@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.vscodium/
+
+# Docker
+*.log
+*.pid
+*.db
+*.sqlite3
+
+# Build artifacts
+dist/
+build/
+
+

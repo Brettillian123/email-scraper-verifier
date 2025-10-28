@@ -20,8 +20,15 @@ scoring:
   thresholds:
     accept: 0.70
     review: 0.50
+
 tiebreaks:
   - recent_source: desc    # fresher page beats older
   - seniority: desc
+
 notes:
-  - Normalize job titles before scoring (e.g., “VP, Sales” → VP).
+  - |
+    Normalize titles before scoring. Examples:
+    - "VP, Sales" → "VP"
+    - "Chief Technology Officer" → "C"
+    - "Head of Marketing" → "Director"
+    - "SWE II" → "IC"

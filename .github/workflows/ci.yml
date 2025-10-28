@@ -8,9 +8,6 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: .
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,25 +21,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt', 'tests/requirements-test.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r tests/requirements-test.txt
-          # ensure tools used in steps are present
-          pip install pre-commit detect-secrets
-
-      - name: Lint (ruff)
-        run: |
-          python -m ruff check .
-          python -m ruff format --check .
+          pip install python-dotenv pytest ruff pre-commit detect-secrets
 
       - name: Pre-commit (all files)
         run: pre-commit run --all-files
 
       - name: Tests
-        run: python -m pytest -q
+        run: pytest

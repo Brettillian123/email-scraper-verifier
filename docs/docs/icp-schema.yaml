@@ -1,0 +1,27 @@
+# Fields captured per lead/company for scoring
+fields:
+  role: {type: enum, values: [Founder, CEO, VP, Director, Manager, IC], required: true}
+  seniority: {type: enum, values: [C, VP, Director, Manager, IC]}
+  company_size: {type: range, buckets: ["1-10","11-50","51-200","201-1000","1001+"], required: true}
+  industry: {type: keyword}
+  geo: {type: region}
+  tech_signals: {type: list, subtype: string}   # e.g., mentions of Salesforce, HubSpot
+  domain: {type: domain, required: true}
+
+scoring:
+  min_required: [domain, role]
+  weights:
+    role: 0.45
+    company_size: 0.20
+    industry: 0.15
+    tech_signals: 0.10
+    seniority: 0.05
+    geo: 0.05
+  thresholds:
+    accept: 0.70
+    review: 0.50
+tiebreaks:
+  - recent_source: desc    # fresher page beats older
+  - seniority: desc
+notes:
+  - Normalize job titles before scoring (e.g., “VP, Sales” → VP).

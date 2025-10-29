@@ -1,4 +1,5 @@
-import sqlite3, pathlib
+import pathlib
+import sqlite3
 
 root = pathlib.Path(__file__).resolve().parents[1]
 db_path = root / "dev.db"

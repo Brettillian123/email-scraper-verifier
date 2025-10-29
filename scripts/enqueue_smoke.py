@@ -1,16 +1,9 @@
-import os
-import pathlib
-import sys
+from __future__ import annotations
 
-# Ensure repo root (parent of scripts/) is on sys.path
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from src.jobs import smoke_job
+from src.queue import get_queue
 
-from redis import Redis
-from rq import Queue
-
-from src.queueing.tasks import verify_email_task
-
-r = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"))
-q = Queue("verify", connection=r)
-job = q.enqueue(verify_email_task, kwargs={"email": "check@example.com"})
-print("enqueued", job.id)
+if __name__ == "__main__":
+    q = get_queue()
+    job = q.enqueue(smoke_job, 2, 3)  # 2 + 3 = 5
+    print("Enqueued job:", job.id)

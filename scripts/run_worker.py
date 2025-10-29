@@ -1,13 +1,8 @@
-# scripts/run_worker.py
 from __future__ import annotations
 
-import os
-import sys
-
-from src.queueing.worker import run as run_worker
+from src.queue import make_worker
 
 if __name__ == "__main__":
-    # Accept queue list via CLI: e.g. "verify_selftest" or "verify,verify_selftest"
-    if len(sys.argv) > 1:
-        os.environ["RQ_QUEUE"] = sys.argv[1]
-    run_worker()
+    w, q = make_worker()
+    print(f"Starting worker for queue '{q.name}'")
+    w.work(with_scheduler=True)

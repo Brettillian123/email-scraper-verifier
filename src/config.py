@@ -76,6 +76,9 @@ class AppConfig:
 
 
 def load_settings() -> AppConfig:
+r06-config-restore
+    """Load environment variables into structured config for R06 queue/rate/retry/SMTP."""
+main
     queue = QueueConfig(
         queue_name=_getenv_str("QUEUE_NAME", "verify"),
         rq_redis_url=_getenv_str("RQ_REDIS_URL", "redis://127.0.0.1:6379/0"),

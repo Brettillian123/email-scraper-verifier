@@ -1,12 +1,21 @@
-# src/queueing/redis_conn.py
-import os
-from functools import lru_cache
-
 from redis import Redis
+from rq import Queue
+
+from src.config import settings  # you already have this loader
+
+_redis = None
+_queue = None
 
 
-@lru_cache(maxsize=1)
 def get_redis() -> Redis:
-    url = os.getenv("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")
-    # IMPORTANT: RQ expects raw bytes; do NOT enable decode_responses.
-    return Redis.from_url(url, decode_responses=False)
+    global _redis
+    if _redis is None:
+        _redis = Redis.from_url(settings.RQ_REDIS_URL, decode_responses=True)
+    return _redis
+
+
+def get_queue() -> Queue:
+    global _queue
+    if _queue is None:
+        _queue = Queue(settings.QUEUE_NAME, connection=get_redis(), default_timeout=600)
+    return _queue

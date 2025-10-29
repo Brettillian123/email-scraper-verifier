@@ -1,51 +1,46 @@
+# src/queueing/dlq.py
 from __future__ import annotations
 
-import logging
+import json
+import traceback
+from datetime import UTC, datetime
 
-from rq import Queue
-from rq.job import Job
+from src.queueing.redis_conn import get_redis
 
-from src.config import load_settings
-
-log = logging.getLogger(__name__)
-_cfg = load_settings()
+DLQ_KEY = "dlq:verify"
+DLQ_MAX = 1000  # keep the newest 1000 failures
 
 
-def push_to_dlq(job: Job, *, err: BaseException | str, **extra_meta) -> str | None:
+def push_to_dlq(
+    job,
+    *,
+    email: str | None = None,
+    mx_host: str | None = None,
+    err: Exception | None = None,
+    extra: dict | None = None,
+) -> None:
     """
-    Copy the failed job to the DLQ with the same function/args/kwargs.
-    Returns new DLQ job id, or None if skipped (already in DLQ).
+    Mirror a final-attempt failure into a Redis list for easy inspection.
+    Call this only on the last retry (job.retries_left == 0), then re-raise in the caller.
     """
-    try:
-        if getattr(job, "origin", "") == _cfg.queue.dlq_name:
-            # Avoid DLQ loops
-            return None
+    r = get_redis()
 
-        conn = job.connection
-        q_dlq = Queue(_cfg.queue.dlq_name, connection=conn)
+    payload = {
+        "ts": datetime.now(UTC).isoformat(),
+        "job_id": getattr(job, "id", None),
+        "queue": getattr(job, "origin", None),
+        "retries_left": getattr(job, "retries_left", None),
+        "email": email,
+        "mx_host": mx_host,
+        "error_type": type(err).__name__ if err else None,
+        "error_message": str(err) if err else None,
+        "traceback": traceback.format_exc() if err else None,
+        "meta": getattr(job, "meta", None),
+    }
+    if extra:
+        payload.update(extra)
 
-        meta = dict(job.meta or {})
-        meta.update(
-            {
-                "dlq_reason": str(err),
-                "failed_job_id": job.id,
-                "origin": job.origin,
-                "exc_type": f"{type(err).__module__}.{type(err).__name__}",
-            }
-        )
-        if extra_meta:
-            meta.update(extra_meta)
-
-        new_job = q_dlq.enqueue(
-            job.func,
-            *job.args,
-            **job.kwargs,
-            job_timeout=job.timeout,
-            meta=meta,
-            # no retry policy in DLQ
-        )
-        log.warning("Moved job %s to DLQ %s as %s", job.id, _cfg.queue.dlq_name, new_job.id)
-        return new_job.id
-    except Exception:  # noqa: BLE001
-        log.exception("Failed to push job %s to DLQ", getattr(job, "id", "<?>"))
-        return None
+    with r.pipeline() as p:
+        p.lpush(DLQ_KEY, json.dumps(payload))
+        p.ltrim(DLQ_KEY, 0, DLQ_MAX - 1)
+        p.execute()

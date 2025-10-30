@@ -37,6 +37,9 @@ def _getenv_list_int(name: str, default_csv: str) -> list[int]:
 # Load .env from project root if present
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
+# Defaults expected by tests
+DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"  # sqlite file in project root
+DEFAULT_USER_AGENT = "EmailVerifierBot/0.1 (+banderson@crestwellpartners.com)"
 
 
 def _parse_intervals(v: str | None) -> list[int]:
@@ -47,6 +50,11 @@ def _parse_intervals(v: str | None) -> list[int]:
 
 @dataclass(frozen=True)
 class Settings:
+    # NEW: fields required by tests
+    DB_URL: str = _getenv_str("DB_URL", DEFAULT_DB_URL)
+    USER_AGENT: str = _getenv_str("USER_AGENT", DEFAULT_USER_AGENT)
+
+    # existing fields
     RQ_REDIS_URL: str = os.getenv("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")
     QUEUE_NAME: str = os.getenv("QUEUE_NAME", "verify")
     VERIFY_MAX_ATTEMPTS: int = int(os.getenv("VERIFY_MAX_ATTEMPTS", "3"))

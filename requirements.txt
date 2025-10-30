@@ -1,0 +1,5 @@
+redis>=5.0,<6
+rq>=1.16,<2
+dnspython>=2.6,<3
+tenacity>=8.2,<9
+python-dotenv>=1.0,<2

@@ -1,5 +1,9 @@
-# src/queueing/tasks.py
+from __future__ import annotations
+
+import json
 import logging
+import time
+import traceback
 
 import dns.resolver
 from redis import Redis
@@ -11,15 +15,13 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from src.config import settings
-from src.queueing.dlq import push_to_dlq
+from src.config import load_settings
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
     RPS_KEY_GLOBAL,
     RPS_KEY_MX,
     can_consume_rps,
-    full_jitter_delay,
     release,
     try_acquire,
 )
@@ -35,6 +37,7 @@ except Exception:
 
 
 log = logging.getLogger(__name__)
+_cfg = load_settings()
 
 
 class TemporarySMTPError(Exception): ...
@@ -59,10 +62,10 @@ def lookup_mx(domain: str) -> tuple[str, int]:
 @retry(
     reraise=True,
     retry=retry_if_exception_type(TemporarySMTPError),
-    stop=stop_after_attempt(settings.VERIFY_MAX_ATTEMPTS),
+    stop=stop_after_attempt(_cfg.retry_timeout.verify_max_attempts),
     wait=wait_random_exponential(
-        multiplier=settings.VERIFY_BASE_BACKOFF_SECONDS,
-        max=settings.VERIFY_MAX_BACKOFF_SECONDS,
+        multiplier=_cfg.retry_timeout.verify_base_backoff_seconds,
+        max=_cfg.retry_timeout.verify_max_backoff_seconds,
     ),
 )
 def smtp_probe(email: str, helo_domain: str) -> tuple[str, str]:
@@ -76,7 +79,7 @@ def smtp_probe(email: str, helo_domain: str) -> tuple[str, str]:
     raise TemporarySMTPError("placeholder until R16")
 
 
-def verify_email_task(  # noqa: C901 - acceptable complexity for orchestrator function
+def verify_email_task(  # noqa: C901
     email: str,
     company_id: int | None = None,
     person_id: int | None = None,
@@ -84,72 +87,49 @@ def verify_email_task(  # noqa: C901 - acceptable complexity for orchestrator fu
     """
     Queue entrypoint. Enforces global + per-MX caps and RPS, then performs the
     probe and persists the result idempotently.
+
+    IMPORTANT: If any cap/throttle is hit, we raise TemporarySMTPError and let
+    the RQ job-level retry policy handle re-enqueue/backoff (see enqueue helper).
+
+    DLQ behavior: if an exception escapes and the job has no retries left,
+    mirror a payload to Redis list 'dlq:verify'.
     """
-    job = get_current_job()
     redis: Redis = get_redis()
+    job = get_current_job()  # may be None if called outside RQ
 
     domain = email.split("@")[-1].lower()
     mx_host, _pref = lookup_mx(domain)
 
     # Acquire semaphores
-    global_lim = int(settings.GLOBAL_MAX_CONCURRENCY)
-    mx_lim = int(settings.PER_MX_MAX_CONCURRENCY_DEFAULT)
-
-    got_global = try_acquire(redis, GLOBAL_SEM, global_lim)
+    got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
     if not got_global:
-        # Soft requeue after jitter (no semaphores were acquired yet)
-        delay = full_jitter_delay(
-            settings.VERIFY_BASE_BACKOFF_SECONDS,
-            getattr(job, "retries_left", 0) ^ 1,
-            settings.VERIFY_MAX_BACKOFF_SECONDS,
-        )
-        if job:
-            job.requeue(delay=delay)
-            return
-        raise TemporarySMTPError("global concurrency cap; no job to requeue")
+        raise TemporarySMTPError("global concurrency cap reached")
 
     mx_key = MX_SEM.format(mx=mx_host)
-    got_mx = try_acquire(redis, mx_key, mx_lim)
+    got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
     if not got_mx:
-        # Release only the global semaphore we hold
         release(redis, GLOBAL_SEM)
-        delay = full_jitter_delay(
-            settings.VERIFY_BASE_BACKOFF_SECONDS,
-            getattr(job, "retries_left", 0) ^ 1,
-            settings.VERIFY_MAX_BACKOFF_SECONDS,
-        )
-        if job:
-            job.requeue(delay=delay)
-            return
-        raise TemporarySMTPError("per-MX concurrency cap; no job to requeue")
+        raise TemporarySMTPError("per-MX concurrency cap reached")
 
     try:
         # Optional RPS smoothing (global)
-        if settings.GLOBAL_RPS and not can_consume_rps(
+        if _cfg.rate.global_rps and not can_consume_rps(
             redis,
             RPS_KEY_GLOBAL,
-            int(settings.GLOBAL_RPS),
+            int(_cfg.rate.global_rps),
         ):
-            delay = full_jitter_delay(1.0, 1, 2.0)
-            if job:
-                job.requeue(delay=delay)
-                return
-            raise TemporarySMTPError("global RPS throttle; no job to requeue")
+            raise TemporarySMTPError("global RPS throttle")
 
         # Optional RPS smoothing (per MX)
-        if settings.PER_MX_RPS_DEFAULT and not can_consume_rps(
+        if _cfg.rate.per_mx_rps_default and not can_consume_rps(
             redis,
             RPS_KEY_MX.format(mx=mx_host),
-            int(settings.PER_MX_RPS_DEFAULT),
+            int(_cfg.rate.per_mx_rps_default),
         ):
-            delay = full_jitter_delay(1.0, 1, 2.0)
-            if job:
-                job.requeue(delay=delay)
-                return
-            raise TemporarySMTPError("MX RPS throttle; no job to requeue")
+            raise TemporarySMTPError("MX RPS throttle")
 
         # ---- Probe (Tenacity handles its own internal retries) ----
-        verify_status, reason = smtp_probe(email, settings.SMTP_HELO_DOMAIN)
+        verify_status, reason = smtp_probe(email, _cfg.smtp_identity.helo_domain)
 
         # ---- Idempotent upsert on success ----
         upsert_verification_result(
@@ -201,17 +181,39 @@ def verify_email_task(  # noqa: C901 - acceptable complexity for orchestrator fu
             "mx_host": mx_host,
         }
 
-    except TemporarySMTPError as e:
-        # Will raise to let RQ retry; if this is the FINAL attempt, mirror to DLQ first
-        if job and getattr(job, "retries_left", 0) == 0:
-            push_to_dlq(job, email=email, mx_host=mx_host, err=e)
-        raise
+    except Exception as e:
+        # Mirror to DLQ only when we've exhausted job retries.
+        retries_left = 0
+        try:
+            if job is not None and getattr(job, "retries_left", None) is not None:
+                retries_left = int(job.retries_left)  # type: ignore[arg-type]
+        except Exception:
+            # Be defensive; if anything goes wrong reading retries, treat as last try.
+            retries_left = 0
 
-    except Exception as e:  # noqa: BLE001
-        # Unknown error → retry via RQ; mirror to DLQ if retries exhausted
-        if job and getattr(job, "retries_left", 0) == 0:
-            push_to_dlq(job, email=email, mx_host=mx_host, err=e)
-        log.exception("unexpected error", extra={"email": email, "mx": mx_host})
+        if retries_left == 0:
+            payload = {
+                "job_id": getattr(job, "id", None),
+                "queue": getattr(job, "origin", None),
+                "email": email,
+                "domain": domain,
+                "mx_host": mx_host,
+                "error": str(e),
+                "exc_type": e.__class__.__name__,
+                "traceback": traceback.format_exc(),
+                "enqueued_at": (
+                    getattr(job, "enqueued_at", None).isoformat()
+                    if getattr(job, "enqueued_at", None)
+                    else None
+                ),
+                "attempts_used": (
+                    (job.meta.get("retry_count", 0) + 1) if getattr(job, "meta", None) else None
+                ),
+                "ts": int(time.time()),
+            }
+            redis.lpush("dlq:verify", json.dumps(payload))
+
+        # Re-raise so RQ marks the job as failed (and/or retries if any left).
         raise
 
     finally:

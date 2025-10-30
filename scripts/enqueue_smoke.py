@@ -3,19 +3,16 @@ import os
 import pathlib
 import sys
 
-# Put repo root on sys.path so "import src" works even if PYTHONPATH isn't set.
-repo_root = pathlib.Path(__file__).resolve().parents[1]
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
 from redis import Redis  # noqa: E402
-from rq import Queue  # noqa: E402
-from rq.retry import Retry  # noqa: E402
+from rq import Queue, Retry
 
 # Choose one import below. If you didn't add always_fail, switch to verify_email_task.
 from src.jobs import always_fail  # noqa: E402
 
-# from src.jobs import verify_email_task  # noqa: E402
+# Put repo root on sys.path so "import src" works even if PYTHONPATH isn't set.
+repo_root = pathlib.Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 
 def main() -> None:

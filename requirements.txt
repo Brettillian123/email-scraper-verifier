@@ -1,5 +1,27 @@
-redis>=5.0,<6
-rq>=1.16,<2
-dnspython>=2.6,<3
-tenacity>=8.2,<9
-python-dotenv>=1.0,<2
+# === Core job queue ===
+rq>=1.15,<2.0
+redis>=5.0,<6.0
+python-dotenv>=1.0,<2.0
+
+# === Email verification helpers ===
+email-validator>=2.0,<3.0
+dnspython>=2.3,<3.0
+aiosmtplib>=2.0,<3.0
+
+# === HTTP scraping ===
+requests>=2.31,<3.0
+beautifulsoup4>=4.12,<5.0
+lxml>=4.9,<6.0
+
+# === Reliability/utilities ===
+tenacity>=8.2,<9.0
+
+# === Database drivers (pick one; SQLite needs none) ===
+# psycopg2-binary>=2.9,<3.0
+# psycopg[binary]>=3.1,<4.0
+
+# === Optional ORM ===
+# SQLAlchemy>=2.0,<3.0
+
+# === Optional logging ===
+# loguru>=0.7,<1.0

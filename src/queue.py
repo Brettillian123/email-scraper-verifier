@@ -1,3 +1,4 @@
+# src/queue.py
 from __future__ import annotations
 
 import os
@@ -5,20 +6,13 @@ import os
 from redis import Redis
 from rq import Queue, Worker
 
-from src.config import load_settings
-
-
-def get_redis() -> Redis:
-    cfg = load_settings()
-    url = os.getenv("RQ_REDIS_URL", cfg.queue.rq_redis_url)
-    # decode_responses=False keeps bytes; RQ is fine either way.
-    return Redis.from_url(url)
+from src.queueing.redis_conn import get_redis
 
 
 def get_queue() -> Queue:
-    cfg = load_settings()
-    r = get_redis()
-    return Queue(cfg.queue.queue_name, connection=r)
+    name = os.getenv("QUEUE_NAME", "verify")
+    r: Redis = get_redis()
+    return Queue(name, connection=r)
 
 
 def make_worker() -> tuple[Worker, Queue]:

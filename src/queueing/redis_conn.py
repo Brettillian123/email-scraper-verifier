@@ -1,21 +1,14 @@
+from __future__ import annotations
+
+from functools import lru_cache
+
 from redis import Redis
-from rq import Queue
 
-from src.config import settings  # you already have this loader
-
-_redis = None
-_queue = None
+from src.config import load_settings
 
 
+@lru_cache(maxsize=1)
 def get_redis() -> Redis:
-    global _redis
-    if _redis is None:
-        _redis = Redis.from_url(settings.RQ_REDIS_URL, decode_responses=True)
-    return _redis
-
-
-def get_queue() -> Queue:
-    global _queue
-    if _queue is None:
-        _queue = Queue(settings.QUEUE_NAME, connection=get_redis(), default_timeout=600)
-    return _queue
+    """Return a cached Redis client using the RQ URL from structured config."""
+    cfg = load_settings()
+    return Redis.from_url(cfg.queue.rq_redis_url, decode_responses=True)

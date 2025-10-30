@@ -127,3 +127,21 @@ def load_settings() -> AppConfig:
         retry_timeout=retry_timeout,
         smtp_identity=smtp_identity,
     )
+
+
+settings: Settings = Settings()
+
+# Your new structured config, if you want to import it elsewhere:
+app_config: AppConfig = load_settings()
+
+__all__ = [
+    "Settings",
+    "QueueConfig",
+    "RateLimitConfig",
+    "RetryTimeoutConfig",
+    "SmtpIdentityConfig",
+    "AppConfig",
+    "load_settings",
+    "settings",  # legacy flat object
+    "app_config",  # structured object
+]

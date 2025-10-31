@@ -1,3 +1,13 @@
-logs/
-*.bin
-dev.db*
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local data/env
+dev.db
+.env
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/

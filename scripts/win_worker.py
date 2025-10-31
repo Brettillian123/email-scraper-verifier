@@ -1,20 +1,28 @@
-# scripts/win_worker.py
 import os
+import pathlib
 import sys
-from pathlib import Path
 
-# Ensure repo root is importable
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Ensure repo root on sys.path
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-# Always use our Windows-safe runner (which selects SimpleWorker on Windows)
-from src.queueing.worker import run  # noqa: E402
+from redis import Redis
+from rq import Queue
+
+try:
+    # RQ >= 2.2 has SpawnWorker (Windows-friendly)
+    from rq.worker import SpawnWorker as Worker
+except Exception:
+    # Fallback: SimpleWorker (dev only, no isolation/timeouts)
+    from rq.worker import SimpleWorker as Worker
+
+
+def main():
+    r = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    q = Queue("verify", connection=r)
+    w = Worker([q], connection=r)
+    print("Starting worker class:", w.__class__.__name__)
+    w.work()  # blocks; Ctrl+C to stop
+
 
 if __name__ == "__main__":
-    # Accept queue names via argv (e.g., `python scripts\win_worker.py verify other`)
-    if len(sys.argv) > 1:
-        os.environ["RQ_QUEUE"] = ",".join(sys.argv[1:])
-    # Ensure nothing overrides the worker class
-    os.environ.pop("RQ_WORKER_CLASS", None)
-    run()
+    main()

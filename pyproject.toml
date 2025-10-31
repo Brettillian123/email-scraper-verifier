@@ -1,11 +1,46 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "email-scraper"
+version = "0.1.0"
+description = "Email Scraper/Verifier"
+readme = "README.md"
 requires-python = ">=3.12"
+dependencies = [
+  "redis>=5",
+  "rq>=1.16",
+  "dnspython>=2.6",
+  "tenacity>=8.2",
+  "python-dotenv>=1.0",
+]
+
+[tool.setuptools]
+# Your top-level package is literally named "src"
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-lint.select = ["E","F","I","B","UP","W","C90"]
+# Keep scratch & venv out of checks
+exclude = [
+  ".venv",
+  "tmp*.py",
+  "tmp_*.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "C90"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E501", "E402"]  # allow long lines in scripts
+"src/db.py" = ["C901"]     # allow complexity in core DB helpers
 
 [tool.ruff.format]
 quote-style = "double"
@@ -13,3 +48,6 @@ quote-style = "double"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 addopts = "-q"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "fakeredis>=2.22"]

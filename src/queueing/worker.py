@@ -10,7 +10,7 @@ from rq import SimpleWorker as RQSimpleWorker
 from rq import Worker as RQWorker
 
 from src.config import load_settings
-from src.queueing import tasks as _tasks  # noqa: F401
+from src.queueing import tasks as _tasks  # noqa: F401  (ensure task module is imported)
 from src.queueing.dlq import push_to_dlq
 from src.queueing.redis_conn import get_redis
 
@@ -26,6 +26,7 @@ def _to_exc_name(exc_type) -> str:
 
 def _dlq_exception_handler(job, exc_type, exc_value, tb):
     try:
+        # Never DLQ jobs already running on the DLQ queue
         if getattr(job, "origin", "") == _cfg.queue.dlq_name:
             return
         exhausted = getattr(job, "retries_left", 0) == 0
@@ -45,14 +46,16 @@ def _queue_names_from_env_or_cfg() -> list[str]:
 
 def _select_worker_cls():
     """
-    Windows: always SimpleWorker. If RQ_WORKER_CLASS is set to a non-SimpleWorker,
-    ignore it and warn. Non-Windows: honor RQ_WORKER_CLASS if provided, else Worker.
+    Windows: always SimpleWorker (forking Worker uses os.wait4 which doesn't exist on Windows).
+    If RQ_WORKER_CLASS is set to a non-SimpleWorker on Windows, ignore it with a warning.
+    Non-Windows: honor RQ_WORKER_CLASS if provided; else use Worker.
     """
     if os.name == "nt":
         env_cls = os.getenv("RQ_WORKER_CLASS", "").strip()
         if env_cls and not env_cls.endswith("SimpleWorker"):
             logging.warning(
-                "Ignoring RQ_WORKER_CLASS=%s on Windows; using rq.SimpleWorker", env_cls
+                "Ignoring RQ_WORKER_CLASS=%s on Windows; using rq.SimpleWorker",
+                env_cls,
             )
         return RQSimpleWorker
 
@@ -73,11 +76,20 @@ def run():
 
     worker_cls = _select_worker_cls()
     qnames = ", ".join(queue_names)
-    print(f"*** Starting {worker_cls.__module__}.{worker_cls.__name__} on queues: {qnames}")
-    log.info("Worker class: %s.%s", worker_cls.__module__, worker_cls.__name__)
+    mod, cls = worker_cls.__module__, worker_cls.__name__
+
+    # E501-safe banner
+    print(f"*** Starting {mod}.{cls}")
+    print(f"Queues: {qnames}")
+    log.info("Worker class: %s.%s", mod, cls)
     log.info("Queues: %s", qnames)
 
+    # Prefer RQ 2.x API to register exception handler; keep constructor fallback
     w = worker_cls(queues, connection=r, exception_handlers=[_dlq_exception_handler])
+    try:
+        w.push_exc_handler(_dlq_exception_handler)  # RQ 2.x+
+    except Exception:
+        pass  # fine; constructor handler covers older/newer versions
 
     # Only the forking Worker supports with_scheduler
     if worker_cls is RQWorker:

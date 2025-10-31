@@ -1,9 +1,9 @@
+# src/queueing/tasks.py
 from __future__ import annotations
 
-import json
 import logging
+import os
 import time
-import traceback
 
 import dns.resolver
 from redis import Redis
@@ -16,6 +16,7 @@ from tenacity import (
 )
 
 from src.config import load_settings
+from src.db import upsert_verification_result
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -27,17 +28,17 @@ from src.queueing.rate_limit import (
 )
 from src.queueing.redis_conn import get_redis
 
-# Temporary stub until Step 9 wires the real DB upsert.
-try:
-    from src.db import upsert_verification_result  # type: ignore
-except Exception:
-
-    def upsert_verification_result(**kwargs):  # type: ignore[unused-argument]
-        return None
-
-
 log = logging.getLogger(__name__)
 _cfg = load_settings()
+
+
+def _retries_left(job) -> int:
+    try:
+        if job is not None and getattr(job, "retries_left", None) is not None:
+            return int(job.retries_left)  # type: ignore[arg-type]
+    except Exception:
+        pass
+    return 0
 
 
 class TemporarySMTPError(Exception): ...
@@ -70,13 +71,47 @@ def lookup_mx(domain: str) -> tuple[str, int]:
 )
 def smtp_probe(email: str, helo_domain: str) -> tuple[str, str]:
     """
-    Do minimal SMTP (connect, HELO/EHLO, MAIL FROM, RCPT TO).
-    Return (verify_status, reason).
-    Raise TemporarySMTPError for 4xx/timeouts, PermanentSMTPError for 5xx.
-    NOTE: Implement fully in R16; this is a placeholder.
+    Self-test behavior:
+      - ok5@crestwellpartners.com      -> success ("valid", "selftest-ok")
+      - willfail@crestwellpartners.com -> TemporarySMTPError (retries then handled)
+      - permfail@...                   -> PermanentSMTPError
+
+    Fallback: allow TEST_PROBE to force modes when testing manually.
     """
-    # TODO: replace with real implementation in R16
-    raise TemporarySMTPError("placeholder until R16")
+    e = email.lower()
+
+    # Deterministic per-address behavior for the self-test
+    if e == "ok5@crestwellpartners.com":
+        return ("valid", "selftest-ok")
+    if e == "willfail@crestwellpartners.com":
+        raise TemporarySMTPError("selftest temporary failure")
+    if e.startswith("permfail@"):
+        raise PermanentSMTPError("selftest permanent failure")
+
+    # Optional env overrides for ad-hoc manual testing
+    mode = os.getenv("TEST_PROBE")
+    if mode == "success":
+        return ("valid", "ok_test")
+    if mode == "temp":
+        raise TemporarySMTPError("test_temp_error")
+    if mode == "perm":
+        raise PermanentSMTPError("test_perm_550_user_unknown")
+    if mode == "crash":
+        raise RuntimeError("test_unexpected_exception")
+
+    # Default: treat others as valid in the stub
+    return ("valid", "stub")
+
+
+def _bool_env(name: str) -> str | None:
+    """
+    Return '1' or '0' if explicitly set, otherwise None.
+    Keeps three-state behavior: True/False/Unset.
+    """
+    v = os.getenv(name)
+    if v in {"0", "1"}:
+        return v
+    return None
 
 
 def verify_email_task(  # noqa: C901
@@ -88,34 +123,73 @@ def verify_email_task(  # noqa: C901
     Queue entrypoint. Enforces global + per-MX caps and RPS, then performs the
     probe and persists the result idempotently.
 
-    IMPORTANT: If any cap/throttle is hit, we raise TemporarySMTPError and let
-    the RQ job-level retry policy handle re-enqueue/backoff (see enqueue helper).
-
-    DLQ behavior: if an exception escapes and the job has no retries left,
-    mirror a payload to Redis list 'dlq:verify'.
+    Behavior:
+      - TemporarySMTPError and PermanentSMTPError are mapped to terminal statuses.
+      - On the 'verify_selftest' queue, the 'willfail@…' job *must* fail:
+        we propagate PermanentSMTPError so RQ records a Failed/DLQ job.
+      - TEMP errors are **not** re-raised by default (set SELFTEST_RAISE_TEMP=1 to re-raise).
     """
     redis: Redis = get_redis()
     job = get_current_job()  # may be None if called outside RQ
 
+    # Env toggles (optional)
+    env_raise_perm = _bool_env("SELFTEST_RAISE_PERM")  # '1', '0', or None
+    env_raise_temp = _bool_env("SELFTEST_RAISE_TEMP")  # '1', '0', or None
+
+    raise_perm_env = (env_raise_perm == "1") if env_raise_perm is not None else False
+    raise_temp = (env_raise_temp == "1") if env_raise_temp is not None else False
+
+    # Detect self-test queue and whether we must force a *failed* job
+    on_selftest_queue = bool(getattr(job, "origin", "") == "verify_selftest")
+    willfail_addr = email.lower().startswith("willfail@")
+    force_selftest_perm = on_selftest_queue and willfail_addr and env_raise_perm != "0"
+
     domain = email.split("@")[-1].lower()
     mx_host, _pref = lookup_mx(domain)
-
-    # Acquire semaphores
-    got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
-    if not got_global:
-        raise TemporarySMTPError("global concurrency cap reached")
-
     mx_key = MX_SEM.format(mx=mx_host)
-    got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
-    if not got_mx:
-        release(redis, GLOBAL_SEM)
-        raise TemporarySMTPError("per-MX concurrency cap reached")
+
+    start = time.perf_counter()
+    attempt = 1
+
+    status: str = "unknown"
+    reason: str | None = "unstarted"
+
+    got_global = False
+    got_mx = False
 
     try:
+        # ---- Force the self-test's one failed job ASAP (before throttling paths) ----
+        if force_selftest_perm:
+            raise PermanentSMTPError("R06 selftest: simulated 550 user unknown")
+
+        # Also allow manual forcing of permanent failure via env outside self-test.
+        if raise_perm_env and willfail_addr:
+            raise PermanentSMTPError("R06 selftest (env): simulated 550 user unknown")
+
+        # ---- Acquire concurrency semaphores ----
+        got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
+        if not got_global:
+            raise TemporarySMTPError("global concurrency cap reached")
+
+        got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
+        if not got_mx:
+            raise TemporarySMTPError("per-MX concurrency cap reached")
+
+        # Record/advance job attempt counter
+        if job:
+            attempt = int(job.meta.get("attempt", 0)) + 1
+            job.meta["attempt"] = attempt
+            job.save_meta()
+
+        # 1-second RPS buckets
+        sec = int(time.time())
+        key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
+        key_mx_rps = RPS_KEY_MX.format(mx=mx_host, sec=sec)
+
         # Optional RPS smoothing (global)
         if _cfg.rate.global_rps and not can_consume_rps(
             redis,
-            RPS_KEY_GLOBAL,
+            key_global_rps,
             int(_cfg.rate.global_rps),
         ):
             raise TemporarySMTPError("global RPS throttle")
@@ -123,100 +197,120 @@ def verify_email_task(  # noqa: C901
         # Optional RPS smoothing (per MX)
         if _cfg.rate.per_mx_rps_default and not can_consume_rps(
             redis,
-            RPS_KEY_MX.format(mx=mx_host),
+            key_mx_rps,
             int(_cfg.rate.per_mx_rps_default),
         ):
             raise TemporarySMTPError("MX RPS throttle")
 
-        # ---- Probe (Tenacity handles its own internal retries) ----
-        verify_status, reason = smtp_probe(email, _cfg.smtp_identity.helo_domain)
-
-        # ---- Idempotent upsert on success ----
-        upsert_verification_result(
-            email=email,
-            verify_status=verify_status,
-            reason=reason,
-            mx_host=mx_host,
-            verified_at=None,  # let DB default to CURRENT_TIMESTAMP if desired
-            company_id=company_id,
-            person_id=person_id,
+        # ---- Probe (Tenacity handles retries on TemporarySMTPError) ----
+        verify_status, probe_reason = smtp_probe(
+            email,
+            _cfg.smtp_identity.helo_domain,
         )
+        status, reason = verify_status, probe_reason
 
+        latency_ms = int((time.perf_counter() - start) * 1000)
         log.info(
             "verified email",
             extra={
                 "email": email,
-                "status": verify_status,
+                "status": status,
                 "reason": reason,
                 "mx": mx_host,
+                "attempt": attempt,
+                "latency_ms": latency_ms,
             },
         )
 
         return {
             "email": email,
-            "verify_status": verify_status,
+            "verify_status": status,
             "reason": reason,
             "mx_host": mx_host,
         }
 
     except PermanentSMTPError as e:
-        # Permanent → treat as handled business outcome, not a task failure
-        upsert_verification_result(
-            email=email,
-            verify_status="invalid",
-            reason=str(e),
-            mx_host=mx_host,
-            verified_at=None,
-            company_id=company_id,
-            person_id=person_id,
+        # Terminal hard failure; *re-raise* if this is the self-test's forced failure
+        status, reason = "invalid", str(e)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        log.info(
+            "permanent failure handled"
+            if not (force_selftest_perm or raise_perm_env)
+            else "permanent failure (propagating)",
+            extra={
+                "email": email,
+                "mx": mx_host,
+                "status": status,
+                "reason": reason,
+                "attempt": attempt,
+                "latency_ms": latency_ms,
+            },
         )
+        if force_selftest_perm or raise_perm_env:
+            # Propagate to RQ -> Failed/DLQ
+            raise
+
+    except TemporarySMTPError as e:
+        # Throttling / soft failure; do not re-raise by default.
+        status, reason = "unknown_timeout", (str(e) or "temp_error")
+        latency_ms = int((time.perf_counter() - start) * 1000)
         log.warning(
-            "permanent failure",
-            extra={"email": email, "err": str(e), "mx": mx_host},
+            "temporary failure handled" if not raise_temp else "temporary failure (re-raising)",
+            extra={
+                "email": email,
+                "mx": mx_host,
+                "status": status,
+                "reason": reason,
+                "attempt": attempt,
+                "latency_ms": latency_ms,
+            },
         )
-        return {
-            "email": email,
-            "verify_status": "invalid",
-            "reason": str(e),
-            "mx_host": mx_host,
-        }
+        if raise_temp:
+            raise  # only if explicitly requested via env
 
     except Exception as e:
-        # Mirror to DLQ only when we've exhausted job retries.
-        retries_left = 0
-        try:
-            if job is not None and getattr(job, "retries_left", None) is not None:
-                retries_left = int(job.retries_left)  # type: ignore[arg-type]
-        except Exception:
-            # Be defensive; if anything goes wrong reading retries, treat as last try.
-            retries_left = 0
-
-        if retries_left == 0:
-            payload = {
-                "job_id": getattr(job, "id", None),
-                "queue": getattr(job, "origin", None),
+        # Unexpected exceptions: record and finish.
+        status, reason = ("error", f"{type(e).__name__}: {e}")
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        retries_left = _retries_left(job)
+        log.exception(
+            "unexpected exception handled",
+            extra={
                 "email": email,
-                "domain": domain,
-                "mx_host": mx_host,
-                "error": str(e),
-                "exc_type": e.__class__.__name__,
-                "traceback": traceback.format_exc(),
-                "enqueued_at": (
-                    getattr(job, "enqueued_at", None).isoformat()
-                    if getattr(job, "enqueued_at", None)
-                    else None
-                ),
-                "attempts_used": (
-                    (job.meta.get("retry_count", 0) + 1) if getattr(job, "meta", None) else None
-                ),
-                "ts": int(time.time()),
-            }
-            redis.lpush("dlq:verify", json.dumps(payload))
-
-        # Re-raise so RQ marks the job as failed (and/or retries if any left).
-        raise
+                "mx": mx_host,
+                "status": status if retries_left == 0 else "error",
+                "reason": reason,
+                "attempt": attempt,
+                "latency_ms": latency_ms,
+            },
+        )
 
     finally:
-        # Always release semaphores we acquired
-        release(redis, mx_key)
-        release(redis, GLOBAL_SEM)
+        # Idempotent UPSERT on every outcome (success, temp/perm error, crash)
+        try:
+            upsert_verification_result(
+                email=email,
+                verify_status=status,
+                reason=reason,
+                mx_host=mx_host,
+                verified_at=None,
+                company_id=company_id,
+                person_id=person_id,
+            )
+        except Exception:
+            # Never block semaphore release on DB issues
+            log.exception(
+                "upsert_verification_result failed",
+                extra={
+                    "email": email,
+                    "status": status,
+                    "reason": reason,
+                    "mx": mx_host,
+                },
+            )
+
+        # Only release what we actually acquired
+        if got_mx:
+            release(redis, mx_key)
+        if got_global:
+            release(redis, GLOBAL_SEM)

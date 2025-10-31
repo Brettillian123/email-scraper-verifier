@@ -59,5 +59,9 @@ CREATE TABLE suppression (
 -- helpful indexes
 CREATE INDEX idx_people_company ON people(company_id);
 CREATE INDEX idx_emails_company ON emails(company_id);
-CREATE INDEX idx_emails_email ON emails(email);
+
+-- enforce global idempotency by email
+DROP INDEX IF EXISTS idx_emails_email;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email);
+
 CREATE INDEX idx_verif_email ON verification_results(email_id);

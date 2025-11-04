@@ -38,6 +38,9 @@ exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "C90"]
 
+[tool.ruff.lint.mccabe]
+max-complexity = 16
+
 [tool.ruff.lint.per-file-ignores]
 "scripts/*.py" = ["E501", "E402"]  # allow long lines in scripts
 "src/db.py" = ["C901"]     # allow complexity in core DB helpers

@@ -25,3 +25,8 @@ tenacity>=8.2,<9.0
 
 # === Optional logging ===
 # loguru>=0.7,<1.0
+
+# === HTTP Injest ===
+fastapi>=0.110
+uvicorn[standard]>=0.23
+fakeredis>=2,<3

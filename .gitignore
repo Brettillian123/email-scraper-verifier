@@ -14,3 +14,14 @@ dev.db
 .DS_Store
 Thumbs.db
 .vscode/
+# Local artifacts & scratch
+*.db
+*.db.bak.*
+ingest_*.rejects.*.log
+email_scraper.egg-info/
+samples/
+ok.csv
+ok.jsonl
+batch.jsonl
+too_big.jsonl
+tmp_*.py

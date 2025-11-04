@@ -1,7 +1,9 @@
+# src/jobs.py
 from __future__ import annotations
 
 import time
 from dataclasses import asdict
+from typing import Any  # <-- add
 
 from rq import Queue, Retry
 
@@ -40,11 +42,19 @@ def enqueue_verify(func, *args, **kwargs):
     return q.enqueue(func, *args, **kwargs)
 
 
+# ---- add this: tests may import src.jobs.enqueue ----
+def enqueue(job_name: str, **payload: Any) -> None:
+    """
+    Present for symmetry with src.queue.enqueue so tests can monkey-patch either.
+    Default is a no-op in R07.
+    """
+    return None
+
+
 # ---- Demo/test jobs ----
 def smoke_job(x: int, y: int) -> int:
-    # Simulate a tiny bit of work + read config to ensure imports work.
     cfg = load_settings()
-    _ = asdict(cfg.retry_timeout)  # touch config to prove it loads
+    _ = asdict(cfg.retry_timeout)
     time.sleep(0.2)
     return x + y
 

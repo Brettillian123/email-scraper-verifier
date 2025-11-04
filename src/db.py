@@ -18,14 +18,6 @@ def _table_columns(cur, table: str) -> dict[str, dict]:
     Returns {col_name: {name,type,notnull,default,pk}} for table.
     """
     meta = {}
-    for _cid, name, ctype, notnull, dflt_value, pk in cur.execute(f"PRAGMA table_info({table})"):
-        meta[name] = {
-            "name": name,
-            "type": (ctype or "").upper(),
-            "notnull": bool(notnull),
-            "default": dflt_value,
-            "pk": bool(pk),
-        }
     return meta
 
 
@@ -250,3 +242,31 @@ def upsert_verification_result(
         """
         cur.execute(sql, insert_vals)
         con.commit()
+
+
+def bulk_insert_ingest_items(rows: list[dict]) -> int:
+    cols = [
+        "company",
+        "domain",
+        "role",
+        "first_name",
+        "last_name",
+        "full_name",
+        "title",
+        "source_url",
+        "notes",
+        "norm_domain",
+        "norm_company",
+        "norm_role",
+        "errors",
+    ]
+    placeholders = ",".join(["?"] * len(cols))
+    values = [[r.get(c) for c in cols] for r in rows]
+    with sqlite3.connect(_db_path()) as conn:
+        cur = conn.cursor()
+        cur.executemany(
+            f"INSERT INTO ingest_items ({','.join(cols)}) VALUES ({placeholders})",
+            values,
+        )
+        conn.commit()
+        return cur.rowcount

@@ -1,0 +1,2 @@
+{"company":"Acme Corp","domain":"acme.com","role":"engineering","first_name":"Grace","last_name":"Hopper","title":"Staff Engineer","source_url":"https://acme.com/team/grace","notes":"seed"}
+{"company":"Globex","role":"hr","full_name":"Dana Scully","title":"People Ops","source_url":"https://globex.com/about","notes":"jsonl example"}

@@ -1,0 +1,10 @@
+redis>=5
+rq>=1.16
+dnspython>=2.6
+tenacity>=8.2
+python-dotenv>=1.0
+
+[dev]
+pytest
+ruff
+fakeredis>=2.22

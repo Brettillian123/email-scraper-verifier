@@ -115,6 +115,7 @@ def split_name(full: str | None) -> tuple[str, str]:
     if not tokens:
         return "", ""
 
+    # drop prefixes (Dr, Ms, etc.)
     toks: list[str] = []
     for t in tokens:
         t_clean = t.strip(".").lower()
@@ -122,6 +123,7 @@ def split_name(full: str | None) -> tuple[str, str]:
             continue
         toks.append(t)
 
+    # drop suffixes (Jr, III, PhD, etc.)
     while toks and toks[-1].strip(".").lower() in _SUFFIXES:
         toks.pop()
 
@@ -130,13 +132,27 @@ def split_name(full: str | None) -> tuple[str, str]:
     if len(toks) == 1:
         first, last = toks[0], ""
     else:
-        first, last = toks[0], toks[-1]
+        # keep all given names EXCEPT middle initials like "Q" or "Q."
+        given = toks[:-1]
+        given = [t for t in given if not re.fullmatch(r"[A-Za-z]\.?", t)]
+        if not given:  # if everything got filtered (e.g., "J. Public"), keep the first token
+            given = toks[:1]
+        first = " ".join(given)
+        last = toks[-1]
+
     return _smart_case(first), _smart_case(last)
 
 
 # ======================= Role mapping =======================
 
 _ROLE_MAP: dict[str, list[str]] = {
+    "executive": [
+        "ceo",
+        "chief executive officer",
+        "chief executive",
+        "president",  # optional, remove if you consider this ambiguous
+        "managing director",  # optional
+    ],
     "engineering": [
         "cto",
         "chief technology officer",
@@ -178,7 +194,8 @@ _ROLE_PLACEHOLDERS = {"-", "—", "--", "na", "n/a", "none", "null"}
 def map_role(raw: str | None) -> str:
     if raw is None:
         return "other"
-    s = str(raw).strip().lower()
+    # Normalize aggressively so fancy Unicode / casing doesn't throw us off
+    s = _ud.normalize("NFKC", str(raw)).strip().lower()
     if not s or s in _ROLE_PLACEHOLDERS:
         return "other"
 
@@ -189,6 +206,8 @@ def map_role(raw: str | None) -> str:
                 return canon
 
     # Heuristics
+    if "chief" in s and "executive" in s:
+        return "executive"
     if "chief" in s and "operat" in s:
         return "operations"
     if "chief" in s and ("tech" in s or "information" in s):

@@ -1,12 +1,15 @@
 -- companies
-CREATE TABLE companies (
+CREATE TABLE IF NOT EXISTS companies (
   id INTEGER PRIMARY KEY,
   name TEXT,
-  domain TEXT NOT NULL UNIQUE,
+  domain TEXT NOT NULL UNIQUE,              -- canonical official
   website_url TEXT,
+  user_supplied_domain TEXT,                -- raw hint from ingest (untrusted)
+  domain_confidence INTEGER,                -- 0..100 trust score for 'domain'
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
+
 
 -- people
 CREATE TABLE people (
@@ -57,14 +60,14 @@ CREATE TABLE suppression (
 );
 
 -- helpful indexes
-CREATE INDEX idx_people_company ON people(company_id);
-CREATE INDEX idx_emails_company ON emails(company_id);
+CREATE INDEX IF NOT EXISTS idx_people_company ON people(company_id);
+CREATE INDEX IF NOT EXISTS idx_emails_company ON emails(company_id);
 
 -- enforce global idempotency by email
 DROP INDEX IF EXISTS idx_emails_email;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email);
 
-CREATE INDEX idx_verif_email ON verification_results(email_id);
+CREATE INDEX IF NOT EXISTS idx_verif_email ON verification_results(email_id);
 
 -- R07 ingestion staging table
 CREATE TABLE IF NOT EXISTS ingest_items (
@@ -88,6 +91,26 @@ CREATE TABLE IF NOT EXISTS ingest_items (
 );
 CREATE INDEX IF NOT EXISTS ix_ingest_items_created_at ON ingest_items(created_at);
 
--- R07 Guardrail: keep raw domain separate from official one
-ALTER TABLE companies ADD COLUMN user_supplied_domain TEXT;
+-- 📌 Fold the guardrail + R08 columns directly into the base table.
+-- Update the *companies* table definition ABOVE to include these columns:
+--   user_supplied_domain TEXT,
+--   domain_confidence INTEGER,
+-- And keep domain as the canonical/official domain.
+
+-- R08: resolution audit log
+CREATE TABLE IF NOT EXISTS domain_resolutions (
+  id               INTEGER PRIMARY KEY,
+  company_id       INTEGER NOT NULL,
+  company_name     TEXT NOT NULL,
+  user_hint        TEXT,                      -- from ingest row (may be NULL)
+  chosen_domain    TEXT,                      -- punycode ascii
+  method           TEXT NOT NULL,             -- 'hint_validated' | 'dns_valid' | 'http_redirect' | 'fallback'
+  confidence       INTEGER NOT NULL,          -- 0..100
+  reason           TEXT,                      -- short human-readable decision note
+  resolver_version TEXT NOT NULL,             -- e.g. 'r08.1'
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_resolutions_company_id ON domain_resolutions(company_id);
 CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain ON companies(user_supplied_domain);

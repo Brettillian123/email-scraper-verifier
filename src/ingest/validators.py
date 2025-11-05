@@ -4,53 +4,69 @@ import os
 import re
 from collections.abc import Iterable
 
-# Canonical header (contract)
-CANONICAL_KEYS = [
-    "company",
-    "domain",
-    "role",
-    "first_name",
-    "last_name",
-    "full_name",
-    "title",
-    "source_url",
-    "notes",
-]
-
-# Limits
-MAX_ROWS_DEFAULT = int(os.getenv("INGEST_MAX_ROWS", "100000"))
-
-_domain_re = re.compile(r"^(?=.{1,253}$)(?!-)([A-Za-z0-9-]{1,63}(?<!-)\.)+[A-Za-z]{2,63}$")
+# CLI default; override with env INGEST_MAX_ROWS if needed
+MAX_ROWS_DEFAULT = int(os.getenv("INGEST_MAX_ROWS", "10000"))
 
 
-def validate_header_csv(header: Iterable[str]) -> tuple[bool, str]:
-    # Must include all canonical keys (order can vary; extras allowed)
-    missing = [k for k in CANONICAL_KEYS if k not in header]
-    if missing:
-        return False, f"Missing required header columns: {', '.join(missing)}"
-    return True, ""
+class TooManyRowsError(RuntimeError):
+    """Raised when input exceeds the configured row cap."""
 
 
-def validate_minimum_fields(item: dict) -> tuple[bool, str]:
-    # (domain OR company) AND role
-    has_domain = bool(str(item.get("domain") or "").strip())
-    has_company = bool(str(item.get("company") or "").strip())
-    has_role = bool(str(item.get("role") or "").strip())
-    if not has_role or not (has_domain or has_company):
-        return False, "Each record must have role AND (domain OR company)."
-    return True, ""
+def enforce_row_cap(count: int, max_rows: int | None = None) -> None:
+    cap = MAX_ROWS_DEFAULT if max_rows is None else int(max_rows)
+    if count > cap:
+        # Keep the message helpful and actionable
+        raise TooManyRowsError(
+            f"Input contains {count:,} rows but --max-rows={cap:,}. "
+            "Lower your file size or raise the cap."
+        )
 
 
-def validate_domain_sanity(domain: str) -> bool:
+def validate_header_csv(fieldnames: Iterable[str] | None) -> None:
+    """CSV must have a header row; we don't require specific columns here."""
+    if not fieldnames:
+        raise ValueError("CSV has no header row")
+
+
+# Minimal “has visible text” (handles unicode whitespace)
+_VIS_RE = re.compile(r"\S", re.UNICODE)
+_ROLE_PLACEHOLDERS = {"-", "—", "--", "na", "n/a", "none", "null"}
+
+
+def _has_visible_text(val: object) -> bool:
+    s = "" if val is None else str(val)
+    return bool(_VIS_RE.search(s))
+
+
+def validate_minimum_fields(item: dict) -> None:
+    """
+    Guardrail: row must have ROLE (visible, not a placeholder)
+    AND at least one of (company, domain).
+    """
+    company = (item.get("company") or "").strip()
+    domain = (item.get("domain") or "").strip()
+    role_raw = item.get("role")
+
+    if not (company or domain):
+        raise ValueError("row must have at least company or domain")
+
+    if not _has_visible_text(role_raw):
+        raise ValueError("role is required")
+
+    role_clean = str(role_raw).strip().lower()
+    if role_clean in _ROLE_PLACEHOLDERS:
+        raise ValueError("role cannot be a placeholder")
+
+
+def validate_domain_sanity(domain: str | None) -> None:
+    """
+    Lenient check: allow blank; if present, reject obvious junk like spaces/slashes.
+    A proper resolver/normalizer can IDNA/punycode later.
+    """
     if not domain:
-        return True  # domain is optional if company present
-    dom = domain.strip().lower()
-    if " " in dom:
-        return False
-    # allow IDN: if it doesn't match ASCII regex, we’ll IDNA-encode downstream
-    return True if _domain_re.match(dom) or True else False  # lenient here
-
-
-def enforce_row_cap(count: int, max_rows: int = MAX_ROWS_DEFAULT) -> None:
-    if count > max_rows:
-        raise ValueError(f"Row/line limit exceeded ({count} > {max_rows}).")
+        return
+    dom = str(domain).strip()
+    if not dom:
+        return
+    if " " in dom or "/" in dom:
+        raise ValueError("domain looks invalid")

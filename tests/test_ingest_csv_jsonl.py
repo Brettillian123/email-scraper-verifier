@@ -21,7 +21,9 @@ def temp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db_path = tmp_path / "test.db"
     db_path.touch()
     _apply_schema(db_path)
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    # Ensure a valid sqlite URL on Windows (use forward slashes)
+    db_url = "sqlite:///" + db_path.as_posix()
+    monkeypatch.setenv("DATABASE_URL", db_url)
     return db_path
 
 
@@ -126,8 +128,8 @@ def test_csv_and_jsonl_persist_and_enqueue(
     # Enqueue should be called once per accepted row
     assert len(enqueue_spy) == a1 + a2
 
-    # Enqueue payloads should include normalized role & domain
-    normalized_domains = {p["domain"] for (_job, p) in enqueue_spy if "domain" in p}
+    # Enqueue payloads should include normalized role & user_supplied_domain
+    normalized_domains = {p.get("user_supplied_domain", "") for (_job, p) in enqueue_spy}
     assert "acme.com" in normalized_domains
     assert "xn--bcher-kva.de" in normalized_domains  # IDN normalized
 

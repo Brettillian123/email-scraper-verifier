@@ -1,4 +1,4 @@
-company,domain,role,first_name,last_name,full_name,title,source_url,notes
-Acme,acme.com,cto,Ada,Lovelace,,CTO,https://acme.com/team,"core lead"
-"Bücher GmbH",https://bücher.de,Head of Sales,,,Franz Müller,Sales Lead,https://bücher.de/ueber-uns,–
-,missing-role.com,,John,Doe,,,,
+﻿full_name,company,user_supplied_domain
+Ada Lovelace,Acme,acme.com
+,,
+Anna Schmidt,Bücher GmbH,bücher.de

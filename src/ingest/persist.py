@@ -5,6 +5,13 @@ import os
 import sqlite3
 from typing import Any
 
+# R08 enqueue deps
+from rq import Queue
+
+from src.db import set_user_hint_and_enqueue
+from src.queueing.redis_conn import get_redis
+from src.queueing.tasks import resolve_company_domain
+
 
 def _sqlite_path_from_env() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
@@ -60,6 +67,31 @@ def _upsert_company(con: sqlite3.Connection, name: str | None, domain: str | Non
     return _insert(None, None)
 
 
+def _enqueue_domain_resolution(
+    con: sqlite3.Connection,
+    company_id: int,
+    company_name: str,
+    user_hint: str | None,
+) -> None:
+    """
+    Store the user hint (domain/website) and enqueue the async resolver job.
+    Important: do NOT write official domain here — only the resolver task does that.
+    """
+    # Persist the user-supplied hint on the company record
+    set_user_hint_and_enqueue(con, company_id, user_hint)
+
+    # Enqueue the resolver job on the default queue
+    q = Queue("default", connection=get_redis())
+    q.enqueue(
+        resolve_company_domain,
+        company_id,
+        company_name,
+        user_hint,
+        job_timeout=30,
+        retry=None,
+    )
+
+
 def persist_best_effort(normalized: dict[str, Any]) -> None:
     db_path = _sqlite_path_from_env()
     con = sqlite3.connect(db_path)
@@ -69,8 +101,16 @@ def persist_best_effort(normalized: dict[str, Any]) -> None:
 
         company = (normalized.get("company") or "").strip() or None
         domain = (normalized.get("domain") or "").strip() or None
+
+        # Upsert company first (R07)
         company_id = _upsert_company(con, company, domain)
 
+        # R08: enqueue resolver right after company upsert
+        # Use the user's provided domain/website as a hint if present
+        user_hint = (normalized.get("domain") or normalized.get("website") or "").strip() or None
+        _enqueue_domain_resolution(con, company_id, (company or ""), user_hint)
+
+        # Continue with people insert as before
         people_cols = _table_columns(con, "people")
         payload: dict[str, Any] = {}
         if "company_id" in people_cols:

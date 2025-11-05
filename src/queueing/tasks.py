@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import time
 
 import dns.resolver
@@ -16,7 +17,7 @@ from tenacity import (
 )
 
 from src.config import load_settings
-from src.db import upsert_verification_result
+from src.db import upsert_verification_result, write_domain_resolution
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -27,9 +28,39 @@ from src.queueing.rate_limit import (
     try_acquire,
 )
 from src.queueing.redis_conn import get_redis
+from src.resolve.domain import resolve
 
 log = logging.getLogger(__name__)
 _cfg = load_settings()
+
+
+def _conn() -> sqlite3.Connection:
+    """
+    Lightweight SQLite connection helper for tasks that need direct DB access.
+    Uses DATABASE_PATH if set, otherwise falls back to 'dev.db'.
+    """
+    return sqlite3.connect(os.getenv("DATABASE_PATH", "dev.db"))
+
+
+def resolve_company_domain(
+    company_id: int, company_name: str, user_hint: str | None = None
+) -> dict:
+    """
+    RQ task: Resolve the official domain for a company, persist the decision, and
+    return a structured dict for logs/metrics.
+
+    Returns:
+        dict: {"company_id", "chosen", "method", "confidence"}
+    """
+    dec = resolve(company_name, user_hint)
+    with _conn() as con:
+        write_domain_resolution(con, company_id, company_name, dec, user_hint)
+    return {
+        "company_id": company_id,
+        "chosen": dec.chosen,
+        "method": dec.method,
+        "confidence": dec.confidence,
+    }
 
 
 def _retries_left(job) -> int:

@@ -1,19 +1,21 @@
+#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # --- make "src" importable when run from scripts/ ---
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.ingest.normalize import normalize_row  # noqa: E402
-
-from src.db import bulk_insert_ingest_items  # noqa: E402
+# Local imports (after sys.path tweak)
+from src.ingest import ingest_row, normalize_company  # noqa: E402
 from src.ingest.rejects import (  # noqa: E402
     current_rejects_file,
     log_reject,
@@ -22,9 +24,7 @@ from src.ingest.validators import (  # noqa: E402
     MAX_ROWS_DEFAULT,
     TooManyRowsError,
     enforce_row_cap,
-    validate_domain_sanity,
     validate_header_csv,
-    validate_minimum_fields,
 )
 
 
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     CLI for ingestion with a hard cap on input size.
     """
     p = argparse.ArgumentParser(description="R07 ingest (CSV/TSV/JSONL)")
-    p.add_argument("path", help="CSV or JSONL to ingest")
+    p.add_argument("path", help="CSV, TSV, or JSONL to ingest")
     p.add_argument(
         "--max-rows",
         type=int,
@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--strict",
         action="store_true",
-        help="Fail fast on first error (TSV legacy path)",
+        help="(TSV only) Fail fast on first error",
     )
     p.add_argument(
         "--dry-run",
@@ -58,42 +58,71 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# ---------------- Helpers (R07 preflight) ----------------
+def _needs_name(row: dict[str, Any]) -> bool:
+    full = normalize_company(row.get("full_name"))
+    first = normalize_company(row.get("first_name"))
+    last = normalize_company(row.get("last_name"))
+    return not (full or (first and last))
+
+
+def _preflight_errors(row: dict[str, Any]) -> list[str]:
+    """
+    R07: company required; must have either full_name or first+last.
+    role is optional; user_supplied_domain is optional (no strict validation here).
+    """
+    errs: list[str] = []
+    company = normalize_company(row.get("company"))
+    if not company:
+        errs.append("company is required")
+    if _needs_name(row):
+        errs.append("full_name (or first+last) is required")
+    return errs
+
+
+def _normalize_legacy_fields(row: dict[str, Any]) -> None:
+    """
+    Accept legacy `domain` by mapping it to `user_supplied_domain`.
+    Do not validate the domain here; R08 will resolve/verify later.
+    """
+    if "domain" in row and "user_supplied_domain" not in row:
+        row["user_supplied_domain"] = row.get("domain")
+
+
 # ---------------- CSV (BOM-safe) with per-row rejections ----------------
-def iter_csv_rows(path: str, max_rows: int | None) -> list[dict[str, str]]:
+def iter_csv_rows(path: str, max_rows: int | None) -> list[dict[str, Any]]:
     """
     Read CSV with UTF-8 BOM handling. Invalid rows are logged to rejects with line numbers.
-    Enforces a strict row cap using enforce_row_cap to fail early on oversized inputs.
+    Enforces a strict row cap to fail early on oversized inputs.
+    Returns only rows that pass R07 preflight (company+name).
     """
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     with open(path, newline="", encoding="utf-8-sig") as f:  # BOM-safe
         rdr = csv.DictReader(f)
-        # Header must exist
         validate_header_csv(rdr.fieldnames)
 
         for line_no, row in enumerate(rdr, start=2):  # header is line 1
-            try:
-                validate_minimum_fields(row)
-                dom = (row.get("domain") or "").strip()
-                validate_domain_sanity(dom)
-
-                rows.append(row)
-                # Fail early if we exceed the user-specified cap
-                enforce_row_cap(len(rows), max_rows or MAX_ROWS_DEFAULT)
-            except Exception as e:
-                log_reject(line_no, str(e), row)
+            _normalize_legacy_fields(row)
+            errs = _preflight_errors(row)
+            if errs:
+                log_reject(line_no, "; ".join(errs), row)
                 continue
+
+            rows.append(row)
+            enforce_row_cap(len(rows), max_rows or MAX_ROWS_DEFAULT)
 
     print(f"Rejects file (if any): {current_rejects_file()}")
     return rows
 
 
 # ---------------- JSONL (per-row rejects, mirrored from CSV) ----------------
-def iter_jsonl_rows(path: str, max_rows: int | None) -> list[dict[str, str]]:
+def iter_jsonl_rows(path: str, max_rows: int | None) -> list[dict[str, Any]]:
     """
     Read JSONL one object per line. Invalid rows are logged to rejects with line numbers.
-    Enforces a strict row cap using enforce_row_cap to fail early on oversized inputs.
+    Enforces a strict row cap to fail early on oversized inputs.
+    Returns only rows that pass R07 preflight (company+name).
     """
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):  # keep 1-based line numbers
             s = line.strip()
@@ -106,16 +135,18 @@ def iter_jsonl_rows(path: str, max_rows: int | None) -> list[dict[str, str]]:
                 log_reject(line_no, f"json: {e}", {"_raw": s})
                 continue
 
-            try:
-                validate_minimum_fields(obj)
-                dom = (obj.get("domain") or "").strip()
-                validate_domain_sanity(dom)
-
-                rows.append(obj)
-                enforce_row_cap(len(rows), max_rows or MAX_ROWS_DEFAULT)
-            except Exception as e:
-                log_reject(line_no, str(e), obj)
+            if not isinstance(obj, dict):
+                log_reject(line_no, "json object is not a dict", {"_raw": s})
                 continue
+
+            _normalize_legacy_fields(obj)
+            errs = _preflight_errors(obj)
+            if errs:
+                log_reject(line_no, "; ".join(errs), obj)
+                continue
+
+            rows.append(obj)
+            enforce_row_cap(len(rows), max_rows or MAX_ROWS_DEFAULT)
 
     print(f"Rejects file (if any): {current_rejects_file()}")
     return rows
@@ -125,10 +156,10 @@ def iter_jsonl_rows(path: str, max_rows: int | None) -> list[dict[str, str]]:
 def _read_delim(path: Path, delim: str, strict: bool, max_rows: int | None):
     """
     Legacy TSV/CSV path that performs validation during iteration.
-    Maintained for compatibility; mirrors the row-cap guardrail.
+    Mirrors the row-cap guardrail and R07 preflight rules.
+    Returns (ok_rows, errs).
     """
-    count = 0
-    ok_rows: list[dict[str, object]] = []
+    ok_rows: list[dict[str, Any]] = []
     errs: list[str] = []
 
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -138,39 +169,57 @@ def _read_delim(path: Path, delim: str, strict: bool, max_rows: int | None):
         except ValueError as e:
             return [], [f"Header error: {e}"]
 
-        for i, row in enumerate(reader, start=2):  # data starts at line 2
-            count += 1
+        for line_no, row in enumerate(reader, start=2):  # data starts at line 2
             try:
-                enforce_row_cap(count, max_rows or MAX_ROWS_DEFAULT)
+                enforce_row_cap(len(ok_rows) + 1, max_rows or MAX_ROWS_DEFAULT)
             except TooManyRowsError:
-                # Propagate to caller for unified handling
                 raise
 
-            try:
-                validate_minimum_fields(row)
-                validate_domain_sanity(row.get("domain"))
-            except Exception as e:
+            _normalize_legacy_fields(row)
+            row_errs = _preflight_errors(row)
+            if row_errs:
+                msg = f"Line {line_no}: {'; '.join(row_errs)}"
                 if strict:
-                    return [], [f"Line {i}: {e}"]
-                errs.append(f"Line {i}: {e}")
+                    return [], [msg]
+                errs.append(msg)
                 continue
 
-            dbrow, _ = normalize_row(row)
-            ok_rows.append(dbrow)
+            ok_rows.append(row)
 
     return ok_rows, errs
 
 
-def _normalize_and_fill(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+# ---------------- Small helpers to keep main() simple ----------------
+def _detect_format(p: Path, override: str | None) -> str:
+    fmt = (override or p.suffix.lower().lstrip(".")).lower()
+    if fmt not in {"csv", "tsv", "jsonl"}:
+        raise ValueError("Cannot detect format (use --format).")
+    return fmt
+
+
+def _ingest_file(fmt: str, p: Path, max_rows: int, strict: bool) -> tuple[int, list[str]]:
     """
-    Run normalize_row and ensure required fields for DB writes (e.g., role).
+    Run ingestion for a given file format and return (accepted_count, errors).
     """
-    normalized = [normalize_row(r)[0] for r in rows]
-    for r in normalized:
-        # Safety net: ensure role is present and non-empty for NOT NULL constraint.
-        if "role" not in r or r["role"] is None or str(r["role"]).strip() == "":
-            r["role"] = "other"
-    return normalized
+    accepted = 0
+    errs: list[str] = []
+
+    if fmt == "csv":
+        for r in iter_csv_rows(str(p), max_rows):
+            if ingest_row(r):
+                accepted += 1
+    elif fmt == "jsonl":
+        for r in iter_jsonl_rows(str(p), max_rows):
+            if ingest_row(r):
+                accepted += 1
+    else:  # tsv
+        ok_rows, errs = _read_delim(p, "\t", strict, max_rows)
+        if not errs:
+            for r in ok_rows:
+                if ingest_row(r):
+                    accepted += 1
+
+    return accepted, errs
 
 
 def main() -> None:
@@ -182,33 +231,23 @@ def main() -> None:
         print(f"File not found: {p}", file=sys.stderr)
         sys.exit(2)
 
-    fmt = args.format or p.suffix.lower().lstrip(".")
-    if fmt not in {"csv", "tsv", "jsonl"}:
-        print("Cannot detect format (use --format).", file=sys.stderr)
+    try:
+        fmt = _detect_format(p, args.format)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         sys.exit(2)
 
-    errs: list[str] = []
-    ok_rows: list[dict[str, object]] = []
+    # Respect dry-run by telling ingest_row to skip persistence.
+    if args.dry_run:
+        os.environ["INGEST_SKIP_PERSIST"] = "1"
 
     try:
-        if fmt == "csv":
-            # CSV: BOM-safe + per-row reject logging
-            raw_rows = iter_csv_rows(str(p), args.max_rows)
-            ok_rows = _normalize_and_fill(raw_rows)
-        elif fmt == "jsonl":
-            # JSONL: per-row reject logging (mirrors CSV)
-            raw_rows = iter_jsonl_rows(str(p), args.max_rows)
-            ok_rows = _normalize_and_fill(raw_rows)
-        else:  # tsv
-            ok_rows, errs = _read_delim(p, "\t", args.strict, args.max_rows)
+        accepted, errs = _ingest_file(fmt, p, args.max_rows, args.strict)
     except TooManyRowsError as e:
-        # Ensure a clear, actionable message for oversized payloads.
-        # Example: "Input contains 12,431 rows but --max-rows=10,000. Lower your file size or raise the cap."
         print(str(e), file=sys.stderr)
         print("Lower your file size or raise --max-rows.", file=sys.stderr)
         sys.exit(3)
     except ValueError as e:
-        # Header-level or other early fatal validation
         print(str(e), file=sys.stderr)
         sys.exit(2)
 
@@ -221,11 +260,9 @@ def main() -> None:
         sys.exit(1)
 
     if args.dry_run:
-        print(f"Validated {len(ok_rows)} rows. (dry-run; no DB writes)")
-        sys.exit(0)
-
-    inserted = bulk_insert_ingest_items(ok_rows) if ok_rows else 0
-    print(f"Inserted {inserted} rows into ingest_items.")
+        print(f"Validated {accepted} rows. (dry-run; no DB writes)")
+    else:
+        print(f"Inserted {accepted} rows into ingest_items.")
     sys.exit(0)
 
 

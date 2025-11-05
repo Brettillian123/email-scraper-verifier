@@ -88,8 +88,6 @@ CREATE TABLE IF NOT EXISTS ingest_items (
 );
 CREATE INDEX IF NOT EXISTS ix_ingest_items_created_at ON ingest_items(created_at);
 
-
 -- R07 Guardrail: keep raw domain separate from official one
 ALTER TABLE companies ADD COLUMN user_supplied_domain TEXT;
 CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain ON companies(user_supplied_domain);
-

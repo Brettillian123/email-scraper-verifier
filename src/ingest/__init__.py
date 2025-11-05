@@ -1,4 +1,3 @@
-# src/ingest/__init__.py
 from __future__ import annotations
 
 import os
@@ -493,35 +492,22 @@ def ingest_row(row: dict[str, Any]) -> bool:  # noqa: C901
     Normalize, validate, persist, and enqueue a verification job.
     Returns True if accepted, False if rejected.
 
-    IMPORTANT GUARDRAIL:
-    - The CSV/JSONL `domain` value is normalized and stored ONLY as `user_supplied_domain`.
-    - We DO NOT write to `companies.domain` here. R08 will resolve official domains.
+    R07 rules:
+    - `company` is required
+    - Must have either `full_name` or BOTH `first_name` and `last_name`
+    - `role` is optional and buckets to "other" if blank
+    - `user_supplied_domain` is accepted verbatim (normalized if parseable) and not authoritative
     """
-    # --- EARLY gate on role presence ---
+    # R07: role is optional; if missing/blank we map to "other"
     role_raw = row.get("role")
-
-    if _INGEST_DEBUG:
-        rt = "" if role_raw is None else str(role_raw)
-        print(
-            "[INGEST-DEBUG] role_raw repr=",
-            repr(rt),
-            "cats=",
-            [_ud.category(c) for c in rt],
-            "codes=",
-            [hex(ord(c)) for c in rt],
-        )
-
-    if (not _has_visible_text(role_raw)) or (str(role_raw).strip().lower() in _ROLE_PLACEHOLDERS):
-        if _INGEST_DEBUG:
-            print("[INGEST-DEBUG] decision: REJECT (empty/placeholder role)")
-        return False
-
     company_raw = row.get("company")
-    domain_raw = row.get("domain")
+    # R07: prefer user_supplied_domain; accept legacy "domain" as fallback
+    domain_raw = row.get("user_supplied_domain", row.get("domain"))
 
     company = normalize_company(company_raw)
-    # Carry the CSV/JSONL domain here only (not authoritative)
-    user_supplied_domain = normalize_domain(domain_raw)
+    # Carry the CSV/JSONL domain here only (not authoritative).
+    # If it doesn't normalize, leave empty.
+    user_supplied_domain = normalize_domain(domain_raw) if domain_raw else ""
     role = map_role(role_raw)
     title = normalize_company(row.get("title"))
     source_url = (row.get("source_url") or "").strip()
@@ -534,16 +520,17 @@ def ingest_row(row: dict[str, Any]) -> bool:  # noqa: C901
     if not (first_name or last_name) and full_name:
         first_name, last_name = split_name(full_name)
 
-    # If a domain string was supplied but normalization yields empty -> reject
-    if (domain_raw is not None) and str(domain_raw).strip() and not user_supplied_domain:
+    # R07 guardrails:
+    # - company is required
+    # - must have either full_name or (first_name AND last_name)
+    if not company:
         if _INGEST_DEBUG:
-            print("[INGEST-DEBUG] decision: REJECT (invalid user-supplied domain)")
+            print("[INGEST-DEBUG] decision: REJECT (company is required)")
         return False
-
-    # Must have at least one of (company or user_supplied_domain)
-    if not (user_supplied_domain or company):
+    has_name = bool(full_name or (first_name and last_name))
+    if not has_name:
         if _INGEST_DEBUG:
-            print("[INGEST-DEBUG] decision: REJECT (no company/user_supplied_domain)")
+            print("[INGEST-DEBUG] decision: REJECT (name is required)")
         return False
 
     normalized = {
@@ -559,20 +546,20 @@ def ingest_row(row: dict[str, Any]) -> bool:  # noqa: C901
         "full_name": full_name if full_name else f"{first_name} {last_name}".strip(),
     }
 
-    # Persist locally so the test DB sees rows regardless of any external DAL.
-    try:
-        _persist_row(normalized)
-    except Exception as _e:
-        if _INGEST_DEBUG:
-            print("[INGEST-DEBUG] persistence error:", repr(_e))
+    # Respect dry-run skip if set by CLI
+    if os.getenv("INGEST_SKIP_PERSIST") != "1":
+        try:
+            _persist_row(normalized)
+        except Exception as _e:
+            if _INGEST_DEBUG:
+                print("[INGEST-DEBUG] persistence error:", repr(_e))
 
-    # Enqueue one job per accepted row — late-bind so monkeypatch sees it.
-    # We DO NOT pass a 'domain' here; we include 'user_supplied_domain' for R08 to resolve.
+    # Enqueue one job per accepted row — tests monkeypatch this.
     try:
         enqueue(
             "verify",
             {
-                "user_supplied_domain": user_supplied_domain,  # not authoritative
+                "user_supplied_domain": user_supplied_domain,
                 "company": company,
                 "first_name": first_name,
                 "last_name": last_name,

@@ -1,3 +1,3 @@
-{"company":"Acme","domain":"acme.com","role":"cfo","first_name":"Grace","last_name":"Hopper","title":"CFO","source_url":"https://acme.com/about"}
-{"company":"Bücher GmbH","domain":"bücher.de","role":"VP Marketing","full_name":"Anna Schmidt","title":"VP Marketing","source_url":"https://bücher.de/team"}
-{"company":"","domain":"","role":"cto","full_name":"Bad Row","title":"N/A"}
+{"full_name":"Ada Lovelace","company":"Acme","user_supplied_domain":"acme.com"}
+{"full_name":"","company":"","user_supplied_domain":""}
+{"full_name":"Anna Schmidt","company":"Bücher GmbH","user_supplied_domain":"bücher.de"}

@@ -53,6 +53,15 @@ def resolve_company_domain(
         dict: {"company_id", "chosen", "method", "confidence"}
     """
     dec = resolve(company_name, user_hint)
+    log.info(
+        "resolve_domain company_id=%s name=%r hint=%r chosen=%r method=%s confidence=%s",
+        company_id,
+        company_name,
+        user_hint,
+        getattr(dec, "chosen", None),
+        getattr(dec, "method", "unknown"),
+        getattr(dec, "confidence", 0),
+    )
     with _conn() as con:
         write_domain_resolution(con, company_id, company_name, dec, user_hint)
     return {

@@ -1,4 +1,3 @@
-# src/config.py
 from __future__ import annotations
 
 import os
@@ -103,20 +102,17 @@ class AppConfig:
 
 
 def load_settings() -> AppConfig:
-    """Load environment variables into structured config for R06 queue/rate/retry/SMTP."""
     queue = QueueConfig(
         queue_name=_getenv_str("QUEUE_NAME", "verify"),
         dlq_name=_getenv_str("DLQ_NAME", "verify_dlq"),
         rq_redis_url=_getenv_str("RQ_REDIS_URL", "redis://127.0.0.1:6379/0"),
     )
-
     rate = RateLimitConfig(
         global_max_concurrency=_getenv_int("GLOBAL_MAX_CONCURRENCY", 12),
         global_rps=_getenv_int("GLOBAL_RPS", 6),
         per_mx_max_concurrency_default=_getenv_int("PER_MX_MAX_CONCURRENCY_DEFAULT", 2),
         per_mx_rps_default=_getenv_int("PER_MX_RPS_DEFAULT", 1),
     )
-
     retry_timeout = RetryTimeoutConfig(
         verify_max_attempts=_getenv_int("VERIFY_MAX_ATTEMPTS", 5),
         verify_base_backoff_seconds=_getenv_int("VERIFY_BASE_BACKOFF_SECONDS", 2),
@@ -125,11 +121,9 @@ def load_settings() -> AppConfig:
         smtp_cmd_timeout_seconds=_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 30),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
     )
-
     smtp_identity = SmtpIdentityConfig(
         helo_domain=_getenv_str("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com"),
     )
-
     return AppConfig(
         queue=queue,
         rate=rate,

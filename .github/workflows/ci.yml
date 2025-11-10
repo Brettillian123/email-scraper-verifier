@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   pull_request:
@@ -8,6 +8,7 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,13 +26,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install python-dotenv pytest ruff pre-commit detect-secrets
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r tests/requirements-test.txt
+          # Install your project so imports like "src.queueing" work consistently
+          python -m pip install -e .
 
+      # Linting (checks only; no formatting in CI)
+      - name: Ruff (lint)
+        run: python -m ruff check .
+
+      - name: Ruff (format check)
+        run: python -m ruff format --check .
+
+      # Optional: run your pre-commit hooks in CI (detect-secrets, etc.)
       - name: Pre-commit (all files)
-        run: pre-commit run --all-files
+        run: |
+          python -m pip install pre-commit detect-secrets
+          pre-commit run --all-files
 
-      - name: Tests
-        run: pytest
+      - name: Run tests
+        # DO NOT set PYTHONPATH=src; it can shadow stdlib 'queue'
+        run: |
+          pytest -q

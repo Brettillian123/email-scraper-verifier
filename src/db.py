@@ -7,11 +7,17 @@ from typing import Any
 # -------------------- basics --------------------
 
 
-def _db_path():
-    url = os.environ["DATABASE_URL"]
-    if not url.startswith("sqlite:///"):
-        raise RuntimeError(f"Only sqlite supported in dev; got {url}")
-    return url.removeprefix("sqlite:///")
+def _db_path() -> str:
+    # Prefer DATABASE_URL if set; otherwise fall back to DATABASE_PATH; otherwise dev.db
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        if not url.startswith("sqlite:///"):
+            raise RuntimeError(f"Only sqlite supported in dev; got {url}")
+        return url.removeprefix("sqlite:///")
+    path = os.environ.get("DATABASE_PATH")
+    if path:
+        return path
+    return "dev.db"
 
 
 def _table_columns(cur, table: str) -> dict[str, dict]:
@@ -282,7 +288,9 @@ def write_domain_resolution(
     Expects `decision` to have: chosen (str|None), method (str), confidence (int), reason (str).
     """
     # Prefer a version on the decision if present; otherwise default to R08's current label.
-    resolver_version = getattr(decision, "version", "r08.1")
+    resolver_version = (
+        getattr(decision, "resolver_version", None) or getattr(decision, "version", None) or "r08.3"
+    )
     chosen = getattr(decision, "chosen", None)
     method = getattr(decision, "method", None)
     confidence = int(getattr(decision, "confidence", 0) or 0)

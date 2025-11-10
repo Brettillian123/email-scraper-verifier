@@ -11,8 +11,18 @@ import httpx
 import idna
 import tldextract
 
+__all__ = [
+    "RESOLVER_VERSION",
+    "Candidate",
+    "Decision",
+    "normalize_hint",
+    "candidates_from_name",
+    "decide",
+    "resolve",
+]
+
 # Bump when resolver logic meaningfully changes
-RESOLVER_VERSION = "r08.2"
+RESOLVER_VERSION = "r08.4"
 
 # Tight, test-friendly timeouts (kept tiny by design)
 _HTTP_TIMEOUT = httpx.Timeout(3.0)
@@ -60,7 +70,12 @@ _CORP_SUFFIX_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-DOMAIN_SPLIT = re.compile(r"^[a-z]+://", re.IGNORECASE)
+# Matches scheme or protocol-relative prefix (e.g., "https://" or "//")
+_SCHEME_OR_PR = re.compile(r"^(?:[a-z][a-z0-9+.\-]*:)?//", re.IGNORECASE)
+
+# Strict-ish domain sanity
+_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+_ALLOWED_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789-.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,15 +92,33 @@ class Decision:
     method: str
     confidence: int
     reason: str
+    # carry the resolver version for auditing (picked up by write_domain_resolution)
+    version: str = RESOLVER_VERSION
 
 
 def _strip_scheme_www(host_like: str) -> str:
-    s = host_like.strip()
-    # Lowercase early; strip scheme and leading wwwN.
-    s = DOMAIN_SPLIT.sub("", s).lower()
+    """
+    Convert a host/url/email-like string to a bare host:
+    - drop scheme or protocol-relative slashes
+    - if there's an '@', keep only the part after it (handles 'user@host')
+    - strip leading www[digits].
+    - drop port and path, drop trailing dot
+    """
+    s = host_like.strip().lower()
+
+    # If it's like user@domain, keep the host part (also handles http://user@host)
+    if "@" in s:
+        s = s.rsplit("@", 1)[-1]
+
+    # Strip scheme or protocol-relative '//' (handles e.g., Location: //example.com/..)
+    s = _SCHEME_OR_PR.sub("", s)
+
+    # Strip leading wwwN.
     s = re.sub(r"^www\d*\.", "", s)
+
     # Remove port and path
     s = s.split("/")[0].split(":")[0]
+
     # Remove trailing dot (rooted FQDN)
     if s.endswith("."):
         s = s[:-1]
@@ -108,14 +141,32 @@ def _registrable(apex_or_host: str) -> str:
     return f"{ext.domain}.{ext.suffix}".lower()
 
 
+def _labels_ok(domain_ascii: str) -> bool:
+    """
+    Basic but strict label checks:
+      - total length <= 253
+      - labels are 1..63, no leading/trailing hyphen
+      - only a-z 0-9 '-' '.' overall
+      - at least one dot
+    """
+    if "." not in domain_ascii or len(domain_ascii) > 253:
+        return False
+    if any(ch not in _ALLOWED_CHARS for ch in domain_ascii):
+        return False
+    for lab in domain_ascii.split("."):
+        if not _LABEL_RE.match(lab):
+            return False
+    return True
+
+
 def _valid_like_domain(s: str) -> bool:
-    # very light sanity: at least one dot and no spaces/underscores
+    # light prefilter to avoid expensive idna work; detailed checks happen after punycoding
     return "." in s and " " not in s and "_" not in s
 
 
 def normalize_hint(hint: str | None) -> Candidate | None:
     """
-    Normalize a user-provided host/domain/url-like hint to a punycoded apex domain.
+    Normalize a user-provided host/domain/url/email-like hint to a punycoded apex domain.
     Rejects denylisted consumer/hosting domains.
     """
     if not hint:
@@ -127,8 +178,10 @@ def normalize_hint(hint: str | None) -> Candidate | None:
         d_ascii = _to_punycode(host)
     except idna.IDNAError:
         return None
+    if not _labels_ok(d_ascii):
+        return None
     apex = _registrable(d_ascii)
-    if apex in _DENY:
+    if apex in _DENY or not _labels_ok(apex):
         return None
     return Candidate(raw=hint, domain=apex, reason="hint_normalized", base_conf=70)
 
@@ -169,7 +222,9 @@ def _dns_any(host: str) -> bool:
     True if the domain has any of MX/A/AAAA. Cached for the process lifetime.
     """
     r = dns.resolver.Resolver(configure=True)
+    # be explicit on both; some dnspython versions use both fields
     r.lifetime = _DNS_TIMEOUT
+    r.timeout = _DNS_TIMEOUT
     try:
         for rtype in ("MX", "A", "AAAA"):
             try:
@@ -195,23 +250,29 @@ def _http_head_ok(host: str) -> tuple[bool, str | None]:
     def _probe(scheme: str) -> tuple[bool, str | None]:
         url = f"{scheme}://{host}"
         try:
-            with httpx.Client(headers=headers, timeout=_HTTP_TIMEOUT, follow_redirects=False) as c:
+            limits = httpx.Limits(max_keepalive_connections=0, max_connections=10)
+            with httpx.Client(
+                headers=headers, timeout=_HTTP_TIMEOUT, follow_redirects=False, limits=limits
+            ) as c:
                 r = c.head(url)
+                # 2xx → OK
                 if 200 <= r.status_code < 300:
                     return True, None
+                # 3xx → try to parse Location (host may be absolute, protocol-relative, or relative)
                 if 300 <= r.status_code < 400:
                     loc = r.headers.get("location")
                     if loc:
-                        # Pull host from the Location, tolerate relative forms
                         loc_host = _strip_scheme_www(loc)
                         if _valid_like_domain(loc_host):
                             try:
-                                return True, _registrable(_to_punycode(loc_host))
+                                loc_apex = _registrable(_to_punycode(loc_host))
+                                if _labels_ok(loc_apex):
+                                    return True, loc_apex
                             except idna.IDNAError:
                                 return True, None
                     return True, None
+                # 405 → some origins block HEAD; try a tiny GET
                 if r.status_code == 405:
-                    # Some origins block HEAD; try a tiny GET
                     r = c.get(url, headers={"Range": "bytes=0-0"})
                     if 200 <= r.status_code < 400:
                         return True, None
@@ -227,11 +288,13 @@ def _http_head_ok(host: str) -> tuple[bool, str | None]:
     return ok, loc
 
 
+def _tld_bonus_for(domain: str) -> int:
+    return _TLD_BONUS.get((_EXTRACT(domain).suffix or ""), 0)
+
+
 def _score_base(candidate: Candidate) -> int:
     # Start from base_conf; add small TLD preference if known
-    ext = _EXTRACT(candidate.domain)
-    bonus = _TLD_BONUS.get(ext.suffix or "", 0)
-    return candidate.base_conf + bonus
+    return candidate.base_conf + _tld_bonus_for(candidate.domain)
 
 
 def decide(cands: Iterable[Candidate]) -> Decision:
@@ -243,6 +306,8 @@ def decide(cands: Iterable[Candidate]) -> Decision:
     by_domain: dict[str, Candidate] = {}
     for c in cands:
         if c.domain in _DENY:
+            continue
+        if not _labels_ok(c.domain):
             continue
         existing = by_domain.get(c.domain)
         if existing is None or c.base_conf > existing.base_conf:
@@ -268,26 +333,31 @@ def decide(cands: Iterable[Candidate]) -> Decision:
         if http_ok:
             score += 25
 
-        # If there is an external redirect to a different apex, consider it (lightly)
+        # Default pick (may be overridden by redirect)
         picked_domain = c.domain
-        if http_ok:
+        picked_method = "candidate"
+        picked_reason = c.reason
+
+        if http_ok and dns_ok:
             picked_method = "http_ok"
             picked_reason = "dns+http_ok"
+        elif http_ok:
+            picked_method = "http_ok"
+            picked_reason = "http_ok"
         elif dns_ok:
             picked_method = "dns_valid"
             picked_reason = "dns_ok"
-        else:
-            picked_method = "candidate"
-            picked_reason = c.reason
 
-        if http_ok and loc and loc != c.domain and loc not in _DENY:
-            # Only trust redirect if the target resolves too
+        # Consider external redirect apex, if it also resolves and is allowed
+        if http_ok and loc and loc != c.domain and loc not in _DENY and _labels_ok(loc):
             if _dns_any(loc):
-                # Prefer the redirect slightly over the original
+                # Rebase score to the redirected apex' TLD bonus and add a small nudge
+                score -= _tld_bonus_for(c.domain)
+                score += _tld_bonus_for(loc)
+                score += 5
                 picked_domain = loc
                 picked_method = "http_redirect"
                 picked_reason = f"redirect->{loc}"
-                score += 5
 
         # Deterministic tie-breakers:
         # 1) higher score

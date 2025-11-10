@@ -2,15 +2,22 @@
 import os
 import sqlite3
 from datetime import UTC, datetime
+from typing import Any
 
 # -------------------- basics --------------------
 
 
-def _db_path():
-    url = os.environ["DATABASE_URL"]
-    if not url.startswith("sqlite:///"):
-        raise RuntimeError(f"Only sqlite supported in dev; got {url}")
-    return url.removeprefix("sqlite:///")
+def _db_path() -> str:
+    # Prefer DATABASE_URL if set; otherwise fall back to DATABASE_PATH; otherwise dev.db
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        if not url.startswith("sqlite:///"):
+            raise RuntimeError(f"Only sqlite supported in dev; got {url}")
+        return url.removeprefix("sqlite:///")
+    path = os.environ.get("DATABASE_PATH")
+    if path:
+        return path
+    return "dev.db"
 
 
 def _table_columns(cur, table: str) -> dict[str, dict]:
@@ -250,3 +257,89 @@ def upsert_verification_result(
         """
         cur.execute(sql, insert_vals)
         con.commit()
+
+
+# ---------------- R08: DB integration helpers ----------------
+
+
+def set_user_hint_and_enqueue(
+    conn: sqlite3.Connection, company_id: int, user_hint: str | None
+) -> None:
+    """
+    Store a user-supplied domain hint on the company.
+    (Enqueueing is handled by the caller/task layer if needed.)
+    """
+    with conn:
+        conn.execute(
+            "UPDATE companies SET user_supplied_domain = ? WHERE id = ?",
+            (user_hint, company_id),
+        )
+
+
+def write_domain_resolution(
+    conn: sqlite3.Connection,
+    company_id: int,
+    company_name: str,
+    decision: Any,
+    user_hint: str | None,
+) -> None:
+    """
+    Persist a resolver Decision and, if a domain was chosen, update the company's official domain.
+    Expects `decision` to have: chosen (str|None), method (str), confidence (int), reason (str).
+    """
+    # Prefer a version on the decision if present; otherwise default to R08's current label.
+    resolver_version = (
+        getattr(decision, "resolver_version", None) or getattr(decision, "version", None) or "r08.3"
+    )
+    chosen = getattr(decision, "chosen", None)
+    method = getattr(decision, "method", None)
+    confidence = int(getattr(decision, "confidence", 0) or 0)
+    reason = getattr(decision, "reason", None)
+
+    with conn:
+        # Audit trail of the resolution attempt
+        conn.execute(
+            """
+            INSERT INTO domain_resolutions (
+                company_id,
+                company_name,
+                user_hint,
+                chosen_domain,
+                method,
+                confidence,
+                reason,
+                resolver_version
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                company_id,
+                company_name,
+                user_hint,
+                chosen,
+                method,
+                confidence,
+                reason,
+                resolver_version,
+            ),
+        )
+
+        # If we have a decision, update the canonical fields on companies
+        # using our existing column names.
+        if chosen:
+            now = _ts_iso8601_z(None)
+            # Our schema uses official_domain*, not domain_official*.
+            # Also keep provenance of how we decided (method) and when.
+            conn.execute(
+                """
+                UPDATE companies
+                   SET official_domain              = ?,
+                       official_domain_confidence   = ?,
+                       official_domain_source       = ?,
+                       official_domain_checked_at   = ?
+                 WHERE id = ?
+                """,
+                (chosen, confidence, method, now, company_id),
+            )

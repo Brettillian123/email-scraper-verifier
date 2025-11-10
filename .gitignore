@@ -1,3 +1,18 @@
 logs/
 *.bin
 dev.db*
+# venv & OS
+.venv/
+$ENV
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data
+*.db
+*.sqlite
+data/

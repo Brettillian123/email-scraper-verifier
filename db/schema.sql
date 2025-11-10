@@ -1,15 +1,28 @@
--- companies
-CREATE TABLE companies (
+-- companies (writer updates official_ domain is nullable)
+CREATE TABLE IF NOT EXISTS companies (
   id INTEGER PRIMARY KEY,
   name TEXT,
-  domain TEXT NOT NULL UNIQUE,
+  domain TEXT,                               -- user/ingest field (nullable)
   website_url TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now'))
+  updated_at TEXT DEFAULT (datetime('now')),
+
+  -- canonical resolver outputs written by src/db.py (official_*)
+  official_domain TEXT,
+  official_domain_source TEXT,
+  official_domain_confidence INTEGER,
+  official_domain_checked_at TEXT,
+
+  -- raw hint from ingest
+  user_supplied_domain TEXT
 );
 
+-- handy for lookups by user hint
+CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain
+  ON companies(user_supplied_domain);
+
 -- people
-CREATE TABLE people (
+CREATE TABLE IF NOT EXISTS people (
   id INTEGER PRIMARY KEY,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   first_name TEXT,
@@ -22,21 +35,20 @@ CREATE TABLE people (
 );
 
 -- emails (can be published or generated permutations)
-CREATE TABLE emails (
+CREATE TABLE IF NOT EXISTS emails (
   id INTEGER PRIMARY KEY,
   person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   email TEXT NOT NULL,
   is_published INTEGER DEFAULT 0,  -- 1 if seen on-page
-  source_url TEXT,                 -- page showing this exact email if published
-  icp_score REAL,                  -- denormalized for convenience
+  source_url TEXT,                  -- page showing this exact email if published
+  icp_score REAL,                   -- denormalized for convenience
   created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(company_id, email)
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 
 -- verification results (many per email over time)
-CREATE TABLE verification_results (
+CREATE TABLE IF NOT EXISTS verification_results (
   id INTEGER PRIMARY KEY,
   email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
   mx_host TEXT,
@@ -46,7 +58,7 @@ CREATE TABLE verification_results (
 );
 
 -- suppression (global/tenant-wide do-not-verify/contact)
-CREATE TABLE suppression (
+CREATE TABLE IF NOT EXISTS suppression (
   id INTEGER PRIMARY KEY,
   email TEXT,
   domain TEXT,
@@ -57,14 +69,14 @@ CREATE TABLE suppression (
 );
 
 -- helpful indexes
-CREATE INDEX idx_people_company ON people(company_id);
-CREATE INDEX idx_emails_company ON emails(company_id);
+CREATE INDEX IF NOT EXISTS idx_people_company ON people(company_id);
+CREATE INDEX IF NOT EXISTS idx_emails_company ON emails(company_id);
 
--- enforce global idempotency by email
+-- enforce global idempotency by email (single truth for email rows)
 DROP INDEX IF EXISTS idx_emails_email;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email);
 
-CREATE INDEX idx_verif_email ON verification_results(email_id);
+CREATE INDEX IF NOT EXISTS idx_verif_email ON verification_results(email_id);
 
 -- R07 ingestion staging table
 CREATE TABLE IF NOT EXISTS ingest_items (
@@ -88,6 +100,20 @@ CREATE TABLE IF NOT EXISTS ingest_items (
 );
 CREATE INDEX IF NOT EXISTS ix_ingest_items_created_at ON ingest_items(created_at);
 
--- R07 Guardrail: keep raw domain separate from official one
-ALTER TABLE companies ADD COLUMN user_supplied_domain TEXT;
-CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain ON companies(user_supplied_domain);
+-- R08: resolution audit log (many attempts per company over time)
+CREATE TABLE IF NOT EXISTS domain_resolutions (
+  id               INTEGER PRIMARY KEY,
+  company_id       INTEGER NOT NULL,
+  company_name     TEXT NOT NULL,
+  user_hint        TEXT,                      -- from ingest row (may be NULL)
+  chosen_domain    TEXT,                      -- punycode ascii
+  method           TEXT NOT NULL,             -- 'http_ok' | 'dns_valid' | 'http_redirect' | 'candidate' | 'none'
+  confidence       INTEGER NOT NULL,          -- 0..100
+  reason           TEXT,                      -- short human-readable decision note
+  resolver_version TEXT NOT NULL,             -- e.g. 'r08.3'
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_resolutions_company_id
+  ON domain_resolutions(company_id);

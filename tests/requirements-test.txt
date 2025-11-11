@@ -2,3 +2,10 @@ pytest>=8,<9
 redis>=5,<6
 fakeredis>=2,<3
 ruff>=0.14.3,<0.15
+
+# HTTP mocking for httpx
+respx>=0.21
+
+pytest-httpserver>=1.0,<2.0
+freezegun>=1.4,<2.0
+time-machine>=2.14,<3.0

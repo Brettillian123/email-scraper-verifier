@@ -34,9 +34,19 @@ def _getenv_list_int(name: str, default_csv: str) -> list[int]:
     return out
 
 
+def _getenv_list_str(name: str, default_csv: str) -> list[str]:
+    raw = os.getenv(name, default_csv).strip()
+    out: list[str] = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if tok:
+            out.append(tok)
+    return out
+
+
 # Load .env from project root if present
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
+
 # Defaults expected by tests
 DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"  # sqlite file in project root
 DEFAULT_USER_AGENT = "EmailVerifierBot/0.1 (+banderson@crestwellpartners.com)"
@@ -46,6 +56,31 @@ def _parse_intervals(v: str | None) -> list[int]:
     if not v:
         return [60, 300, 900]  # sensible defaults: 1m, 5m, 15m
     return [int(x.strip()) for x in v.split(",") if x.strip()]
+
+
+# -------------------------------
+# R09: Fetch/robots config (constants, env-overridable)
+# -------------------------------
+FETCH_USER_AGENT: str = _getenv_str(
+    "FETCH_USER_AGENT",
+    (
+        "EmailVerifierBot/0.9 "
+        "(+https://verifier.crestwellpartners.com/; "
+        "contact: banderson@crestwellpartners.com)"
+    ),
+)
+FETCH_DEFAULT_DELAY_SEC: int = _getenv_int("FETCH_DEFAULT_DELAY_SEC", 3)
+FETCH_TIMEOUT_SEC: int = _getenv_int("FETCH_TIMEOUT_SEC", 5)
+FETCH_CONNECT_TIMEOUT_SEC: int = _getenv_int("FETCH_CONNECT_TIMEOUT_SEC", 5)
+FETCH_CACHE_TTL_SEC: int = _getenv_int("FETCH_CACHE_TTL_SEC", 3600)  # 1h default for HTML
+ROBOTS_CACHE_TTL_SEC: int = _getenv_int("ROBOTS_CACHE_TTL_SEC", 86400)  # 24h for robots.txt
+# jittered backoff handled by caller
+FETCH_MAX_RETRIES: int = _getenv_int("FETCH_MAX_RETRIES", 2)
+FETCH_MAX_BODY_BYTES: int = _getenv_int("FETCH_MAX_BODY_BYTES", 2_000_000)  # ≈2MB cap
+FETCH_ALLOWED_CONTENT_TYPES: list[str] = _getenv_list_str(
+    "FETCH_ALLOWED_CONTENT_TYPES",
+    "text/html,text/plain",
+)
 
 
 @dataclass(frozen=True)
@@ -94,11 +129,25 @@ class SmtpIdentityConfig:
 
 
 @dataclass(frozen=True)
+class FetchConfig:
+    user_agent: str
+    default_delay_sec: int
+    timeout_sec: int
+    connect_timeout_sec: int
+    cache_ttl_sec: int
+    robots_cache_ttl_sec: int
+    max_retries: int
+    max_body_bytes: int
+    allowed_content_types: list[str]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     queue: QueueConfig
     rate: RateLimitConfig
     retry_timeout: RetryTimeoutConfig
     smtp_identity: SmtpIdentityConfig
+    fetch: FetchConfig
 
 
 def load_settings() -> AppConfig:
@@ -124,11 +173,23 @@ def load_settings() -> AppConfig:
     smtp_identity = SmtpIdentityConfig(
         helo_domain=_getenv_str("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com"),
     )
+    fetch = FetchConfig(
+        user_agent=FETCH_USER_AGENT,
+        default_delay_sec=FETCH_DEFAULT_DELAY_SEC,
+        timeout_sec=FETCH_TIMEOUT_SEC,
+        connect_timeout_sec=FETCH_CONNECT_TIMEOUT_SEC,
+        cache_ttl_sec=FETCH_CACHE_TTL_SEC,
+        robots_cache_ttl_sec=ROBOTS_CACHE_TTL_SEC,
+        max_retries=FETCH_MAX_RETRIES,
+        max_body_bytes=FETCH_MAX_BODY_BYTES,
+        allowed_content_types=FETCH_ALLOWED_CONTENT_TYPES,
+    )
     return AppConfig(
         queue=queue,
         rate=rate,
         retry_timeout=retry_timeout,
         smtp_identity=smtp_identity,
+        fetch=fetch,
     )
 
 
@@ -143,8 +204,19 @@ __all__ = [
     "RateLimitConfig",
     "RetryTimeoutConfig",
     "SmtpIdentityConfig",
+    "FetchConfig",
     "AppConfig",
     "load_settings",
     "settings",  # legacy flat object
     "app_config",  # structured object
+    # R09 fetch/robots constants
+    "FETCH_USER_AGENT",
+    "FETCH_DEFAULT_DELAY_SEC",
+    "FETCH_TIMEOUT_SEC",
+    "FETCH_CONNECT_TIMEOUT_SEC",
+    "FETCH_CACHE_TTL_SEC",
+    "ROBOTS_CACHE_TTL_SEC",
+    "FETCH_MAX_RETRIES",
+    "FETCH_MAX_BODY_BYTES",
+    "FETCH_ALLOWED_CONTENT_TYPES",
 ]

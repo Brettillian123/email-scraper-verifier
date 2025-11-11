@@ -21,3 +21,5 @@
 
 ## Out of scope (MVP)
 - Paid enrichment, CRM sync, deep JS-rendered crawling.
+
+Robots/ToS: see [robots-policy.md](./robots-policy.md).

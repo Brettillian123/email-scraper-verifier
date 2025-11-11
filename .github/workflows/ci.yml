@@ -13,6 +13,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show branch & head
+        run: |
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD)"
+          echo "Repo status:"
+          git status --porcelain
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -26,13 +33,32 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      - name: Show tests requirements (debug)
+        run: |
+          echo "::group::tests/requirements-test.txt"
+          if [ -f tests/requirements-test.txt ]; then
+            nl -ba tests/requirements-test.txt
+          else
+            echo "tests/requirements-test.txt not found"
+          fi
+          echo "::endgroup::"
+
       - name: Install dependencies
         run: |
-          python -m pip install -U pip
+          python -m pip install -U pip setuptools wheel
           python -m pip install -r requirements.txt
+          # Install test deps from the file in the repo
           python -m pip install -r tests/requirements-test.txt
-          # Install your project so imports like "src.queueing" work consistently
+          # Belt-and-suspenders: ensure respx is present even if the file didn’t include it
+          python -m pip install "respx>=0.21"
+          # Install your project so imports like "src.fetch" resolve
           python -m pip install -e .
+
+      - name: Verify test deps
+        run: |
+          python -c "import respx, httpx; print('respx', respx.__version__, 'httpx', httpx.__version__)"
+          python -m pip show respx || true
+          python -m pip freeze | grep -E '^(httpx|respx|pytest)=='
 
       # Linting (checks only; no formatting in CI)
       - name: Ruff (lint)
@@ -49,5 +75,4 @@ jobs:
 
       - name: Run tests
         # DO NOT set PYTHONPATH=src; it can shadow stdlib 'queue'
-        run: |
-          pytest -q
+        run: pytest -q

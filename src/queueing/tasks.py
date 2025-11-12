@@ -33,6 +33,7 @@ from src.generate.patterns import (
     infer_domain_pattern,  # O01 canonical inference (returns Inference)
 )
 from src.generate.permutations import generate_permutations
+from src.ingest.normalize import normalize_split_parts  # O09 normalization
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -510,10 +511,23 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
       - Collect published examples for the domain.
       - Use canonical inference to decide a single pattern when confident.
       - Optionally persist/read per-domain decisions via domain_patterns.
+
+    O09 enhancement:
+      - Normalize/transliterate name parts before applying patterns so locals are ASCII
+        and particle-aware for global correctness.
     """
     con = get_conn()
     dom = (domain or "").lower().strip()
     if not dom:
+        return {"count": 0, "only_pattern": None, "domain": dom, "person_id": person_id}
+
+    # --- O09: normalize already-split name parts (no reordering, CJK-safe) ---
+    nf, nl = normalize_split_parts(first, last)
+    if not (nf or nl):
+        log.info(
+            "R12 skipped generation due to empty normalized name",
+            extra={"person_id": person_id, "domain": dom, "first": first, "last": last},
+        )
         return {"count": 0, "only_pattern": None, "domain": dom, "person_id": person_id}
 
     # Try cached pattern first (if migration was applied)
@@ -538,8 +552,8 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
     # Generate candidates: use the inferred/cached pattern if available,
     # otherwise fall back to the full canonical set.
     candidates = generate_permutations(
-        first,
-        last,
+        nf,  # normalized/transliterated first
+        nl,  # normalized/transliterated last
         dom,
         only_pattern=inf_pattern,  # canonical key or None
     )
@@ -559,6 +573,8 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
             "domain": dom,
             "first": first,
             "last": last,
+            "first_norm": nf,
+            "last_norm": nl,
             "only_pattern": inf_pattern,
             "inference_confidence": inf_conf,
             "inference_samples": inf_samples,

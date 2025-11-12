@@ -9,3 +9,6 @@ respx>=0.21
 pytest-httpserver>=1.0,<2.0
 freezegun>=1.4,<2.0
 time-machine>=2.14,<3.0
+
+# Internationalization (O09)
+Unidecode>=1.3

@@ -32,3 +32,32 @@ notes:
     - "Chief Technology Officer" → "C"
     - "Head of Marketing" → "Director"
     - "SWE II" → "IC"
+
+# -----------------------------
+# R13 Normalization Rules
+# -----------------------------
+normalization_rules:
+  names:
+    - "Unicode NFKC; trim; collapse whitespace."
+    - "Title-case with particle rules: keep particles lowercase unless leading (e.g., 'de', 'da', 'van', 'bin', 'al', 'de la')."
+    - "Preserve meaningful hyphens/apostrophes (e.g., 'Mary-Kate', 'O’Leary', 'Jean-Paul')."
+    - "Keep diacritics in display form (e.g., 'Bücher'); ASCII fallback used only where needed for generation (O09)."
+  titles:
+    abbreviations_uppercase: [CEO, CFO, COO, CMO, CTO, CIO, CHRO, CRO, VP, SVP, EVP, GM, MD, PhD, CPA, JD, MBA, II, III, IV]
+    small_words_lowercase: [a, an, and, as, at, but, by, for, from, in, into, nor, of, on, or, over, per, the, to, via, vs, with]
+    examples:
+      - "vp, sales & marketing → VP, Sales & Marketing"
+      - "Head Of Data → Head of Data"
+  companies:
+    display_suffixes: [Inc., LLC, Ltd., GmbH, S.A., Sàrl, Pty Ltd, BV, NV, PLC, AG, Oy, Oyj]
+    norm_key: "lowercase; diacritics removed; punctuation stripped; corporate suffixes removed; spaces collapsed."
+    auto_merge: false  # norm_key clusters candidates only; merging is a review/accept step
+    example:
+      raw: "Crestwell Partners, LLC"
+      name_norm: "Crestwell Partners, LLC"
+      norm_key: "crestwell partners"
+  domains:
+    - "Normalize to IDNA ASCII and lowercase (e.g., 'bücher.de' → 'xn--bcher-kva.de')."
+  provenance:
+    - "Always preserve source_url from extraction/generation (R11/R12); normalization must not drop or overwrite it."
+    - "On ingest, copy title to people.title_raw and store normalized title in people.title_norm."

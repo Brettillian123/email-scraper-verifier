@@ -33,7 +33,11 @@ from src.generate.patterns import (
     infer_domain_pattern,  # O01 canonical inference (returns Inference)
 )
 from src.generate.permutations import generate_permutations
-from src.ingest.normalize import normalize_split_parts  # O09 normalization
+from src.ingest.normalize import (
+    normalize_row,  # R13 lightweight full-row normalization
+    normalize_split_parts,  # O09 normalization for generation (ASCII locals)
+)
+from src.ingest.persist import upsert_row as persist_upsert_row  # R13: persist normalized rows
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -515,6 +519,10 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
     O09 enhancement:
       - Normalize/transliterate name parts before applying patterns so locals are ASCII
         and particle-aware for global correctness.
+
+    R13 note:
+      - This task already performs a lightweight normalization (normalize_split_parts)
+        before generation; for *upserts* from other stages, use upsert_person_task().
     """
     con = get_conn()
     dom = (domain or "").lower().strip()
@@ -656,3 +664,50 @@ def crawl_approved_domains(db: str | None = None, limit: int | None = None) -> i
 
     log.info("R10 crawled domains total", extra={"count": count})
     return count
+
+
+# -----------------------------------------------------------
+# R13 helper task: upsert a person with lightweight normalization
+# -----------------------------------------------------------
+
+
+def upsert_person_task(row: dict) -> dict:
+    """
+    R13: Queueable task to upsert a person/company from arbitrary *raw* input.
+
+    - Runs normalize_row(row) (name/title/company normalization; preserves source_url)
+    - Persists via src.ingest.persist.upsert_row()
+    - Returns a small echo payload (without IDs; DB layer remains the source of truth)
+
+    Use this from other stages that discover people (e.g., extractors) so that all
+    entries pass through the same normalization guardrails as CLI ingest.
+    """
+    try:
+        normalized, errors = normalize_row(row or {})
+        # Never drop provenance (normalize_row preserves source_url by design)
+        persist_upsert_row(normalized)
+        log.info(
+            "R13 upsert_person_task persisted",
+            extra={
+                "company": normalized.get("company"),
+                "domain": normalized.get("domain"),
+                "first_name": normalized.get("first_name"),
+                "last_name": normalized.get("last_name"),
+                "title_norm": normalized.get("title_norm"),
+                "company_norm_key": normalized.get("company_norm_key"),
+                "err_count": len(errors),
+            },
+        )
+        return {
+            "ok": True,
+            "errors": errors,
+            "company": normalized.get("company"),
+            "domain": normalized.get("domain"),
+            "first_name": normalized.get("first_name"),
+            "last_name": normalized.get("last_name"),
+            "title_norm": normalized.get("title_norm"),
+            "company_norm_key": normalized.get("company_norm_key"),
+        }
+    except Exception as e:
+        log.exception("R13 upsert_person_task failed", extra={"exc": str(e)})
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}

@@ -1,14 +1,16 @@
+# scripts/migrate_r08_add_domains.py
 import argparse
 import sqlite3
 
 
-def col_exists(conn, table, col):
-    return any(r[1] == col for r in conn.execute(f"PRAGMA table_info({table})"))
+def column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == col for r in rows)  # r[1] is the column name
 
 
-def add_col(conn, table, col, ddl, dry):
-    if not col_exists(conn, table, col):
-        sql = f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"
+def add_column_if_missing(conn: sqlite3.Connection, table: str, col: str, type_sql: str, dry: bool):
+    if not column_exists(conn, table, col):
+        sql = f"ALTER TABLE {table} ADD COLUMN {col} {type_sql}"
         print(f"[APPLY] {sql}")
         if not dry:
             conn.execute(sql)
@@ -16,56 +18,46 @@ def add_col(conn, table, col, ddl, dry):
         print(f"[SKIP]  {table}.{col} already exists")
 
 
-def ensure_domain_resolutions(conn, dry):
-    create_sql = """
-    CREATE TABLE IF NOT EXISTS domain_resolutions (
-      id               INTEGER PRIMARY KEY,
-      company_id       INTEGER NOT NULL,
-      company_name     TEXT NOT NULL,
-      user_hint        TEXT,          -- from ingest row (may be NULL)
-      chosen_domain    TEXT,          -- punycode ascii
-      method           TEXT NOT NULL, -- 'hint_validated' | 'dns_valid' | 'http_redirect' | 'fallback' | ...
-      confidence       INTEGER NOT NULL,  -- 0..100
-      reason           TEXT,          -- brief decision note
-      resolver_version TEXT NOT NULL, -- e.g. 'r08.1'
-      created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
-    )
-    """
-    idx1 = "CREATE INDEX IF NOT EXISTS idx_domain_resolutions_company_id ON domain_resolutions(company_id)"
-    print("[APPLY] create domain_resolutions (if missing)")
-    if not dry:
-        conn.execute(create_sql)
-        conn.execute(idx1)
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Finalize R08 DB pieces safely")
-    ap.add_argument("db", nargs="?", default="dev.db")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser(description="R08 migration: add domain-resolution columns")
+    p.add_argument("db_path", nargs="?", default="dev.db")
+    p.add_argument("--dry-run", action="store_true", help="show actions without writing changes")
+    args = p.parse_args()
 
-    conn = sqlite3.connect(args.db)
-    with conn:
-        # You already have official_domain* columns. Keep them.
-        # Add a place to store the *raw* hint from ingest if missing.
-        add_col(conn, "companies", "user_supplied_domain", "TEXT", args.dry_run)
+    conn = sqlite3.connect(args.db_path)
+    try:
+        # Keep it atomic
+        with conn:
+            # --- companies: where the official, resolved domain lives ---
+            add_column_if_missing(conn, "companies", "official_domain", "TEXT", args.dry_run)
+            add_column_if_missing(
+                conn, "companies", "official_domain_source", "TEXT", args.dry_run
+            )  # e.g., 'home_page', 'whois', 'search'
+            add_column_if_missing(
+                conn, "companies", "official_domain_confidence", "REAL", args.dry_run
+            )  # 0.0–1.0
+            add_column_if_missing(
+                conn, "companies", "official_domain_checked_at", "TEXT", args.dry_run
+            )  # ISO8601
 
-        # (Optional but handy) keep per-row resolution notes on ingest staging
-        add_col(conn, "ingest_items", "resolved_domain", "TEXT", args.dry_run)
-        add_col(conn, "ingest_items", "resolved_domain_source", "TEXT", args.dry_run)
-        add_col(conn, "ingest_items", "resolved_domain_confidence", "INTEGER", args.dry_run)
+            # Helpful lookup speed-up (non-unique, partial uniqueness can come later if needed)
+            idx_sql = "CREATE INDEX IF NOT EXISTS ix_companies_official_domain ON companies(official_domain)"
+            print(f"[APPLY] {idx_sql}")
+            if not args.dry_run:
+                conn.execute(idx_sql)
 
-        # Create the audit log table for R08 decisions
-        ensure_domain_resolutions(conn, args.dry_run)
+            # --- ingest_items: keep what we attempted/resolved during intake ---
+            add_column_if_missing(conn, "ingest_items", "resolved_domain", "TEXT", args.dry_run)
+            add_column_if_missing(
+                conn, "ingest_items", "resolved_domain_source", "TEXT", args.dry_run
+            )
+            add_column_if_missing(
+                conn, "ingest_items", "resolved_domain_confidence", "REAL", args.dry_run
+            )
 
-        # Helpful lookup index
-        idx = "CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain ON companies(user_supplied_domain)"
-        print(f"[APPLY] {idx}")
-        if not args.dry_run:
-            conn.execute(idx)
-
-    print("Done.")
+        print("Done.")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

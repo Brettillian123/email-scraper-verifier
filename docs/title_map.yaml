@@ -1,0 +1,136 @@
+# docs/title_map.yaml
+# Canonical role families & seniority mappings for O02.
+# These rules are applied to R13-normalized titles (display form).
+#
+# Notes:
+# - Matching is case-insensitive substring (first match wins).
+# - You can add as many rules as you like; keep them specific to avoid collisions.
+# - role_family should be one of:
+#     Executive, Founder, Sales, Marketing, Customer Success, Support, Finance,
+#     Operations, Engineering, Product, Data, IT, Security, HR, Legal,
+#     Design, General Management
+# - seniority should be one of: C, VP, Director, Manager, IC
+#
+# Example:
+#   "VP, Sales & Marketing" → matches "VP, Sales" rule (Sales/VP)
+#   "Head of Data"          → Data/Director
+#   "Chief Revenue Officer" → Sales/C
+
+rules:
+  # --- Executive / Founder ---
+  - match: "Chief Executive Officer"
+    role_family: "Executive"
+    seniority: "C"
+  - match: "CEO"
+    role_family: "Executive"
+    seniority: "C"
+  - match: "Chief Revenue Officer"
+    role_family: "Sales"
+    seniority: "C"
+  - match: "CRO"
+    role_family: "Sales"
+    seniority: "C"
+  - match: "Co-Founder"
+    role_family: "Founder"
+    seniority: "C"
+  - match: "Founder"
+    role_family: "Founder"
+    seniority: "C"
+
+  # --- Sales ---
+  - match: "SVP, Sales"
+    role_family: "Sales"
+    seniority: "VP"
+  - match: "EVP, Sales"
+    role_family: "Sales"
+    seniority: "VP"
+  - match: "VP, Sales"
+    role_family: "Sales"
+    seniority: "VP"
+  - match: "Head of Sales"
+    role_family: "Sales"
+    seniority: "Director"
+  - match: "Director of Sales"
+    role_family: "Sales"
+    seniority: "Director"
+  - match: "Sales Manager"
+    role_family: "Sales"
+    seniority: "Manager"
+
+  # --- Marketing ---
+  - match: "Chief Marketing Officer"
+    role_family: "Marketing"
+    seniority: "C"
+  - match: "CMO"
+    role_family: "Marketing"
+    seniority: "C"
+  - match: "VP, Marketing"
+    role_family: "Marketing"
+    seniority: "VP"
+  - match: "Head of Marketing"
+    role_family: "Marketing"
+    seniority: "Director"
+  - match: "Director of Marketing"
+    role_family: "Marketing"
+    seniority: "Director"
+
+  # --- Data / Engineering / Product ---
+  - match: "Head of Data"
+    role_family: "Data"
+    seniority: "Director"
+  - match: "Director of Data"
+    role_family: "Data"
+    seniority: "Director"
+  - match: "Data Engineer"
+    role_family: "Data"
+    seniority: "IC"
+  - match: "Chief Technology Officer"
+    role_family: "Engineering"
+    seniority: "C"
+  - match: "CTO"
+    role_family: "Engineering"
+    seniority: "C"
+  - match: "VP, Engineering"
+    role_family: "Engineering"
+    seniority: "VP"
+  - match: "Head of Engineering"
+    role_family: "Engineering"
+    seniority: "Director"
+  - match: "Director of Engineering"
+    role_family: "Engineering"
+    seniority: "Director"
+  - match: "Product Manager"
+    role_family: "Product"
+    seniority: "IC"
+  - match: "Head of Product"
+    role_family: "Product"
+    seniority: "Director"
+
+  # --- Finance / Operations / HR / Legal ---
+  - match: "CFO"
+    role_family: "Finance"
+    seniority: "C"
+  - match: "Chief Financial Officer"
+    role_family: "Finance"
+    seniority: "C"
+  - match: "VP, Finance"
+    role_family: "Finance"
+    seniority: "VP"
+  - match: "COO"
+    role_family: "Operations"
+    seniority: "C"
+  - match: "Chief Operating Officer"
+    role_family: "Operations"
+    seniority: "C"
+  - match: "Head of Operations"
+    role_family: "Operations"
+    seniority: "Director"
+  - match: "CHRO"
+    role_family: "HR"
+    seniority: "C"
+  - match: "Chief Human Resources Officer"
+    role_family: "HR"
+    seniority: "C"
+  - match: "General Counsel"
+    role_family: "Legal"
+    seniority: "C"

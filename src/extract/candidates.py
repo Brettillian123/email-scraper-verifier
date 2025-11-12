@@ -1,9 +1,11 @@
 # src/extract/candidates.py
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from html import unescape
 from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -74,6 +76,21 @@ TOKEN_BLACKLIST = ROLE_ALIASES | {"it"}
 # Token must be at least this long to be considered "namey"
 MIN_NAME_TOKEN_LEN = 2
 
+# O05 (optional): de-obfuscation is behind a flag; enable only where policies/ToS allow.
+_DEOBFUSCATE = os.getenv("EXTRACT_DEOBFUSCATE", "0").strip().lower() in {"1", "true", "yes"}
+
+# De-obfuscation components, e.g. "john [at] acme [dot] com", "mary (at) acme dot co dot uk"
+_OB_AT = r"(?:@|\[at\]|\(at\)|\sat\s| at )"
+_OB_DOT = r"(?:\.|\[dot\]|\(dot\)|\sdot\s| dot )"
+_OB_EMAIL = re.compile(
+    rf"""
+    (?P<local>[A-Za-z0-9._%+\-]+)
+    \s*{_OB_AT}\s*
+    (?P<domain>[A-Za-z0-9\-]+(?:\s*{_OB_DOT}\s*[A-Za-z0-9\-]+)+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 def _is_role_alias_email(email: str) -> bool:
     """
@@ -93,6 +110,8 @@ def extract_candidates(
     html: str,
     source_url: str,
     official_domain: str | None = None,
+    *,
+    deobfuscate: bool | None = None,
 ) -> list[Candidate]:
     """
     Extract (email, first_name, last_name, source_url[, raw_name]) records
@@ -102,6 +121,7 @@ def extract_candidates(
       1) mailto: links (high precision)
       2) conservative regex inside typical contact/person blocks
       3) cautious fallback name inference from email local-part
+      4) (O05 when enabled) de-obfuscated patterns in page text
 
     Filtering:
       - If `official_domain` is provided, only return emails whose domain is the
@@ -114,9 +134,21 @@ def extract_candidates(
 
     by_email: dict[str, Candidate] = {}
 
+    # 0) (O05) De-obfuscation pass over full page text — only when enabled
+    use_deob = _DEOBFUSCATE if deobfuscate is None else bool(deobfuscate)
+    if use_deob:
+        page_text = soup.get_text(" ", strip=True)
+        for email in _scan_deobfuscated_emails(page_text):
+            if _is_role_alias_email(email):
+                continue
+            if not _in_scope(email, official_domain):
+                continue
+            cand = _candidate_with_best_name(email, None, source_url)
+            _insert_or_upgrade(by_email, cand)
+
     # 1) mailto: links (most precise)
     for email, name_guess in _scan_mailto_links(soup):
-        if _is_role_alias_email(email):  # NEW: drop role/distribution addresses
+        if _is_role_alias_email(email):  # drop role/distribution addresses
             continue
         if not _in_scope(email, official_domain):
             continue
@@ -125,7 +157,7 @@ def extract_candidates(
 
     # 2) plain text emails inside texty blocks
     for email, ctx_name in _scan_text_blocks(soup):
-        if _is_role_alias_email(email):  # NEW: drop role/distribution addresses
+        if _is_role_alias_email(email):  # drop role/distribution addresses
             continue
         if not _in_scope(email, official_domain):
             continue
@@ -182,11 +214,46 @@ def _scan_text_blocks(soup: BeautifulSoup) -> Iterator[tuple[str, str | None]]:
         if not text:
             continue
 
+        # Decode HTML entities so patterns like "bob&#64;acme.com" become "bob@acme.com"
+        text = unescape(text)
+
         for m in EMAIL_RE.finditer(text):
             email = m.group(0).lower()
             # Try to find a nearby label (strong/h* sibling or parent context)
             nearby_name = _nearest_label_name(el)
             yield email, nearby_name
+
+
+def _scan_deobfuscated_emails(text: str) -> list[str]:
+    """
+    (O05) Find obfuscated emails like "name [at] acme [dot] com" within plain text.
+    Also benefits from HTML entity unescaping to catch things like "user&#64;example.com".
+    """
+    txt = unescape(text or "")
+    found: set[str] = set()
+
+    for m in _OB_EMAIL.finditer(txt):
+        local = (m.group("local") or "").strip()
+        domain = _normalize_obfuscated_domain(m.group("domain") or "")
+        if not local or not domain:
+            continue
+        email = f"{local}@{domain}".lower()
+        # Validate with our standard email regex to avoid oddities
+        if EMAIL_RE.fullmatch(email):
+            found.add(email)
+
+    # A light extra pass: after unescape, the standard regex will catch any plain emails
+    # that were previously encoded (e.g., "&#64;"). We only add what wasn't already added.
+    for m in EMAIL_RE.finditer(txt):
+        found.add(m.group(0).lower())
+
+    return sorted(found)
+
+
+def _normalize_obfuscated_domain(dom_s: str) -> str:
+    """Turn 'acme [dot] co [dot] uk' → 'acme.co.uk' and remove stray spaces."""
+    s = re.sub(_OB_DOT, ".", dom_s, flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", s)
 
 
 # --- Context/name helpers ----------------------------------------------------

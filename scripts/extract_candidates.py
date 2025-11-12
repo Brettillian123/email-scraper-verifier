@@ -145,7 +145,10 @@ def _find_or_create_person_id(
         )
         row = cur.fetchone()
         if row:
-            return int(row["id"])
+            try:
+                return int(row["id"])
+            except Exception:
+                return int(row[0])
 
         cols = ["first_name", "last_name"]
         vals = [first_name, last_name]
@@ -170,7 +173,10 @@ def _find_or_create_person_id(
         cur = con.execute(f"SELECT id FROM people WHERE {full_name_col} = ?", (full_name,))
         row = cur.fetchone()
         if row:
-            return int(row["id"])
+            try:
+                return int(row["id"])
+            except Exception:
+                return int(row[0])
 
         cols = [full_name_col]
         vals = [full_name]
@@ -244,21 +250,54 @@ def _upsert_email(
     con.execute(sql, insert_vals)
 
 
+def _get_email_id(con: sqlite3.Connection, email: str) -> int | None:
+    cur = con.execute("SELECT id FROM emails WHERE email = ?", (email,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return int(row["id"])
+    except Exception:
+        return int(row[0])
+
+
+def _record_provenance(con: sqlite3.Connection, email_id: int, source_url: str) -> bool:
+    """
+    Record a provenance entry if the email_provenance table exists with the expected columns.
+    Returns True if an insert (or conflict-no-op) statement executed successfully, False otherwise.
+    """
+    prov_cols = _table_columns(con, "email_provenance")
+    if not {"email_id", "source_url"}.issubset(prov_cols):
+        return False
+
+    con.execute(
+        """
+        INSERT INTO email_provenance(email_id, source_url)
+        VALUES (?, ?)
+        ON CONFLICT(email_id, source_url) DO NOTHING
+        """,
+        (email_id, source_url),
+    )
+    return True
+
+
 def _persist_candidates(
     con: sqlite3.Connection,
     cands: Iterable[Candidate],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
-    Persist candidates to DB. Returns (n_people_inserted_or_found, n_emails_upserted).
+    Persist candidates to DB.
+    Returns (n_people_inserted_or_found, n_emails_upserted, n_provenance_written).
     """
     n_people = 0
     n_emails = 0
+    n_prov = 0
     now_iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     with con:  # transaction
         for cand in cands:
             person_id: int | None = None
-            if cand.first_name or cand.last_name:
+            if getattr(cand, "first_name", None) or getattr(cand, "last_name", None):
                 person_id = _find_or_create_person_id(con, cand.first_name, cand.last_name)
                 if person_id:
                     n_people += 1  # counts "found or created" logically
@@ -272,7 +311,13 @@ def _persist_candidates(
             )
             n_emails += 1
 
-    return n_people, n_emails
+            # provenance (email_id + source_url)
+            eid = _get_email_id(con, cand.email)
+            if eid is not None:
+                if _record_provenance(con, eid, cand.source_url):
+                    n_prov += 1
+
+    return n_people, n_emails, n_prov
 
 
 # ------------------------------ Main flow ------------------------------------
@@ -323,14 +368,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[info] No candidates extracted from {total_pages} page(s) under {target_desc}.")
         return 0
 
-    n_people, n_emails = _persist_candidates(con, all_candidates)
+    n_people, n_emails, n_prov = _persist_candidates(con, all_candidates)
 
     # Small summary
     unique_emails = len({c.email for c in all_candidates})
     print(
         f"[ok] Processed {total_pages} page(s) for {target_desc}. "
         f"Extracted {len(all_candidates)} candidates ({unique_emails} unique emails). "
-        f"Upserted {n_emails} email rows; matched/created ~{n_people} people."
+        f"Upserted {n_emails} email rows; matched/created ~{n_people} people; "
+        f"recorded {n_prov} provenance entries."
     )
 
     return 0

@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import dns.resolver
 from redis import Redis
@@ -354,3 +357,70 @@ def verify_email_task(  # noqa: C901
             release(redis, mx_key)
         if got_global:
             release(redis, GLOBAL_SEM)
+
+
+# ---------------------------
+# R10 wiring: thin crawl task
+# ---------------------------
+
+
+def crawl_approved_domains(db: str | None = None, limit: int | None = None) -> int:
+    """
+    R10: Read approved official domains written by R08 and run the crawler for each.
+    Returns the number of domains crawled.
+
+    This is intentionally thin and calls the same CLI used in acceptance:
+    `scripts/crawl_domain.py <domain> --db <db>`
+
+    Args:
+        db: Path to SQLite DB. Defaults to $DATABASE_PATH or 'dev.db'.
+        limit: Optional cap on how many domains to process (useful for smoke runs).
+    """
+    db_path = Path(db or os.getenv("DATABASE_PATH", "dev.db")).resolve()
+
+    # Pull distinct official domains discovered by R08
+    with sqlite3.connect(str(db_path)) as con:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT TRIM(official_domain)
+            FROM companies
+            WHERE official_domain IS NOT NULL
+              AND TRIM(official_domain) <> ''
+            ORDER BY 1
+            """
+        )
+        domains = [row[0] for row in cur.fetchall()]
+
+    if limit is not None:
+        domains = domains[:limit]
+
+    if not domains:
+        log.info(
+            "crawl_approved_domains: no official domains found in companies table",
+            extra={"db": str(db_path)},
+        )
+        return 0
+
+    # Invoke the same script used manually, to keep behavior identical
+    script = Path(__file__).resolve().parents[2] / "scripts" / "crawl_domain.py"
+    if not script.exists():
+        raise FileNotFoundError(f"crawl_domain.py not found at {script}")
+
+    count = 0
+    for domain in domains:
+        cmd = [sys.executable, str(script), domain, "--db", str(db_path)]
+        log.info(
+            "R10 crawl start",
+            extra={
+                "domain": domain,
+                "db": str(db_path),
+                "cmd": " ".join(cmd),
+            },
+        )
+        subprocess.run(cmd, check=True)
+        count += 1
+        log.info("R10 crawl done", extra={"domain": domain})
+
+    log.info("R10 crawled domains total", extra={"count": count})
+    return count

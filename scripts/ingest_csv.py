@@ -1,10 +1,27 @@
 # scripts/ingest_csv.py
 from __future__ import annotations
 
+"""
+CSV ingestor (R13-ready)
+
+- Reads one or more CSV files
+- Normalizes each row with src.ingest.normalize.normalize_row (name/title/company)
+- Preserves provenance (source_url)
+- Persists via src.ingest.persist.persist_best_effort (per-row) so we can log rejects
+- Optional: emit normalized JSONL (--out PATH or "-" for stdout)
+- Supports both legacy --path and positional file args
+
+Examples:
+  python scripts/ingest_csv.py samples/leads.csv
+  python scripts/ingest_csv.py samples/a.csv samples/b.csv --out normalized.jsonl
+  python scripts/ingest_csv.py --path samples/leads.csv --dry-run
+"""
+
 import argparse
 import csv
 import json
 import sys
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.ingest import enforce_row_limit, ingest_row  # noqa: E402
+from src.ingest.normalize import normalize_row  # noqa: E402
+from src.ingest.persist import persist_best_effort  # noqa: E402
 
 CANONICAL_FIELDS = {
     "company",
@@ -46,9 +64,39 @@ def _validate_headers(fieldnames: list[str]) -> None:
         print(f"[warn] CSV missing optional columns: {', '.join(missing)}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Ingest leads from CSV.")
-    ap.add_argument("--path", required=True, help="Path to CSV file")
+def _read_csv(path: Path, delimiter: str) -> Iterator[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=delimiter)
+        if not reader.fieldnames:
+            raise SystemExit(f"CSV has no header row: {path}")
+        _validate_headers(reader.fieldnames)
+        for row in reader:
+            # Normalize keys to lowercase for robustness
+            yield {str(k).lower(): (v if v is not None else "") for k, v in row.items()}
+
+
+def _iter_inputs(paths: list[Path], delimiter: str) -> Iterator[dict[str, str]]:
+    for p in paths:
+        if not p.exists():
+            raise SystemExit(f"File not found: {p}")
+        yield from _read_csv(p, delimiter=delimiter)
+
+
+def _write_jsonl(rows: Iterable[dict[str, object]], out_path: Path | None) -> None:
+    out_f = sys.stdout if out_path is None else out_path.open("w", encoding="utf-8")
+    close = out_f is not sys.stdout
+    try:
+        for r in rows:
+            out_f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    finally:
+        if close:
+            out_f.close()
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Ingest leads from CSV with R13 normalization.")
+    ap.add_argument("inputs", nargs="*", help="CSV files to ingest (positional form)")
+    ap.add_argument("--path", help="(Deprecated) single CSV file path (use positional instead)")
     ap.add_argument(
         "--delimiter",
         default=",",
@@ -60,53 +108,91 @@ def main() -> None:
         default=100_000,
         help="Row cap (default: 100000)",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not write to DB; only emit normalized JSONL if --out is set.",
+    )
+    ap.add_argument(
+        "--out",
+        metavar="PATH",
+        help="Write normalized JSONL to PATH (use '-' for stdout).",
+    )
+    args = ap.parse_args(argv)
 
-    path = Path(args.path)
-    if not path.exists():
-        raise SystemExit(f"File not found: {path}")
+    # Resolve inputs (support legacy --path)
+    paths: list[Path] = []
+    if args.path:
+        paths.append(Path(args.path))
+    paths.extend(Path(p) for p in args.inputs)
+    if not paths:
+        ap.error("Provide at least one input CSV (positional) or --path FILE")
+
+    # Prepare output sink if requested
+    out_path: Path | None = None
+    if args.out is not None:
+        out_path = None if args.out == "-" else Path(args.out)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rej_path = Path(f"ingest_csv.rejects.{ts}.log")
+    rej_path = Path(f"ingest_csv.rejects.{ts}.log") if not args.dry_run else None
     rejects = 0
     ok = 0
     seen = 0
 
-    with (
-        path.open("r", encoding="utf-8-sig", newline="") as fh,
-        rej_path.open("w", encoding="utf-8") as rej,
-    ):
-        reader = csv.DictReader(fh, delimiter=args.delimiter)
-        if not reader.fieldnames:
-            raise SystemExit("CSV has no header row")
-        _validate_headers(reader.fieldnames)
+    # Iterate rows → normalize → (optional) write normalized → (optional) persist
+    norm_buffer: list[dict[str, object]] = []
 
-        for row in reader:
-            seen += 1
-            if seen > args.max_rows:
-                enforce_row_limit(seen, channel="file", file_limit=args.max_rows)
-            try:
-                # Pass the raw row dict; src.ingest.ingest_row will normalize,
-                # write to DB, and enqueue follow-ups.
-                ingest_row({k.lower(): v for k, v in row.items()})
-                ok += 1
-            except Exception as e:
-                rejects += 1
-                rej.write(
-                    json.dumps(
-                        {
-                            "row_number": seen,
-                            "error": str(e),
-                            "row": {k: v for k, v in row.items()},
-                        },
-                        ensure_ascii=False,
+    for raw in _iter_inputs(paths, delimiter=args.delimiter):
+        seen += 1
+        if seen > args.max_rows:
+            raise SystemExit(f"Row limit exceeded: {args.max_rows}")
+
+        try:
+            norm, _errs = normalize_row(raw)
+            # Optionally collect normalized output
+            if out_path is not None:
+                norm_buffer.append(norm)
+                # Flush occasionally to limit memory
+                if len(norm_buffer) >= 1000:
+                    _write_jsonl(norm_buffer, out_path)
+                    norm_buffer.clear()
+
+            if not args.dry_run:
+                # Persist the already-normalized row (best-effort)
+                persist_best_effort(norm)
+
+            ok += 1
+
+        except Exception as e:
+            rejects += 1
+            if rej_path is not None:
+                with rej_path.open("a", encoding="utf-8") as rej:
+                    rej.write(
+                        json.dumps(
+                            {
+                                "row_number": seen,
+                                "error": str(e),
+                                "row": raw,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
 
-    print(f"CSV ingest complete: ok={ok} rejects={rejects} max_rows={args.max_rows} file={path}")
-    if rejects:
+    # Flush any remaining normalized rows to output
+    if norm_buffer and out_path is not None:
+        _write_jsonl(norm_buffer, out_path)
+
+    # Epilogue
+    print(
+        f"CSV ingest complete: ok={ok} rejects={rejects} "
+        f"max_rows={args.max_rows} files={', '.join(str(p) for p in paths)}"
+    )
+    if rejects and rej_path is not None:
         print(f"Rejected rows logged to: {rej_path}")
+    if out_path is None and args.dry_run:
+        # If user requested dry-run without --out, default to stdout for visibility
+        print("[note] --dry-run without --out: no normalized output was written.")
 
 
 if __name__ == "__main__":

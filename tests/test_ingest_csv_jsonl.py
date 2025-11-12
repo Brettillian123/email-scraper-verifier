@@ -97,7 +97,12 @@ def _ingest_rows(rows: list[dict[str, Any]]) -> tuple[int, int]:
     """Call src.ingest.ingest_row on each row and return (accepted, rejected).
     ingest_row returns True (accepted) or False (rejected) and should not raise for normal rejects.
     """
+    # TEMP: drop this at the top of whatever function does the gating (often _ingest_rows)
+    import pprint
+
     from src import ingest as I  # import here to honor DATABASE_URL monkeypatch
+
+    print("FIRST ROW:", pprint.pformat(rows[0] if rows else None))
 
     accepted = rejected = 0
     for _i, r in enumerate(rows):

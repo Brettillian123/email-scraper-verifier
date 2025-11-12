@@ -13,6 +13,7 @@
   - Suppress role/distribution addresses (e.g., admin@, info@, sales@, support@, help@, hello@, hr@).
   - Suppress any email/domain in explicit opt-out records.
   - Never re-verify suppressed emails/domains.
+- Provenance: **R13 normalization preserves `source_url` on all contacts; never drop or overwrite it.**
 
 ## Success Metrics (initial targets)
 - Valid rate ≥ 70% of verified emails.

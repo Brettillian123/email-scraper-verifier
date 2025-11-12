@@ -93,22 +93,44 @@ def infer_domain_pattern(
     last: str,
 ) -> str | None:
     """
-    Given known valid emails for a domain and a name, try to infer which of our
-    PATTERNS the domain uses by formatting each pattern with the normalized name
-    and checking whether the formatted local-part appears among the emails.
-    """
-    first, last, f_initial, last_initial = normalize_name_parts(first, last)
-    locals_published = {e.split("@", 1)[0].lower() for e in emails if "@" in e}
+    Infer a domain's email pattern from published examples by using simple
+    shape heuristics (separator and token count), not exact names.
 
+    Priority:
+      1) first.last / first_last / first-last (separator-based)
+      2) f + last
+      3) first + last
+      4) first + l  (rare; after f+last)
+    """
+    locals_published = {e.split("@", 1)[0].lower() for e in emails if "@" in e}
     if not locals_published:
         return None
 
-    ctx = {"first": first, "last": last, "f": f_initial, "l": last_initial}
-    for pattern in PATTERNS:
-        try:
-            local = pattern.format(**ctx)
-        except Exception:
-            continue
-        if local in locals_published:
-            return pattern
+    def two_token(local: str, sep: str) -> bool:
+        if sep not in local or local.count(sep) != 1:
+            return False
+        a, b = local.split(sep, 1)
+        return bool(a) and bool(b)
+
+    # 1) Separator-based patterns (strongest indicator)
+    if any(two_token(lc, ".") for lc in locals_published):
+        return "{first}.{last}"
+    if any(two_token(lc, "_") for lc in locals_published):
+        return "{first}_{last}"
+    if any(two_token(lc, "-") for lc in locals_published):
+        return "{first}-{last}"
+
+    # 2) Initial + last (e.g., jdoe)
+    if any(re.fullmatch(r"[a-z][a-z0-9]+", lc) for lc in locals_published):
+        return "{f}{last}"
+
+    # 3) firstlast (no separator; weak heuristic)
+    #    Use a minimal length to avoid matching short aliases.
+    if any(re.fullmatch(r"[a-z0-9]{6,}", lc) for lc in locals_published):
+        return "{first}{last}"
+
+    # 4) first + last initial (e.g., john.d or john d) — rare; keep last
+    if any(re.fullmatch(r"[a-z0-9]+[a-z]", lc) for lc in locals_published):
+        return "{first}{l}"
+
     return None

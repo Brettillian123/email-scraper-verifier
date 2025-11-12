@@ -25,15 +25,19 @@ $env:CRAWL_MAX_PAGES_PER_DOMAIN = "5"
 python .\scripts\migrate_r10_add_sources.py --db "$DB" | Out-Null
 python .\scripts\crawl_domain.py "www.$Domain" --db "$DB"
 
-# 3) Run the extractor
+# 3) Run the extractor (R11)
 Write-Host "-> Extracting candidates (R11)..."
-python .\scripts\extract_candidates.py --db "$DB" "$Domain"
+python .\scripts\extract_candidates.py --db "$DB" --domain "$Domain"
 
 # 4) If nothing landed, seed one test page into sources and retry
 $got = & sqlite3 $DB "SELECT COUNT(*) FROM email_provenance;"
 if ([int]$got -eq 0) {
   Write-Host "[info] No emails found; seeding a small test page in 'sources' and retrying..."
-  $seed = @"
+
+  # See if 'domain' column exists in sources; pick seed SQL accordingly
+  $hasDomain = & sqlite3 $DB "SELECT 1 FROM pragma_table_info('sources') WHERE name='domain' LIMIT 1;"
+  if ($hasDomain -eq "1") {
+    $seedSql = @"
 INSERT INTO sources(domain, path, source_url, html, fetched_at)
 VALUES (
   '$Domain',
@@ -45,8 +49,21 @@ VALUES (
   datetime('now')
 );
 "@
-  & sqlite3 $DB $seed
-  python .\scripts\extract_candidates.py --db "$DB" "$Domain"
+  } else {
+    $seedSql = @"
+INSERT INTO sources(source_url, html, fetched_at)
+VALUES (
+  'https://$Domain/accept-r11',
+  '<h1>Contact</h1>
+   <p>Sales lead: <a href="mailto:jane.doe@$Domain">Jane Doe</a></p>
+   <p>General inbox: info@$Domain</p>',
+  datetime('now')
+);
+"@
+  }
+
+  & sqlite3 $DB $seedSql
+  python .\scripts\extract_candidates.py --db "$DB" --domain "$Domain"
 }
 
 # 5) Show latest 5 emails with provenance

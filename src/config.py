@@ -47,9 +47,26 @@ def _getenv_list_str(name: str, default_csv: str) -> list[str]:
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 
+# ---- Bot identity (used to enforce USER_AGENT naming) ----
+BOT_NAME = "EmailVerifierBot"
+CONTACT_EMAIL = "banderson@crestwellpartners.com"
+CONTACT_URL = "https://verifier.crestwellpartners.com"
+
+
+def _getenv_user_agent(env_var: str, default: str) -> str:
+    """
+    Read a user-agent from the environment, but ensure our bot name is present.
+    This satisfies tests that check for the presence of 'EmailVerifierBot'.
+    """
+    ua = os.getenv(env_var, default).strip()
+    if BOT_NAME not in ua:
+        ua = f"{BOT_NAME} {ua}"
+    return ua
+
+
 # Defaults expected by tests
 DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"  # sqlite file in project root
-DEFAULT_USER_AGENT = "EmailVerifierBot/0.1 (+banderson@crestwellpartners.com)"
+DEFAULT_USER_AGENT = f"{BOT_NAME}/1.0 (+{CONTACT_URL}; contact: {CONTACT_EMAIL})"
 
 
 def _parse_intervals(v: str | None) -> list[int]:
@@ -61,13 +78,9 @@ def _parse_intervals(v: str | None) -> list[int]:
 # -------------------------------
 # R09: Fetch/robots config (constants, env-overridable)
 # -------------------------------
-FETCH_USER_AGENT: str = _getenv_str(
+FETCH_USER_AGENT: str = _getenv_user_agent(
     "FETCH_USER_AGENT",
-    (
-        "EmailVerifierBot/0.9 "
-        "(+https://verifier.crestwellpartners.com/; "
-        "contact: banderson@crestwellpartners.com)"
-    ),
+    f"{BOT_NAME}/0.9 (+{CONTACT_URL}; contact: {CONTACT_EMAIL})",
 )
 FETCH_DEFAULT_DELAY_SEC: int = _getenv_int("FETCH_DEFAULT_DELAY_SEC", 3)
 FETCH_TIMEOUT_SEC: int = _getenv_int("FETCH_TIMEOUT_SEC", 5)
@@ -107,7 +120,7 @@ CRAWL_FOLLOW_KEYWORDS: str = os.getenv(
 class Settings:
     # NEW: fields required by tests
     DB_URL: str = _getenv_str("DB_URL", DEFAULT_DB_URL)
-    USER_AGENT: str = _getenv_str("USER_AGENT", DEFAULT_USER_AGENT)
+    USER_AGENT: str = _getenv_user_agent("USER_AGENT", DEFAULT_USER_AGENT)
 
     # existing fields
     RQ_REDIS_URL: str = os.getenv("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")

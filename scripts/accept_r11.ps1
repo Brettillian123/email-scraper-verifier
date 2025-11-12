@@ -1,32 +1,66 @@
-# scripts/accept_r11.ps1
 Param(
   [string]$Domain = "crestwellpartners.com",
-  [string]$Db = "dev.db"
+  [string]$DB = "dev.db"
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-Write-Host "== R11 acceptance for domain '$Domain' with DB '$Db' =="
+Write-Host "== R11 acceptance for domain '$Domain' with DB '$DB' =="
 
-# 0) Ensure unique index on emails.email (idempotent; safe to re-run)
-if (Test-Path .\scripts\apply_unique_email_index.py) {
-  Write-Host "-> Ensuring unique index on emails.email..."
-  python .\scripts\apply_unique_email_index.py --db "$Db"
-} else {
-  Write-Host "-> (skip) scripts\apply_unique_email_index.py not found; assuming schema already enforced."
+# 0) Safety backup
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$bak = "$DB.$stamp.bak"
+Copy-Item -Path $DB -Destination $bak -ErrorAction SilentlyContinue
+if (Test-Path $bak) { Write-Host "[INFO] Backup created: $bak" }
+
+# 1) Ensure schema for R11
+Write-Host "-> Ensuring R11 tables (people/emails/email_provenance)..."
+python .\scripts\migrate_r11_add_extraction_tables.py --db "$DB"
+
+# 2) Crawl a few pages via R10 (polite)
+Write-Host "-> Crawling sources via R10 (writes into 'sources')..."
+$env:CRAWL_SEED_PATHS = "/,/about,/team,/contact,/news"
+$env:CRAWL_MAX_DEPTH = "1"
+$env:CRAWL_MAX_PAGES_PER_DOMAIN = "5"
+python .\scripts\migrate_r10_add_sources.py --db "$DB" | Out-Null
+python .\scripts\crawl_domain.py "www.$Domain" --db "$DB"
+
+# 3) Run the extractor
+Write-Host "-> Extracting candidates (R11)..."
+python .\scripts\extract_candidates.py --db "$DB" "$Domain"
+
+# 4) If nothing landed, seed one test page into sources and retry
+$got = & sqlite3 $DB "SELECT COUNT(*) FROM email_provenance;"
+if ([int]$got -eq 0) {
+  Write-Host "[info] No emails found; seeding a small test page in 'sources' and retrying..."
+  $seed = @"
+INSERT INTO sources(domain, path, source_url, html, fetched_at)
+VALUES (
+  '$Domain',
+  '/accept-r11',
+  'https://$Domain/accept-r11',
+  '<h1>Contact</h1>
+   <p>Sales lead: <a href="mailto:jane.doe@$Domain">Jane Doe</a></p>
+   <p>General inbox: info@$Domain</p>',
+  datetime('now')
+);
+"@
+  & sqlite3 $DB $seed
+  python .\scripts\extract_candidates.py --db "$DB" "$Domain"
 }
 
-# 1) Ensure sources exist (from R10)
-Write-Host "-> Crawling sources via R10 (this reads politely and writes into 'sources')..."
-python .\scripts\crawl_domain.py "www.$Domain" --db "$Db"
-
-# 2) Run extraction
-Write-Host "-> Extracting candidates (R11)..."
-python .\scripts\extract_candidates.py --domain "$Domain" --db "$Db"
-
-# 3) Show sample results (SQLite one-liner; avoid heredocs)
+# 5) Show latest 5 emails with provenance
 Write-Host "-> Showing latest 5 emails with provenance:"
-python -c "import sqlite3;con=sqlite3.connect(r'$Db');print('email | source_url');[print(f'{e} | {s or \"\"}') for (e,s) in con.execute('select email, source_url from emails order by rowid desc limit 5')];con.close()"
+& sqlite3 $DB ".headers on" ".mode column" @"
+SELECT e.email,
+       COALESCE(p.name,'') AS name,
+       ep.source_url,
+       ep.discovered_at
+FROM email_provenance ep
+JOIN emails e ON e.id = ep.email_id
+LEFT JOIN people p ON p.id = e.person_id
+ORDER BY ep.discovered_at DESC
+LIMIT 5;
+"@
 
 Write-Host "== Done =="

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import dns.resolver
 from redis import Redis
-from rq import get_current_job
+from rq import Queue, get_current_job
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -20,7 +20,13 @@ from tenacity import (
 )
 
 from src.config import load_settings
-from src.db import upsert_verification_result, write_domain_resolution
+from src.db import (
+    get_conn,
+    upsert_generated_email,
+    upsert_verification_result,
+    write_domain_resolution,
+)
+from src.generate.permutations import generate_permutations, infer_domain_pattern
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -357,6 +363,65 @@ def verify_email_task(  # noqa: C901
             release(redis, mx_key)
         if got_global:
             release(redis, GLOBAL_SEM)
+
+
+# ---------------------------------------------
+# R12 wiring: email generation + verify enqueue
+# ---------------------------------------------
+
+
+def _enqueue_verify(email: str) -> None:
+    """
+    Minimal enqueue helper for verification jobs.
+    Uses the 'verify' queue by default.
+    """
+    try:
+        qname = getattr(getattr(_cfg, "queues", object()), "verify", "verify")
+    except Exception:
+        qname = "verify"
+    q = Queue(name=qname, connection=get_redis())
+    # Keep kwargs to match verify_email_task signature
+    q.enqueue(verify_email_task, email=email)
+
+
+def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> dict:
+    """
+    R12 job: Generate email permutations for a person@domain, persist them as
+    'generated' candidates, and enqueue verification for each.
+
+    Returns basic metrics for logging.
+    """
+    con = get_conn()
+    # Optional O01: infer domain pattern from already-published emails
+    rows = con.execute(
+        "SELECT email FROM emails WHERE domain = ? AND source = 'published'",
+        (domain,),
+    ).fetchall()
+    published = [r[0] for r in rows if r and r[0]]
+
+    only = infer_domain_pattern(published, first, last)
+    candidates = generate_permutations(first, last, domain, only_pattern=only)
+
+    inserted = 0
+    for e in sorted(candidates):
+        upsert_generated_email(con, person_id, e, domain, source_note="r12")
+        _enqueue_verify(e)
+        inserted += 1
+
+    con.commit()
+
+    log.info(
+        "R12 generated emails",
+        extra={
+            "person_id": person_id,
+            "domain": domain,
+            "first": first,
+            "last": last,
+            "only_pattern": only,
+            "count": inserted,
+        },
+    )
+    return {"count": inserted, "only_pattern": only, "domain": domain, "person_id": person_id}
 
 
 # ---------------------------

@@ -20,6 +20,16 @@ def _db_path() -> str:
     return "dev.db"
 
 
+def get_conn() -> sqlite3.Connection:
+    """
+    Convenience connection helper (used by queue/CLI tasks).
+    Ensures foreign keys are enforced.
+    """
+    con = sqlite3.connect(_db_path())
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
 def _table_columns(cur, table: str) -> dict[str, dict]:
     """
     Returns {col_name: {name,type,notnull,default,pk}} for table.
@@ -162,7 +172,7 @@ def _ensure_person(cur, *, email: str, company_id: int | None) -> int | None:
     return cur.lastrowid
 
 
-# ---------------- main upsert ----------------
+# ---------------- main upserts ----------------
 
 
 def upsert_verification_result(
@@ -257,6 +267,86 @@ def upsert_verification_result(
         """
         cur.execute(sql, insert_vals)
         con.commit()
+
+
+# ---------------- R12: generated emails upsert ----------------
+
+
+def upsert_generated_email(
+    con: sqlite3.Connection,
+    person_id: int | None,
+    email: str,
+    domain: str,
+    source_note: str | None = None,
+) -> None:
+    """
+    Insert a 'generated' email candidate for later verification.
+    - Idempotent on emails.email (no-op on conflict).
+    - Ensures companies row exists for the domain.
+    - If emails.person_id exists and person_id is None, attempts to _ensure_person.
+    - Populates optional columns when present:
+        source='generated', source_note, domain, created_at, verify_status=NULL.
+    """
+    con.execute("PRAGMA foreign_keys=ON")
+    cur = con.cursor()
+
+    email = (email or "").lower().strip()
+    domain = (domain or "").lower().strip()
+    if not email or "@" not in email:
+        raise ValueError("upsert_generated_email: expected full email address with '@'")
+
+    # Ensure company record
+    company_id = _ensure_company(cur, domain)
+
+    # Ensure/validate person if FK present
+    emails_cols = _table_columns(cur, "emails")
+    if "person_id" in emails_cols:
+        if person_id is None:
+            person_id = _ensure_person(cur, email=email, company_id=company_id)
+        else:
+            fks = _fk_map(cur, "emails")
+            if "person_id" in fks:
+                ptable, ppk = fks["person_id"]
+                exists = cur.execute(
+                    f"SELECT 1 FROM {ptable} WHERE {ppk} = ? LIMIT 1", (person_id,)
+                ).fetchone()
+                if not exists:
+                    person_id = _ensure_person(cur, email=email, company_id=company_id)
+
+    # Idempotency guard on emails.email
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email)")
+
+    # Build INSERT dynamically based on available columns
+    cols_meta = _table_columns(cur, "emails")
+
+    insert_cols: list[str] = ["email", "company_id"]
+    insert_vals: list[Any] = [email, company_id]
+
+    def maybe(col: str, val: Any):
+        if col in cols_meta:
+            insert_cols.append(col)
+            insert_vals.append(val)
+
+    maybe("person_id", person_id)
+    maybe("domain", domain)  # some schemas include a denormalized domain column
+    maybe("source", "generated")
+    maybe("source_note", source_note)
+    maybe("verify_status", None)
+    # Prefer explicit created_at if present; otherwise rely on DEFAULTs
+    if "created_at" in cols_meta:
+        insert_cols.append("created_at")
+        insert_vals.append(_ts_iso8601_z(None))
+
+    placeholders = ", ".join("?" for _ in insert_cols)
+    insert_cols_sql = ", ".join(insert_cols)
+
+    sql = f"""
+        INSERT INTO emails ({insert_cols_sql})
+        VALUES ({placeholders})
+        ON CONFLICT(email) DO NOTHING
+    """
+    cur.execute(sql, insert_vals)
+    # No commit here; caller (batch/queue) decides when to commit.
 
 
 # ---------------- R08: DB integration helpers ----------------

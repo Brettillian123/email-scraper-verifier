@@ -26,7 +26,13 @@ from src.db import (
     upsert_verification_result,
     write_domain_resolution,
 )
-from src.generate.permutations import generate_permutations, infer_domain_pattern
+from src.generate.patterns import (
+    PATTERNS as CANON_PATTERNS,  # keys of canonical patterns (e.g., "first.last")
+)
+from src.generate.patterns import (
+    infer_domain_pattern,  # O01 canonical inference (returns Inference)
+)
+from src.generate.permutations import generate_permutations
 from src.queueing.rate_limit import (
     GLOBAL_SEM,
     MX_SEM,
@@ -366,6 +372,117 @@ def verify_email_task(  # noqa: C901
 
 
 # ---------------------------------------------
+# Helpers for O01 domain pattern inference/cache
+# ---------------------------------------------
+
+
+def _has_table(con: sqlite3.Connection, name: str) -> bool:
+    try:
+        cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (name,))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _examples_for_domain(con: sqlite3.Connection, domain: str) -> list[tuple[str, str, str]]:
+    """
+    Build [(first, last, localpart)] examples for a domain using 'published' emails.
+    Tries a join to people first; falls back to emails table fields if present.
+    """
+    examples: list[tuple[str, str, str]] = []
+
+    # 1) Preferred: join emails -> people
+    try:
+        rows = con.execute(
+            """
+            SELECT p.first_name, p.last_name, e.email
+            FROM emails e
+            JOIN people p ON p.id = e.person_id
+            WHERE e.domain = ? AND e.source = 'published'
+            """,
+            (domain,),
+        ).fetchall()
+        for fn, ln, em in rows:
+            if not em or "@" not in em or not fn or not ln:
+                continue
+            local = em.split("@", 1)[0].lower()
+            examples.append((str(fn), str(ln), local))
+        if examples:
+            return examples
+    except Exception:
+        pass
+
+    # 2) Fallback: emails table has names inline
+    try:
+        rows = con.execute(
+            """
+            SELECT first_name, last_name, email
+            FROM emails
+            WHERE domain = ? AND source = 'published'
+            """,
+            (domain,),
+        ).fetchall()
+        for fn, ln, em in rows:
+            if not em or "@" not in em or not fn or not ln:
+                continue
+            local = em.split("@", 1)[0].lower()
+            examples.append((str(fn), str(ln), local))
+    except Exception:
+        # As a last resort, return empty -> no inference
+        examples = []
+
+    return examples
+
+
+def _load_cached_pattern(con: sqlite3.Connection, domain: str) -> str | None:
+    """Read a cached canonical pattern key for a domain if the table exists."""
+    if not _has_table(con, "domain_patterns"):
+        return None
+    try:
+        row = con.execute(
+            "SELECT pattern FROM domain_patterns WHERE domain = ?",
+            (domain,),
+        ).fetchone()
+        pat = row[0] if row and row[0] else None
+        if pat in CANON_PATTERNS:
+            return pat
+    except Exception:
+        pass
+    return None
+
+
+def _save_inferred_pattern(
+    con: sqlite3.Connection,
+    domain: str,
+    pattern: str,
+    confidence: float,
+    samples: int,
+) -> None:
+    """Upsert the inferred pattern if the table exists."""
+    if not _has_table(con, "domain_patterns"):
+        return
+    try:
+        con.execute(
+            """
+            INSERT INTO domain_patterns (domain, pattern, confidence, samples)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+              pattern=excluded.pattern,
+              confidence=excluded.confidence,
+              samples=excluded.samples,
+              inferred_at=datetime('now')
+            """,
+            (domain, pattern, float(confidence), int(samples)),
+        )
+    except Exception:
+        # Non-fatal; skip caching errors
+        log.exception(
+            "failed to upsert domain_patterns",
+            extra={"domain": domain, "pattern": pattern},
+        )
+
+
+# ---------------------------------------------
 # R12 wiring: email generation + verify enqueue
 # ---------------------------------------------
 
@@ -389,22 +506,47 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
     R12 job: Generate email permutations for a person@domain, persist them as
     'generated' candidates, and enqueue verification for each.
 
-    Returns basic metrics for logging.
+    O01 enhancement:
+      - Collect published examples for the domain.
+      - Use canonical inference to decide a single pattern when confident.
+      - Optionally persist/read per-domain decisions via domain_patterns.
     """
     con = get_conn()
-    # Optional O01: infer domain pattern from already-published emails
-    rows = con.execute(
-        "SELECT email FROM emails WHERE domain = ? AND source = 'published'",
-        (domain,),
-    ).fetchall()
-    published = [r[0] for r in rows if r and r[0]]
+    dom = (domain or "").lower().strip()
+    if not dom:
+        return {"count": 0, "only_pattern": None, "domain": dom, "person_id": person_id}
 
-    only = infer_domain_pattern(published, first, last)
-    candidates = generate_permutations(first, last, domain, only_pattern=only)
+    # Try cached pattern first (if migration was applied)
+    cached_pattern = _load_cached_pattern(con, dom)
+
+    examples = _examples_for_domain(con, dom)
+    inf_pattern = None
+    inf_conf = 0.0
+    inf_samples = 0
+
+    if cached_pattern:
+        inf_pattern = cached_pattern
+    else:
+        # Run canonical inference from examples (filters role aliases internally)
+        inf = infer_domain_pattern(examples)
+        inf_pattern = inf.pattern
+        inf_conf = float(inf.confidence)
+        inf_samples = int(inf.samples)
+        if inf_pattern:
+            _save_inferred_pattern(con, dom, inf_pattern, inf_conf, inf_samples)
+
+    # Generate candidates: use the inferred/cached pattern if available,
+    # otherwise fall back to the full canonical set.
+    candidates = generate_permutations(
+        first,
+        last,
+        dom,
+        only_pattern=inf_pattern,  # canonical key or None
+    )
 
     inserted = 0
     for e in sorted(candidates):
-        upsert_generated_email(con, person_id, e, domain, source_note="r12")
+        upsert_generated_email(con, person_id, e, dom, source_note="r12")
         _enqueue_verify(e)
         inserted += 1
 
@@ -414,14 +556,23 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
         "R12 generated emails",
         extra={
             "person_id": person_id,
-            "domain": domain,
+            "domain": dom,
             "first": first,
             "last": last,
-            "only_pattern": only,
+            "only_pattern": inf_pattern,
+            "inference_confidence": inf_conf,
+            "inference_samples": inf_samples,
             "count": inserted,
         },
     )
-    return {"count": inserted, "only_pattern": only, "domain": domain, "person_id": person_id}
+    return {
+        "count": inserted,
+        "only_pattern": inf_pattern,
+        "inference_confidence": inf_conf,
+        "inference_samples": inf_samples,
+        "domain": dom,
+        "person_id": person_id,
+    }
 
 
 # ---------------------------

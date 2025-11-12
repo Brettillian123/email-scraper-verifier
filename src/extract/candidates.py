@@ -77,7 +77,8 @@ TOKEN_BLACKLIST = ROLE_ALIASES | {"it"}
 MIN_NAME_TOKEN_LEN = 2
 
 # O05 (optional): de-obfuscation is behind a flag; enable only where policies/ToS allow.
-_DEOBFUSCATE = os.getenv("EXTRACT_DEOBFUSCATE", "0").strip().lower() in {"1", "true", "yes"}
+# NOTE: We intentionally DO NOT read the env var at import time. Tests (and callers)
+# may set it dynamically; we consult it at call time via _should_deobfuscate().
 
 # De-obfuscation components, e.g. "john [at] acme [dot] com", "mary (at) acme dot co dot uk"
 _OB_AT = r"(?:@|\[at\]|\(at\)|\sat\s| at )"
@@ -101,6 +102,28 @@ def _is_role_alias_email(email: str) -> bool:
     except Exception:
         return False
     return local in ROLE_ALIASES
+
+
+# --- Env helpers for de-obfuscation -----------------------------------------
+
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    """
+    Return True iff the env var is one of: 1, true, yes, on (case-insensitive).
+    """
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_deobfuscate(explicit: bool | None) -> bool:
+    """
+    If caller provided a bool, use it; otherwise consult EXTRACT_DEOBFUSCATE at runtime.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return _truthy_env("EXTRACT_DEOBFUSCATE", default=False)
 
 
 # --- Public API --------------------------------------------------------------
@@ -135,7 +158,7 @@ def extract_candidates(
     by_email: dict[str, Candidate] = {}
 
     # 0) (O05) De-obfuscation pass over full page text — only when enabled
-    use_deob = _DEOBFUSCATE if deobfuscate is None else bool(deobfuscate)
+    use_deob = _should_deobfuscate(deobfuscate)
     if use_deob:
         page_text = soup.get_text(" ", strip=True)
         for email in _scan_deobfuscated_emails(page_text):

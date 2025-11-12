@@ -82,6 +82,26 @@ FETCH_ALLOWED_CONTENT_TYPES: list[str] = _getenv_list_str(
     "text/html,text/plain",
 )
 
+# -------------------------------
+# R10: Crawler config (constants, env-overridable)
+# -------------------------------
+CRAWL_MAX_PAGES_PER_DOMAIN: int = _getenv_int("CRAWL_MAX_PAGES_PER_DOMAIN", 30)
+CRAWL_MAX_DEPTH: int = _getenv_int("CRAWL_MAX_DEPTH", 2)
+# ~1.5MB HTML cap to avoid giant blobs
+CRAWL_HTML_MAX_BYTES: int = _getenv_int("CRAWL_HTML_MAX_BYTES", 1_500_000)
+# Network timeouts (seconds) — left as floats; not part of R10 guardrails but used by crawler
+CRAWL_CONNECT_TIMEOUT_S: float = float(os.getenv("CRAWL_CONNECT_TIMEOUT_S", "10"))
+CRAWL_READ_TIMEOUT_S: float = float(os.getenv("CRAWL_READ_TIMEOUT_S", "15"))
+# CSV seed paths and follow keywords (parsing happens in crawler)
+CRAWL_SEED_PATHS: str = os.getenv(
+    "CRAWL_SEED_PATHS",
+    "/team,/about,/contact,/news,/press,/newsroom",
+)
+CRAWL_FOLLOW_KEYWORDS: str = os.getenv(
+    "CRAWL_FOLLOW_KEYWORDS",
+    "team,about,contact,leadership,people,staff,news,press,newsroom",
+)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -219,4 +239,12 @@ __all__ = [
     "FETCH_MAX_RETRIES",
     "FETCH_MAX_BODY_BYTES",
     "FETCH_ALLOWED_CONTENT_TYPES",
+    # R10 crawler constants
+    "CRAWL_MAX_PAGES_PER_DOMAIN",
+    "CRAWL_MAX_DEPTH",
+    "CRAWL_HTML_MAX_BYTES",
+    "CRAWL_CONNECT_TIMEOUT_S",
+    "CRAWL_READ_TIMEOUT_S",
+    "CRAWL_SEED_PATHS",
+    "CRAWL_FOLLOW_KEYWORDS",
 ]

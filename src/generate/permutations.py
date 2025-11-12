@@ -1,3 +1,4 @@
+# src/generate/permutations.py
 from __future__ import annotations
 
 import re
@@ -10,7 +11,18 @@ try:
 except Exception:  # pragma: no cover
     ROLE_ALIASES: set[str] = set()
 
-# Common local-part patterns. Placeholders: {first}, {last}, {f}, {l}
+# O01 canonical toolkit (keys like "first.last"); used when an explicit key is supplied.
+from src.generate.patterns import (
+    PATTERNS as CANON_PATTERNS,  # dict[str, LPFn]
+)
+from src.generate.patterns import (
+    apply_pattern,  # (first, last, key) -> local
+)
+
+# ---------------------------------------------------------------------------
+# Legacy R12 pattern templates (kept for backward compatibility with tests)
+# Placeholders: {first}, {last}, {f}, {l}
+# ---------------------------------------------------------------------------
 PATTERNS: tuple[str, ...] = (
     "{first}.{last}",
     "{first}{last}",
@@ -27,6 +39,9 @@ PATTERNS: tuple[str, ...] = (
 )
 
 
+# ------------------------------
+# Name normalization (R12 legacy)
+# ------------------------------
 def _to_ascii_lower(s: str) -> str:
     """ASCII-fold and lower-case."""
     nfkd = unicodedata.normalize("NFKD", s)
@@ -53,48 +68,84 @@ def normalize_name_parts(first: str, last: str) -> tuple[str, str, str, str]:
     return first, last, f_initial, last_initial
 
 
+# -----------------------
+# Candidate generation
+# -----------------------
 def generate_permutations(
     first: str,
     last: str,
     domain: str,
+    *,
+    # If provided, this takes precedence. Accepts either a canonical key
+    # (e.g., 'first.last') OR a legacy format string (e.g., '{first}.{last}').
     only_pattern: str | None = None,
+    # (optional; unused here but accepted to avoid breaking callers that pass it)
+    examples: Iterable[tuple[str, str, str]] | None = None,  # noqa: ARG001
 ) -> set[str]:
     """
-    Make email candidates for first/last@domain using common patterns.
-    If only_pattern is provided (e.g., '{first}.{last}'), use just that one.
+    Make email candidates for first/last@domain.
+
+    Resolution order:
+      1) If only_pattern is a canonical key in CANON_PATTERNS, generate exactly one
+         using apply_pattern().
+      2) Else if only_pattern is a legacy brace-template string, render with the
+         legacy normalization context.
+      3) Else fall back to the legacy R12 PATTERNS list.
+
+    Role/distribution aliases are always skipped when known.
     """
-    first, last, f_initial, last_initial = normalize_name_parts(first, last)
     if not (first or last) or not domain:
         return set()
 
-    locals_seen: set[str] = set()
-    patterns = (only_pattern,) if only_pattern else PATTERNS
-    ctx = {"first": first, "last": last, "f": f_initial, "l": last_initial}
+    dom = domain.lower().strip()
+    out: set[str] = set()
 
-    for pattern in patterns:
+    # 1) Canonical key path (O01)
+    if only_pattern and only_pattern in CANON_PATTERNS:
+        local = apply_pattern(first, last, only_pattern)
+        if local and local not in ROLE_ALIASES:
+            out.add(f"{local}@{dom}")
+        return out
+
+    # Prepare legacy formatting context
+    first_n, last_n, f_initial, l_initial = normalize_name_parts(first, last)
+    ctx = {"first": first_n, "last": last_n, "f": f_initial, "l": l_initial}
+
+    # 2) Legacy single-template path
+    if only_pattern and only_pattern not in CANON_PATTERNS:
+        try:
+            local = only_pattern.format(**ctx)
+        except Exception:
+            local = ""
+        if local and local not in ROLE_ALIASES:
+            out.add(f"{local}@{dom}")
+        return out
+
+    # 3) Legacy full-set fallback
+    for pattern in PATTERNS:
         try:
             local = pattern.format(**ctx)
         except Exception:
             continue
-        if not local:
+        if not local or local in ROLE_ALIASES:
             continue
-        if local in ROLE_ALIASES:
-            # Skip obvious role/distribution addresses if aliases were provided
-            continue
-        locals_seen.add(local)
+        out.add(f"{local}@{dom}")
 
-    dom = domain.lower()
-    return {f"{local}@{dom}" for local in locals_seen}
+    return out
 
 
+# -----------------------------------------
+# Legacy heuristic used by some R12 tests
+# -----------------------------------------
 def infer_domain_pattern(
     emails: Iterable[str],
     first: str,
     last: str,
 ) -> str | None:
     """
-    Infer a domain's email pattern from published examples by using simple
-    shape heuristics (separator and token count), not exact names.
+    R12-era heuristic inference that looks only at published localparts,
+    returning a *legacy* format string like '{first}.{last}' when a clear
+    shape dominates. Kept for backward compatibility with tests.
 
     Priority:
       1) first.last / first_last / first-last (separator-based)
@@ -125,11 +176,10 @@ def infer_domain_pattern(
         return "{f}{last}"
 
     # 3) firstlast (no separator; weak heuristic)
-    #    Use a minimal length to avoid matching short aliases.
     if any(re.fullmatch(r"[a-z0-9]{6,}", lc) for lc in locals_published):
         return "{first}{last}"
 
-    # 4) first + last initial (e.g., john.d or john d) — rare; keep last
+    # 4) first + last initial (e.g., john.d) — rare; keep last
     if any(re.fullmatch(r"[a-z0-9]+[a-z]", lc) for lc in locals_published):
         return "{first}{l}"
 

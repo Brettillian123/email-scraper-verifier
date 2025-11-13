@@ -120,12 +120,18 @@ def split_name_hard(full_name: str) -> tuple[str, str]:
     if not raw:
         return "", ""
 
-    # If CJK: treat first token as surname (last), remaining tokens as given name (first)
+    # If CJK: treat first token as surname (last), remaining tokens as given name (first).
+    # We split on the original string so this still works even if Unidecode is not
+    # installed; transliteration happens later in normalize_name_parts.
     if is_cjk(raw):
-        toks = _collapse_ws(transliterate(raw)).split()
+        toks = raw.split()
         if len(toks) >= 2:
-            return " ".join(toks[1:]), toks[0]
-        return (toks[0], "") if toks else ("", "")
+            first_raw = " ".join(toks[1:])
+            last_raw = toks[0]
+            return first_raw, last_raw
+        if toks:
+            return toks[0], ""
+        return "", ""
 
     toks = raw.split()
     if len(toks) == 1:
@@ -158,7 +164,9 @@ def split_name_hard(full_name: str) -> tuple[str, str]:
 def normalize_name_parts(full_name: str) -> tuple[str, str, str]:
     """
     Returns (first_name, last_name, raw_name).
-    Applies transliteration, diacritic stripping, and particle-aware splitting.
+    Applies transliteration, diacritic stripping, and particle-aware splitting,
+    with family-first handling for CJK names (e.g., "王 小明" → first "xiaoming",
+    last "wang" after transliteration).
     """
     first, last = split_name_hard(full_name)
     norm_first = _collapse_ws(transliterate(first)).lower()

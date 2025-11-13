@@ -73,6 +73,11 @@ jobs:
           python -m pip install pre-commit detect-secrets
           pre-commit run --all-files
 
+      # R14: ICP config smoke test (no bash heredoc)
+      - name: ICP config smoke test
+        run: |
+          python -c 'from src.config import load_icp_config; cfg = load_icp_config(); import sys; sys.exit("load_icp_config() did not return a dict") if not isinstance(cfg, dict) else print("ICP config loaded OK; keys:", sorted(cfg.keys()))'
+
       - name: Run tests
         # DO NOT set PYTHONPATH=src; it can shadow stdlib 'queue'
         run: pytest -q

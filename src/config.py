@@ -3,8 +3,15 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
+
+# Optional dependency for YAML-based configs (R14 ICP scoring)
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore
 
 
 def _getenv_int(name: str, default: int) -> int:
@@ -226,6 +233,41 @@ def load_settings() -> AppConfig:
     )
 
 
+def load_icp_config() -> dict[str, Any]:
+    """
+    Load ICP scoring configuration for R14 from docs/icp-schema.yaml.
+
+    Returns an empty dict if the file does not exist or PyYAML is unavailable.
+    The expected shape is:
+
+      min_required: [...]
+      weights:
+        role_family: ...
+        seniority: ...
+        company_size: ...
+        industry_bonus: ...
+        tech_keywords: ...
+      thresholds:
+        good: ...
+        stretch: ...
+        reject: ...
+      null_penalty: ...
+      cap: ...
+
+    Additional keys (e.g., fields, normalization_rules) are preserved but not
+    required by the scorer.
+    """
+    path = ROOT / "docs" / "icp-schema.yaml"
+    if yaml is None or not path.exists():
+        return {}
+
+    text = path.read_text(encoding="utf-8")
+    cfg = yaml.safe_load(text)
+    if not isinstance(cfg, dict):
+        return {}
+    return cfg or {}
+
+
 settings: Settings = Settings()
 
 # Your new structured config, if you want to import it elsewhere:
@@ -260,4 +302,6 @@ __all__ = [
     "CRAWL_READ_TIMEOUT_S",
     "CRAWL_SEED_PATHS",
     "CRAWL_FOLLOW_KEYWORDS",
+    # R14 ICP config
+    "load_icp_config",
 ]

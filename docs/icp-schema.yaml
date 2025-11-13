@@ -1,63 +1,47 @@
-# Fields captured per lead/company for scoring
-fields:
-  role: {type: enum, values: [Founder, CEO, VP, Director, Manager, IC], required: true}
-  seniority: {type: enum, values: [C, VP, Director, Manager, IC]}
-  company_size: {type: range, buckets: ["1-10","11-50","51-200","201-1000","1001+"], required: true}
-  industry: {type: keyword}
-  geo: {type: region}
-  tech_signals: {type: list, subtype: string}   # e.g., mentions of Salesforce, HubSpot
-  domain: {type: domain, required: true}
+version: 1
+cap: 100
 
-scoring:
-  min_required: [domain, role]
-  weights:
-    role: 0.45
-    company_size: 0.20
-    industry: 0.15
-    tech_signals: 0.10
-    seniority: 0.05
-    geo: 0.05
-  thresholds:
-    accept: 0.70
-    review: 0.50
+# Turn gating OFF to prove signals apply; we can re-enable after.
+min_required: [role_family]
 
-tiebreaks:
-  - recent_source: desc    # fresher page beats older
-  - seniority: desc
+# Preferred shape
+weights:
+  role_family:
+    Sales: 35
+    Engineering: 25
+    Marketing: 10
+    "Customer Success": 20
+    Operations: 10
+  seniority:
+    C: 30
+    VP: 25
+    Head: 20
+    Director: 18
+    Manager: 12
+    IC: 0
 
-notes:
-  - |
-    Normalize titles before scoring. Examples:
-    - "VP, Sales" → "VP"
-    - "Chief Technology Officer" → "C"
-    - "Head of Marketing" → "Director"
-    - "SWE II" → "IC"
+# Back-compat shape some loaders expect
+signals:
+  role_family:
+    Sales: 35
+    Engineering: 25
+    Marketing: 10
+    "Customer Success": 20
+    Operations: 10
+  seniority:
+    C: 30
+    VP: 25
+    Head: 20
+    Director: 18
+    Manager: 12
+    IC: 0
 
-# -----------------------------
-# R13 Normalization Rules
-# -----------------------------
-normalization_rules:
-  names:
-    - "Unicode NFKC; trim; collapse whitespace."
-    - "Title-case with particle rules: keep particles lowercase unless leading (e.g., 'de', 'da', 'van', 'bin', 'al', 'de la')."
-    - "Preserve meaningful hyphens/apostrophes (e.g., 'Mary-Kate', 'O’Leary', 'Jean-Paul')."
-    - "Keep diacritics in display form (e.g., 'Bücher'); ASCII fallback used only where needed for generation (O09)."
-  titles:
-    abbreviations_uppercase: [CEO, CFO, COO, CMO, CTO, CIO, CHRO, CRO, VP, SVP, EVP, GM, MD, PhD, CPA, JD, MBA, II, III, IV]
-    small_words_lowercase: [a, an, and, as, at, but, by, for, from, in, into, nor, of, on, or, over, per, the, to, via, vs, with]
-    examples:
-      - "vp, sales & marketing → VP, Sales & Marketing"
-      - "Head Of Data → Head of Data"
-  companies:
-    display_suffixes: [Inc., LLC, Ltd., GmbH, S.A., Sàrl, Pty Ltd, BV, NV, PLC, AG, Oy, Oyj]
-    norm_key: "lowercase; diacritics removed; punctuation stripped; corporate suffixes removed; spaces collapsed."
-    auto_merge: false  # norm_key clusters candidates only; merging is a review/accept step
-    example:
-      raw: "Crestwell Partners, LLC"
-      name_norm: "Crestwell Partners, LLC"
-      norm_key: "crestwell partners"
-  domains:
-    - "Normalize to IDNA ASCII and lowercase (e.g., 'bücher.de' → 'xn--bcher-kva.de')."
-  provenance:
-    - "Always preserve source_url from extraction/generation (R11/R12); normalization must not drop or overwrite it."
-    - "On ingest, copy title to people.title_raw and store normalized title in people.title_norm."
+# Optional extras if you wire them up later
+company_size: { small: 5, mid: 10, large: 15 }
+industry: { SaaS: 10, Manufacturing: 5 }
+
+reason_labels:
+  role_family: "role_family"
+  seniority: "seniority"
+  company_size: "company_size"
+  industry: "industry"

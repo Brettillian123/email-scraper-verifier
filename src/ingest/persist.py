@@ -17,15 +17,22 @@ Queueing policy (best-effort):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
+from src.config import load_icp_config
 from src.ingest.normalize import norm_domain, normalize_row
+from src.scoring.icp import compute_icp
 
 logger = logging.getLogger(__name__)
+
+# Load ICP config once (R14)
+ICPCFG: dict[str, Any] = load_icp_config() or {}
 
 # Import lazily / resiliently so tests without src.db don't explode on import.
 try:  # pragma: no cover
@@ -246,7 +253,7 @@ def _enqueue_domain_resolution(
 
 def _insert_person(con: sqlite3.Connection, company_id: int, normalized: dict[str, Any]) -> None:
     """
-    Insert a person row. Honors new R13 fields if present in schema.
+    Insert a person row. Honors new R13/R14 fields if present in schema.
     Never drops provenance: source_url is passed through as provided.
     """
     people_cols = _table_columns(con, "people")
@@ -272,9 +279,13 @@ def _insert_person(con: sqlite3.Connection, company_id: int, normalized: dict[st
     if "title_norm" in people_cols:
         payload["title_norm"] = normalized.get("title_norm") or ""
 
-    # Role (O02 may later canonicalize into role_family/seniority)
+    # Role (legacy), plus O02-derived role_family/seniority if present
     if "role" in people_cols:
         payload["role"] = normalized.get("role") or ""
+    if "role_family" in people_cols:
+        payload["role_family"] = normalized.get("role_family") or ""
+    if "seniority" in people_cols:
+        payload["seniority"] = normalized.get("seniority") or ""
 
     # Provenance
     if "source_url" in people_cols:
@@ -287,6 +298,27 @@ def _insert_person(con: sqlite3.Connection, company_id: int, normalized: dict[st
     # Optional errors snapshot (if schema has it)
     if "errors" in people_cols:
         payload["errors"] = normalized.get("errors") or ""
+
+    # R14: inline ICP scoring for new rows (null-safe, config-aware)
+    # Only attempt if config is present and columns exist.
+    if (
+        ICPCFG
+        and "icp_score" in people_cols
+        and "icp_reasons" in people_cols
+        and "last_scored_at" in people_cols
+    ):
+        person_for_icp = {
+            "domain": normalized.get("domain"),
+            "role_family": normalized.get("role_family"),
+            "seniority": normalized.get("seniority"),
+        }
+        try:
+            res = compute_icp(person_for_icp, None, ICPCFG)
+            payload["icp_score"] = int(res.score)
+            payload["icp_reasons"] = json.dumps(res.reasons, ensure_ascii=False)
+            payload["last_scored_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        except Exception as e:  # best-effort; do not break ingest on scoring errors
+            logger.warning("ICP scoring failed during insert; continuing without score: %s", e)
 
     cols = list(payload.keys())
     placeholders = ",".join("?" for _ in cols)

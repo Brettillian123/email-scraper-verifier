@@ -10,16 +10,14 @@ CSV ingestor (R13-ready)
 - Persists via src.ingest.persist.persist_best_effort (per-row) so we can log rejects
 - Optional: emit normalized JSONL (--out PATH or "-" for stdout)
 - Supports both legacy --path and positional file args
-
-Examples:
-  python scripts/ingest_csv.py samples/leads.csv
-  python scripts/ingest_csv.py samples/a.csv samples/b.csv --out normalized.jsonl
-  python scripts/ingest_csv.py --path samples/leads.csv --dry-run
+- POLISH: After successful ingest (not --dry-run), auto-backfill O02 role/seniority
+  (if helper exists) and run R14 scoring against the DB.
 """
 
 import argparse
 import csv
 import json
+import subprocess
 import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
@@ -116,7 +114,18 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--out",
         metavar="PATH",
-        help="Write normalized JSONL to PATH (use '-' for stdout).",
+        help='Write normalized JSONL to PATH (use "-" for stdout).',
+    )
+    # POLISH: DB path & ability to skip post-ingest scoring
+    ap.add_argument(
+        "--db",
+        default="data/dev.db",
+        help="SQLite DB path used by migrators (default: data/dev.db)",
+    )
+    ap.add_argument(
+        "--no-score",
+        action="store_true",
+        help="Skip post-ingest O02 backfill and R14 scoring.",
     )
     args = ap.parse_args(argv)
 
@@ -193,6 +202,36 @@ def main(argv: list[str] | None = None) -> None:
     if out_path is None and args.dry_run:
         # If user requested dry-run without --out, default to stdout for visibility
         print("[note] --dry-run without --out: no normalized output was written.")
+
+    # POLISH: After a real ingest, ensure O02 fields exist then score (R14).
+    if not args.dry_run and not args.no_score:
+        scripts_dir = ROOT / "scripts"
+
+        # 1) Populate role_family/seniority if helper exists
+        bf_o02 = scripts_dir / "backfill_o02_roles.py"
+        if bf_o02.exists():
+            print("Backfilling O02 role_family/seniority…")
+            subprocess.run(
+                [sys.executable, str(bf_o02), "--db", args.db],
+                check=True,
+            )
+        else:
+            print(
+                "[warn] backfill_o02_roles.py not found; assuming ingest populated role/seniority."
+            )
+
+        # 2) Score ICP (R14)
+        print("Scoring (R14): backfilling icp_score/icp_reasons…")
+        subprocess.run(
+            [
+                sys.executable,
+                str(scripts_dir / "migrate_r14_add_icp.py"),
+                "--db",
+                args.db,
+                "-v",
+            ],
+            check=True,
+        )
 
 
 if __name__ == "__main__":

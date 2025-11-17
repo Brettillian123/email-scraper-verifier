@@ -43,6 +43,38 @@ except Exception:  # pragma: no cover
         return None
 
 
+# Optional freemail detector (project-level), fallback to a local set if unavailable.
+try:  # pragma: no cover
+    from src.ingest.freemail import is_freemail as _is_freemail  # type: ignore
+except Exception:  # pragma: no cover
+
+    def _is_freemail(domain: str) -> bool:
+        d = (domain or "").lower().strip()
+        # Minimal but practical default list; project module (if present) takes precedence.
+        return d in {
+            "gmail.com",
+            "googlemail.com",
+            "yahoo.com",
+            "yahoo.co.uk",
+            "ymail.com",
+            "outlook.com",
+            "hotmail.com",
+            "live.com",
+            "msn.com",
+            "aol.com",
+            "icloud.com",
+            "me.com",
+            "mac.com",
+            "gmx.com",
+            "proton.me",
+            "protonmail.com",
+            "yandex.com",
+            "zoho.com",
+            "mail.com",
+            "hey.com",
+        }
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -247,6 +279,88 @@ def _enqueue_domain_resolution(
 
 
 # ---------------------------------------------------------------------------
+# R15: enqueue MX resolver (idempotent; skip freemail)
+# ---------------------------------------------------------------------------
+
+
+def _enqueue_mx_resolution(
+    company_id: int,
+    domain: str | None,
+    *,
+    force: bool = False,
+) -> None:
+    """
+    Enqueue the R15 MX resolver for a concrete company domain.
+
+    Rules:
+    - Only runs best-effort; never raises.
+    - Skips freemail domains.
+    - Calls the ingest enqueue shim (for tests) **and** then attempts real RQ enqueue.
+      MX writes are idempotent, so double-enqueue is safe if the shim also enqueues.
+    - Idempotent behavior is handled inside src.resolve.mx.resolve_mx (DB-upsert).
+    """
+    try:
+        canon = norm_domain(domain) if domain else None
+        if not canon:
+            return
+        if _is_freemail(canon):
+            logger.info("R15 MX enqueue skipped (freemail): %s", canon)
+            return
+
+        # 1) Preferred: ingest enqueue shim (observed in tests)
+        try:
+            from src.ingest import enqueue as ingest_enqueue  # type: ignore
+
+            ingest_enqueue(
+                "task_resolve_mx",
+                {
+                    "company_id": int(company_id),
+                    "domain": canon,
+                    "force": bool(force),
+                },
+            )
+            logger.info(
+                "R15 MX enqueue via ingest shim: company_id=%s domain=%s", company_id, canon
+            )
+            # NOTE: Do NOT return here; fall through to RQ to ensure real enqueue in runtime.
+        except Exception as e:
+            logger.debug("ingest.enqueue unavailable for MX; will attempt RQ: %s", e)
+
+        # 2) Also attempt direct RQ on 'mx' queue (idempotent)
+        try:
+            from rq import Queue  # type: ignore
+
+            from src.queueing.redis_conn import get_redis  # type: ignore
+            from src.queueing.tasks import task_resolve_mx  # type: ignore
+        except Exception:
+            return  # environment without RQ/Redis installed
+
+        try:
+            q = Queue("mx", connection=get_redis())
+            q.enqueue(
+                task_resolve_mx,
+                company_id=company_id,
+                domain=canon,
+                force=force,
+                job_timeout=10,
+                retry=None,
+            )
+            logger.info(
+                "R15 MX enqueue via ingest shim: company_id=%s domain=%s",
+                company_id,
+                canon,
+            )
+
+        except (ConnectionError, TimeoutError, OSError) as e:
+            logger.warning("Queue degraded (MX resolution not enqueued): %s", e)
+        except Exception as e:
+            logger.warning("Queue degraded (MX unexpected): %s", e)
+    except Exception as e:
+        # Belt-and-suspenders: never break ingest on enqueue errors.
+        logger.debug("Ignoring MX enqueue error (best-effort): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # People/lead persistence
 # ---------------------------------------------------------------------------
 
@@ -385,6 +499,10 @@ def persist_best_effort(normalized: dict[str, Any]) -> None:
         normalized_hint = _compute_normalized_hint(normalized)
         _enqueue_domain_resolution(con, company_id, (company or ""), normalized_hint)
 
+        # R15: enqueue MX resolver if we already have a concrete non-freemail domain
+        if domain:
+            _enqueue_mx_resolution(company_id, domain, force=False)
+
         con.commit()
     finally:
         con.close()
@@ -434,6 +552,10 @@ def persist_rows(rows: Iterable[dict[str, Any]]) -> int:
             # Best-effort enqueue after DB write
             normalized_hint = _compute_normalized_hint(normalized)
             _enqueue_domain_resolution(con, company_id, (company or ""), normalized_hint)
+
+            # R15: enqueue MX resolver for concrete non-freemail domains
+            if domain:
+                _enqueue_mx_resolution(company_id, domain, force=False)
 
         con.commit()
         return n

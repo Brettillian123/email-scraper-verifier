@@ -12,6 +12,7 @@ from pathlib import Path
 import dns.resolver
 from redis import Redis
 from rq import Queue, get_current_job
+from rq.decorators import job
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -49,6 +50,7 @@ from src.queueing.rate_limit import (
 )
 from src.queueing.redis_conn import get_redis
 from src.resolve.domain import resolve
+from src.resolve.mx import resolve_mx as _resolve_mx  # R15
 
 log = logging.getLogger(__name__)
 _cfg = load_settings()
@@ -374,6 +376,152 @@ def verify_email_task(  # noqa: C901
             release(redis, mx_key)
         if got_global:
             release(redis, GLOBAL_SEM)
+
+
+# -------------------------------
+# R15: MX resolution queue task
+# -------------------------------
+
+
+@job("mx", timeout=10)
+def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
+    """
+    R15 queue task: Resolve MX for a domain and persist to domain_resolutions.
+
+    Behavior:
+      - If Redis is available, enforce R06 concurrency/RPS caps (global + per-domain pre-MX).
+      - If Redis is NOT available (e.g., direct call / smoke), gracefully bypass throttling
+        and run inline (no Redis dependency).
+
+    Returns:
+      {"ok", "company_id", "domain", "lowest_mx", "mx_hosts", "preference_map",
+       "cached", "failure", "row_id"}
+    """
+    import os
+    import time
+
+    dom = (domain or "").strip().lower()
+    if not dom:
+        return {"ok": False, "error": "empty_domain", "company_id": company_id, "domain": dom}
+
+    # Detect Redis availability; if unreachable, run inline without throttling.
+    redis_ok = False
+    try:
+        redis: Redis = get_redis()
+        try:
+            redis.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+    except Exception:
+        redis_ok = False
+
+    start = time.perf_counter()
+    got_global = False
+    got_key = False
+    sem_key = MX_SEM.format(mx=dom)  # per-domain key pre-MX to avoid herd
+
+    try:
+        # --------------------------
+        # Optional throttling (R06)
+        # --------------------------
+        if redis_ok:
+            # Concurrency caps
+            got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
+            if not got_global:
+                return {
+                    "ok": False,
+                    "error": "global concurrency cap reached",
+                    "company_id": company_id,
+                    "domain": dom,
+                }
+
+            got_key = try_acquire(redis, sem_key, _cfg.rate.per_mx_max_concurrency_default)
+            if not got_key:
+                return {
+                    "ok": False,
+                    "error": "per-MX concurrency cap reached",
+                    "company_id": company_id,
+                    "domain": dom,
+                }
+
+            # RPS smoothing (optional)
+            sec = int(time.time())
+            key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
+            key_dom_rps = RPS_KEY_MX.format(mx=dom, sec=sec)
+
+            if _cfg.rate.global_rps and not can_consume_rps(
+                redis, key_global_rps, int(_cfg.rate.global_rps)
+            ):
+                return {
+                    "ok": False,
+                    "error": "global RPS throttle",
+                    "company_id": company_id,
+                    "domain": dom,
+                }
+
+            if _cfg.rate.per_mx_rps_default and not can_consume_rps(
+                redis, key_dom_rps, int(_cfg.rate.per_mx_rps_default)
+            ):
+                return {
+                    "ok": False,
+                    "error": "MX RPS throttle",
+                    "company_id": company_id,
+                    "domain": dom,
+                }
+
+        # --------------------------
+        # Resolve & persist (R15)
+        # --------------------------
+        db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
+        res = _resolve_mx(company_id=company_id, domain=dom, force=force, db_path=db_path)
+
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        log.info(
+            "R15 resolved MX",
+            extra={
+                "company_id": company_id,
+                "domain": dom,
+                "lowest_mx": res.lowest_mx,
+                "cached": res.cached,
+                "failure": res.failure,
+                "latency_ms": latency_ms,
+                "row_id": res.row_id,
+                "count_hosts": len(res.mx_hosts or []),
+                "throttled": redis_ok,
+            },
+        )
+
+        return {
+            "ok": True,
+            "company_id": company_id,
+            "domain": dom,
+            "lowest_mx": res.lowest_mx,
+            "mx_hosts": res.mx_hosts,
+            "preference_map": res.preference_map,
+            "cached": res.cached,
+            "failure": res.failure,
+            "row_id": res.row_id,
+        }
+
+    except Exception as e:
+        log.exception(
+            "R15 task_resolve_mx failed",
+            extra={"company_id": company_id, "domain": dom, "exc": str(e)},
+        )
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "company_id": company_id,
+            "domain": dom,
+        }
+    finally:
+        # Only release if we actually acquired and Redis was usable
+        if redis_ok:
+            if got_key:
+                release(redis, sem_key)
+            if got_global:
+                release(redis, GLOBAL_SEM)
 
 
 # ---------------------------------------------

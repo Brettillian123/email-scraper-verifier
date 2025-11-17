@@ -20,6 +20,31 @@ _cfg = load_settings()
 _PERM_ERR_SUFFIX = ".PermanentSMTPError"
 
 
+# -----------------------------
+# Windows-safe death penalty
+# -----------------------------
+class _NoOpPenalty:
+    """
+    A no-op death penalty context manager.
+
+    RQ uses a "death penalty" (signal/SIGALRM on POSIX) to enforce job timeouts.
+    On Windows, SIGALRM does not exist, so we must disable that mechanism.
+
+    When set as worker.death_penalty_class, job timeouts will be ignored.
+    """
+
+    def __init__(self, timeout, exception, **_kwargs) -> None:  # noqa: D401
+        self.timeout = timeout
+        self.exception = exception
+
+    def __enter__(self):  # noqa: D401
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:  # noqa: D401
+        # Do not suppress exceptions raised by the job
+        return False
+
+
 def _to_exc_name(exc_type) -> str:
     return f"{exc_type.__module__}.{exc_type.__name__}"
 
@@ -89,12 +114,30 @@ def run():
     try:
         w.push_exc_handler(_dlq_exception_handler)  # RQ 2.x+
     except Exception:
-        pass  # fine; constructor handler covers older/newer versions
+        pass  # constructor handler covers older/newer versions
+
+    # ---- Windows adjustments ----
+    if os.name == "nt":
+        # Disable death penalty (SIGALRM not available on Windows)
+        try:
+            # type: ignore[attr-defined]
+            w.death_penalty_class = _NoOpPenalty  # noqa: SLF001
+            log.info("Windows: disabled job timeouts (death_penalty_class->NoOp)")
+        except Exception:
+            log.warning("Windows: failed to set death_penalty_class NoOp; continuing")
+
+        # Avoid worker TTL semantics that may rely on signals
+        try:
+            # internal attr; safe to relax in our controlled worker
+            w._default_worker_ttl = 0  # noqa: SLF001
+        except Exception:
+            pass
 
     # Only the forking Worker supports with_scheduler
     if worker_cls is RQWorker:
         w.work(with_scheduler=True)
     else:
+        # SimpleWorker path (Windows): no scheduler, no signals
         w.work()
 
 

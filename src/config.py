@@ -122,6 +122,14 @@ CRAWL_FOLLOW_KEYWORDS: str = os.getenv(
     "team,about,contact,leadership,people,staff,news,press,newsroom",
 )
 
+# -------------------------------
+# R16: SMTP probe config (constants, env-overridable)
+# -------------------------------
+SMTP_HELO_DOMAIN = os.getenv("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com")
+SMTP_MAIL_FROM = os.getenv("SMTP_MAIL_FROM", f"bounce@{SMTP_HELO_DOMAIN}")
+SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", "10"))
+SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", "10"))
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -304,4 +312,9 @@ __all__ = [
     "CRAWL_FOLLOW_KEYWORDS",
     # R14 ICP config
     "load_icp_config",
+    # R16 SMTP probe constants
+    "SMTP_HELO_DOMAIN",
+    "SMTP_MAIL_FROM",
+    "SMTP_CONNECT_TIMEOUT",
+    "SMTP_COMMAND_TIMEOUT",
 ]

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sqlite3
+import statistics
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -137,7 +139,7 @@ def _ensure_table(con: sqlite3.Connection) -> None:
 
 def _table_info(con: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
     cur = con.execute(f"PRAGMA table_info({table})")
-    cur.row_factory = sqlite3.Row
+    # The connection may already have row_factory set; rely on that.
     rows = cur.fetchall()
     return rows  # columns: cid, name, type, notnull, dflt_value, pk
 
@@ -509,3 +511,247 @@ def resolve_mx(
         failure=failure,
         cached=False,
     )
+
+
+def _db_path_from_env() -> str:
+    return os.getenv("DATABASE_PATH") or "data/dev.db"
+
+
+def _ensure_behavior_schema(con: sqlite3.Connection) -> None:
+    con.executescript(
+        """
+    CREATE TABLE IF NOT EXISTS mx_probe_stats (
+      id INTEGER PRIMARY KEY,
+      mx_host    TEXT NOT NULL,
+      ts         TEXT NOT NULL DEFAULT (datetime('now')),
+      code       INTEGER,
+      category   TEXT,
+      error_kind TEXT,
+      elapsed_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_mx_probe_host_ts ON mx_probe_stats(mx_host, ts);
+    """
+    )
+
+
+def record_mx_probe(
+    mx_host: str,
+    code: int | None,
+    elapsed_s: float,
+    *,
+    error_kind: str | None = None,
+    category: str | None = None,
+    db_path: str | None = None,
+) -> None:
+    """Append a single probe datapoint (called by R16 smtp.probe_rcpt)."""
+    mx_host = (mx_host or "").strip().lower()
+    if not mx_host:
+        return
+    db = db_path or _db_path_from_env()
+    with sqlite3.connect(db) as con:
+        _ensure_behavior_schema(con)
+        con.execute(
+            """
+            INSERT INTO mx_probe_stats(
+                mx_host,
+                code,
+                category,
+                error_kind,
+                elapsed_ms
+            )
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                mx_host,
+                None if code is None else int(code),
+                category,
+                error_kind,
+                int(round(elapsed_s * 1000)),
+            ),
+        )
+
+
+def _percentile(vals: list[int], p: float) -> int:
+    if not vals:
+        return 0
+    try:
+        # statistics.quantiles requires n>=1; we handle small n via sorted index
+        vals = sorted(vals)
+        k = max(0, min(len(vals) - 1, int(round((p / 100.0) * (len(vals) - 1)))))
+        return int(vals[k])
+    except Exception:
+        return int(statistics.median(vals)) if vals else 0
+
+
+def get_mx_behavior_hint(
+    mx_host: str, *, window_days: int = 30, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """Return a compact behavior hint dict derived from recent probes."""
+    mx_host = (mx_host or "").strip().lower()
+    if not mx_host:
+        return None
+    db = db_path or _db_path_from_env()
+    with sqlite3.connect(db) as con:
+        _ensure_behavior_schema(con)
+        rows = con.execute(
+            """
+            SELECT code, category, elapsed_ms
+            FROM mx_probe_stats
+            WHERE mx_host = ? AND ts >= datetime('now', ?)
+            ORDER BY ts DESC
+            LIMIT 5000
+            """,
+            (mx_host, f"-{int(window_days)} days"),
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    total = len(rows)
+    temps = sum(1 for c, cat, _ in rows if (cat or "") == "temp_fail")
+    accpt = sum(1 for c, cat, _ in rows if (cat or "") == "accept")
+    elats = [int(e or 0) for _, _, e in rows if e is not None]
+
+    p50 = _percentile(elats, 50)
+    p95 = _percentile(elats, 95)
+    tfr = round(temps / total, 3)
+    srate = round(accpt / total, 3)
+    tarpit = (p95 > 2000) or (tfr > 0.30)
+
+    return {
+        "n": total,
+        "latency_p50_ms": p50,
+        "latency_p95_ms": p95,
+        "recent_temp_fail_rate": tfr,
+        "success_rate": srate,
+        "tarpit": bool(tarpit),
+        "window_days": window_days,
+    }
+
+
+def _update_latest_resolution_behavior(
+    domain: str, behavior: dict | None, *, db_path: str | None = None
+) -> None:
+    """
+    Write a JSON summary into the most-recent domain_resolutions row for this
+    domain, ordered by resolved_at (ties broken by id).
+    """
+    if not behavior:
+        return
+    db = db_path or _db_path_from_env()
+    payload = json.dumps(behavior, ensure_ascii=False)
+    with sqlite3.connect(db) as con:
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(domain_resolutions)").fetchall()}
+            if "mx_behavior" not in cols or "resolved_at" not in cols:
+                return
+            row = con.execute(
+                """
+                SELECT id
+                  FROM domain_resolutions
+                 WHERE domain = ?
+                 ORDER BY
+                      COALESCE(NULLIF(resolved_at, ''), '0000-01-01T00:00:00Z') DESC,
+                      id DESC
+                 LIMIT 1
+                """,
+                (domain,),
+            ).fetchone()
+            if row:
+                con.execute(
+                    "UPDATE domain_resolutions SET mx_behavior = ? WHERE id = ?",
+                    (payload, int(row[0])),
+                )
+        except Exception:
+            # best-effort; do not raise
+            pass
+
+
+# -----------------------------
+# R16-visible behavior hook
+# -----------------------------
+
+
+def record_behavior(
+    *,
+    domain: str,
+    mx_host: str,
+    elapsed_ms: int,
+    category: str,
+    code: int | None,
+    error_kind: str | None,
+) -> None:
+    """
+    O06/R16 hook: tests monkeypatch this symbol and assert it is called exactly
+    once per probe. Default implementation records a datapoint and refreshes
+    the summarized behavior hint on the latest domain_resolutions row.
+    """
+    try:
+        # 1) Append a raw probe datapoint
+        record_mx_probe(
+            mx_host=mx_host,
+            code=code,
+            elapsed_s=(float(elapsed_ms) / 1000.0),
+            error_kind=error_kind,
+            category=category,
+            db_path=_db_path_from_env(),
+        )
+        # 2) Recompute hint for this MX and store it back on the latest resolution row
+        hint = get_mx_behavior_hint(mx_host, db_path=_db_path_from_env())
+        _update_latest_resolution_behavior(domain, hint, db_path=_db_path_from_env())
+    except Exception:
+        # Never let stats logic break verifier flow
+        pass
+
+
+# -----------------------------
+# Convenience for R16
+# -----------------------------
+
+
+@dataclass
+class MXInfo:
+    lowest_mx: str | None
+    mx_behavior: dict | None
+
+
+def get_or_resolve_mx(domain: str, *, force: bool = False, db_path: str | None = None) -> MXInfo:
+    """
+    Lightweight helper used by R16 to get lowest_mx plus a behavior hint.
+    Falls back to bare DNS if your R15 resolver isn't available.
+    Also writes the summarized hint into domain_resolutions.mx_behavior (best-effort).
+    """
+    d = (domain or "").strip().lower()
+    from importlib import import_module
+
+    lowest = None
+    try:
+        # Prefer your R15 resolver if present
+        mod = import_module("src.resolve.mx")
+        if hasattr(mod, "resolve_mx"):
+            res = mod.resolve_mx(
+                company_id=0, domain=d, force=force, db_path=(db_path or _db_path_from_env())
+            )
+            lowest = getattr(res, "lowest_mx", None) or d
+        else:
+            raise ImportError
+    except Exception:
+        # Bare DNS fallback
+        try:
+            import dns.resolver as _dr
+
+            answers = _dr.resolve(d, "MX")
+            pairs = sorted(
+                [(r.exchange.to_text(omit_final_dot=True), r.preference) for r in answers],
+                key=lambda x: x[1],
+            )
+            lowest = pairs[0][0]
+        except Exception:
+            lowest = d
+
+    hint = get_mx_behavior_hint(lowest or d, db_path=db_path or _db_path_from_env())
+    try:
+        _update_latest_resolution_behavior(d, hint, db_path=db_path or _db_path_from_env())
+    except Exception:
+        pass
+    return MXInfo(lowest_mx=lowest, mx_behavior=hint)

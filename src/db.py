@@ -58,6 +58,32 @@ def _fk_map(cur, table: str) -> dict[str, tuple[str, str]]:
     return m
 
 
+def _emails_pk_col(cur) -> str | None:
+    """
+    Return the primary key column name for the emails table, or None if none found.
+    """
+    cols = _table_columns(cur, "emails")
+    for name, meta in cols.items():
+        if meta.get("pk"):
+            return name
+    # Common fallback
+    if "id" in cols:
+        return "id"
+    return None
+
+
+def _select_email_id(cur, email: str) -> int | None:
+    """
+    Look up the primary key of an email row by its address.
+    Returns None if the table has no PK or the row does not exist.
+    """
+    pk = _emails_pk_col(cur)
+    if not pk:
+        return None
+    row = cur.execute(f"SELECT {pk} FROM emails WHERE email = ? LIMIT 1", (email,)).fetchone()
+    return int(row[0]) if row else None
+
+
 def _ts_iso8601_z(value: datetime | str | None) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
@@ -131,7 +157,7 @@ def _ensure_person(cur, *, email: str, company_id: int | None) -> int | None:
     insert_cols: list[str] = []
     insert_vals: list[object] = []
 
-    def add(col: str, val):
+    def add(col: str, val: object) -> None:
         insert_cols.append(col)
         insert_vals.append(val)
 
@@ -186,7 +212,7 @@ def upsert_verification_result(
     person_id: int | None = None,
     source_url: str | None = None,
     icp_score: int | None = None,
-    **_ignored,
+    **_ignored: Any,
 ) -> None:
     """
     Idempotent write keyed by emails.email.
@@ -228,7 +254,7 @@ def upsert_verification_result(
         # Build INSERT dynamically to match available columns
         cols = _table_columns(cur, "emails")
         insert_cols = ["email", "company_id", "verify_status", "reason", "mx_host", "verified_at"]
-        insert_vals = [email, comp_id, verify_status, reason, mx_host, ts]
+        insert_vals: list[Any] = [email, comp_id, verify_status, reason, mx_host, ts]
 
         if "person_id" in cols:
             insert_cols.append("person_id")
@@ -269,6 +295,84 @@ def upsert_verification_result(
         con.commit()
 
 
+# ---------------- R16: verify/probe enqueue helper ----------------
+
+
+def enqueue_probe_email(
+    email_id: int, email: str, domain: str | None, *, force: bool = False
+) -> None:
+    """
+    Best-effort enqueue for the R16 SMTP RCPT probe task (task_probe_email).
+
+    Tries the ingest enqueue shim first (which tests observe), then falls back to
+    real RQ enqueue on the 'verify' queue. Never raises.
+    """
+    try:
+        # Normalize/derive domain lazily to avoid importing at module import time.
+        try:
+            from src.ingest.normalize import norm_domain  # type: ignore
+        except Exception:
+            norm_domain = None  # type: ignore
+
+        canon_dom = domain
+        if norm_domain:
+            try:
+                canon_dom = norm_domain(domain) if domain else None  # type: ignore[arg-type]
+            except Exception:
+                canon_dom = domain
+
+        if not canon_dom:
+            try:
+                dom_raw = email.split("@", 1)[1]
+                canon_dom = norm_domain(dom_raw) if norm_domain else dom_raw  # type: ignore[arg-type]
+            except Exception:
+                return  # cannot derive a domain; skip
+
+        # 1) Preferred path: ingest enqueue shim
+        try:
+            from src.ingest import enqueue as ingest_enqueue  # type: ignore
+
+            ingest_enqueue(
+                "task_probe_email",
+                {
+                    "email_id": int(email_id),
+                    "email": str(email),
+                    "domain": str(canon_dom),
+                    "force": bool(force),
+                },
+            )
+            # Do not early return; also try real RQ enqueue in runtime environments.
+        except Exception:
+            pass
+
+        # 2) Fallback: direct RQ enqueue
+        try:
+            from rq import Queue  # type: ignore
+
+            from src.queueing.redis_conn import get_redis  # type: ignore
+            from src.queueing.tasks import task_probe_email  # type: ignore
+        except Exception:
+            return  # RQ/Redis not available in this environment
+
+        try:
+            q = Queue("verify", connection=get_redis())
+            q.enqueue(
+                task_probe_email,
+                email_id=email_id,
+                email=email,
+                domain=canon_dom,
+                force=force,
+                job_timeout=20,
+                retry=None,
+            )
+        except Exception:
+            # Best-effort: swallow any queue errors
+            return
+    except Exception:
+        # Never propagate from enqueue helper
+        return
+
+
 # ---------------- R12: generated emails upsert ----------------
 
 
@@ -278,14 +382,23 @@ def upsert_generated_email(
     email: str,
     domain: str,
     source_note: str | None = None,
-) -> None:
+    *,
+    enqueue_probe: bool = False,
+    force_probe: bool = False,
+) -> int | None:
     """
     Insert a 'generated' email candidate for later verification.
+
     - Idempotent on emails.email (no-op on conflict).
     - Ensures companies row exists for the domain.
     - If emails.person_id exists and person_id is None, attempts to _ensure_person.
     - Populates optional columns when present:
         source='generated', source_note, domain, created_at, verify_status=NULL.
+    - Returns the email row's primary key (if the emails table has a PK), else None.
+
+    R16 addition:
+    - If enqueue_probe=True, best-effort enqueues task_probe_email(email_id,email,domain).
+      This does NOT commit the outer transaction; callers should commit after batching.
     """
     con.execute("PRAGMA foreign_keys=ON")
     cur = con.cursor()
@@ -322,7 +435,7 @@ def upsert_generated_email(
     insert_cols: list[str] = ["email", "company_id"]
     insert_vals: list[Any] = [email, company_id]
 
-    def maybe(col: str, val: Any):
+    def maybe(col: str, val: Any) -> None:
         if col in cols_meta:
             insert_cols.append(col)
             insert_vals.append(val)
@@ -346,7 +459,20 @@ def upsert_generated_email(
         ON CONFLICT(email) DO NOTHING
     """
     cur.execute(sql, insert_vals)
+
+    # Determine/lookup the email_id regardless of conflict outcome
+    email_id = _select_email_id(cur, email)
+
+    # Best-effort enqueue of R16 probe if requested
+    if enqueue_probe and email_id is not None:
+        try:
+            enqueue_probe_email(email_id, email, domain, force=force_probe)
+        except Exception:
+            # Never break the caller's transaction for enqueue issues
+            pass
+
     # No commit here; caller (batch/queue) decides when to commit.
+    return email_id
 
 
 # ---------------- R08: DB integration helpers ----------------

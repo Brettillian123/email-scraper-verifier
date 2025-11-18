@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import dns.resolver
 from redis import Redis
@@ -20,7 +21,13 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from src.config import load_settings
+from src.config import (
+    SMTP_COMMAND_TIMEOUT,
+    SMTP_CONNECT_TIMEOUT,
+    SMTP_HELO_DOMAIN,
+    SMTP_MAIL_FROM,
+    load_settings,
+)
 from src.db import (
     get_conn,
     upsert_generated_email,
@@ -51,6 +58,7 @@ from src.queueing.rate_limit import (
 from src.queueing.redis_conn import get_redis
 from src.resolve.domain import resolve
 from src.resolve.mx import resolve_mx as _resolve_mx  # R15
+from src.verify.smtp import probe_rcpt  # R16 SMTP probe core
 
 log = logging.getLogger(__name__)
 _cfg = load_settings()
@@ -182,14 +190,13 @@ def verify_email_task(  # noqa: C901
     person_id: int | None = None,
 ):
     """
-    Queue entrypoint. Enforces global + per-MX caps and RPS, then performs the
-    probe and persists the result idempotently.
+    Legacy queue entrypoint used by earlier stages.
 
-    Behavior:
-      - TemporarySMTPError and PermanentSMTPError are mapped to terminal statuses.
-      - On the 'verify_selftest' queue, the 'willfail@…' job *must* fail:
-        we propagate PermanentSMTPError so RQ records a Failed/DLQ job.
-      - TEMP errors are **not** re-raised by default (set SELFTEST_RAISE_TEMP=1 to re-raise).
+    Enforces global + per-MX caps and RPS, then performs a *stub* probe (smtp_probe)
+    and persists the result idempotently. R18 will supersede the persistence path.
+
+    NOTE: New R16 probes should prefer task_probe_email() which returns a structured
+    result and defers persistence to a later release.
     """
     redis: Redis = get_redis()
     job = get_current_job()  # may be None if called outside RQ
@@ -199,7 +206,7 @@ def verify_email_task(  # noqa: C901
     env_raise_temp = _bool_env("SELFTEST_RAISE_TEMP")  # '1', '0', or None
 
     raise_perm_env = (env_raise_perm == "1") if env_raise_perm is not None else False
-    raise_temp = (env_raise_temp == "1") if env_raise_temp is not None else False
+    raise_temp_env = (env_raise_temp == "1") if env_raise_temp is not None else False
 
     # Detect self-test queue and whether we must force a *failed* job
     on_selftest_queue = bool(getattr(job, "origin", "") == "verify_selftest")
@@ -227,6 +234,10 @@ def verify_email_task(  # noqa: C901
         # Also allow manual forcing of permanent failure via env outside self-test.
         if raise_perm_env and willfail_addr:
             raise PermanentSMTPError("R06 selftest (env): simulated 550 user unknown")
+
+        # Allow manual forcing of temporary failure via env outside self-test.
+        if raise_temp_env and willfail_addr:
+            raise TemporarySMTPError("R06 selftest (env): simulated temp failure")
 
         # ---- Acquire concurrency semaphores ----
         got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
@@ -297,7 +308,7 @@ def verify_email_task(  # noqa: C901
         latency_ms = int((time.perf_counter() - start) * 1000)
         log.info(
             "permanent failure handled"
-            if not (force_selftest_perm or raise_perm_env)
+            if not force_selftest_perm
             else "permanent failure (propagating)",
             extra={
                 "email": email,
@@ -308,7 +319,7 @@ def verify_email_task(  # noqa: C901
                 "latency_ms": latency_ms,
             },
         )
-        if force_selftest_perm or raise_perm_env:
+        if force_selftest_perm:
             # Propagate to RQ -> Failed/DLQ
             raise
 
@@ -317,7 +328,7 @@ def verify_email_task(  # noqa: C901
         status, reason = "unknown_timeout", (str(e) or "temp_error")
         latency_ms = int((time.perf_counter() - start) * 1000)
         log.warning(
-            "temporary failure handled" if not raise_temp else "temporary failure (re-raising)",
+            "temporary failure handled",
             extra={
                 "email": email,
                 "mx": mx_host,
@@ -327,8 +338,6 @@ def verify_email_task(  # noqa: C901
                 "latency_ms": latency_ms,
             },
         )
-        if raise_temp:
-            raise  # only if explicitly requested via env
 
     except Exception as e:
         # Unexpected exceptions: record and finish.
@@ -372,10 +381,16 @@ def verify_email_task(  # noqa: C901
             )
 
         # Only release what we actually acquired
-        if got_mx:
-            release(redis, mx_key)
-        if got_global:
-            release(redis, GLOBAL_SEM)
+        redis = get_redis()
+        if redis:
+            try:
+                release(redis, MX_SEM.format(mx=mx_host))
+            except Exception:
+                pass
+            try:
+                release(redis, GLOBAL_SEM)
+            except Exception:
+                pass
 
 
 # -------------------------------
@@ -524,6 +539,200 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
                 release(redis, GLOBAL_SEM)
 
 
+# -------------------------------
+# R16: SMTP RCPT probe queue task
+# -------------------------------
+
+
+def _mx_info(domain: str, *, force: bool, db_path: str | None) -> tuple[str, dict[str, Any] | None]:
+    """
+    Resolve MX for a domain using R15 helpers and return (lowest_mx, behavior_hint).
+    Falls back to naive DNS and no behavior if R15 helper is unavailable.
+    """
+    try:
+        # Prefer get_or_resolve_mx if present
+        from src.resolve.mx import get_or_resolve_mx as _gomx  # type: ignore
+
+        res = _gomx(domain, force=force, db_path=db_path)
+        mxh = getattr(res, "lowest_mx", None) or domain
+        beh = getattr(res, "behavior", None) or getattr(res, "mx_behavior", None)
+        return (mxh, beh)
+    except Exception:
+        pass
+    try:
+        # Fall back to resolve_mx (R15) dataclass
+        res = _resolve_mx(company_id=0, domain=domain, force=force, db_path=db_path)
+        mxh = getattr(res, "lowest_mx", None) or domain
+        beh = getattr(res, "behavior", None) or getattr(res, "mx_behavior", None)
+        return (mxh, beh)
+    except Exception:
+        # Last resort: bare DNS
+        mxh, _pref = lookup_mx(domain)
+        return (mxh, None)
+
+
+@job("verify", timeout=20)
+def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
+    """
+    R16 queue task: Resolve MX if needed, enforce R06 throttling per-MX,
+    run RCPT probe via src.verify.smtp.probe_rcpt, and return a structured dict.
+
+    Does NOT write verification_results; persistence happens in R18.
+    """
+    # Normalize inputs
+    email_str = (email or "").strip()
+    dom = (domain or "").strip().lower() or (
+        email_str.split("@", 1)[1].strip().lower() if "@" in email_str else ""
+    )
+    if not email_str or "@" not in email_str or not dom:
+        return {
+            "ok": False,
+            "error": "bad_input",
+            "category": "unknown",
+            "code": None,
+            "mx_host": None,
+            "domain": dom,
+            "email_id": email_id,
+            "email": email_str,
+            "elapsed_ms": 0,
+        }
+
+    # Resolve MX and get behavior hint from cache (O06)
+    db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
+    start = time.perf_counter()
+    mx_host, behavior_hint = _mx_info(dom, force=bool(force), db_path=db_path)
+
+    # Throttling (R06): global + per-MX concurrency and RPS
+    redis_ok = False
+    try:
+        redis: Redis = get_redis()
+        try:
+            redis.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+    except Exception:
+        redis_ok = False
+
+    got_global = False
+    got_mx = False
+    sec = int(time.time())
+    key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
+    key_mx_rps = RPS_KEY_MX.format(mx=mx_host, sec=sec)
+    mx_key = MX_SEM.format(mx=mx_host)
+
+    try:
+        if redis_ok:
+            got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
+            if not got_global:
+                return {
+                    "ok": False,
+                    "error": "global concurrency cap reached",
+                    "category": "unknown",
+                    "code": None,
+                    "mx_host": mx_host,
+                    "domain": dom,
+                    "email_id": email_id,
+                    "email": email_str,
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                }
+
+            got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
+            if not got_mx:
+                return {
+                    "ok": False,
+                    "error": "per-MX concurrency cap reached",
+                    "category": "unknown",
+                    "code": None,
+                    "mx_host": mx_host,
+                    "domain": dom,
+                    "email_id": email_id,
+                    "email": email_str,
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                }
+
+            # RPS smoothing
+            if _cfg.rate.global_rps and not can_consume_rps(
+                redis, key_global_rps, int(_cfg.rate.global_rps)
+            ):
+                return {
+                    "ok": False,
+                    "error": "global RPS throttle",
+                    "category": "unknown",
+                    "code": None,
+                    "mx_host": mx_host,
+                    "domain": dom,
+                    "email_id": email_id,
+                    "email": email_str,
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                }
+
+            if _cfg.rate.per_mx_rps_default and not can_consume_rps(
+                redis, key_mx_rps, int(_cfg.rate.per_mx_rps_default)
+            ):
+                return {
+                    "ok": False,
+                    "error": "MX RPS throttle",
+                    "category": "unknown",
+                    "code": None,
+                    "mx_host": mx_host,
+                    "domain": dom,
+                    "email_id": email_id,
+                    "email": email_str,
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                }
+
+        # Execute probe
+        result = probe_rcpt(
+            email_str,
+            mx_host,
+            helo_domain=SMTP_HELO_DOMAIN,
+            mail_from=SMTP_MAIL_FROM,
+            connect_timeout=SMTP_CONNECT_TIMEOUT,
+            command_timeout=SMTP_COMMAND_TIMEOUT,
+            behavior_hint=behavior_hint,
+        )
+
+        return {
+            "ok": bool(result.get("ok", True)),
+            "category": result.get("category", "unknown"),
+            "code": result.get("code"),
+            "mx_host": result.get("mx_host", mx_host),
+            "domain": dom,
+            "email_id": int(email_id),
+            "email": email_str,
+            "elapsed_ms": int(
+                result.get("elapsed_ms") or int((time.perf_counter() - start) * 1000)
+            ),
+            "error": result.get("error"),
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "category": "unknown",
+            "code": None,
+            "mx_host": mx_host,
+            "domain": dom,
+            "email_id": int(email_id),
+            "email": email_str,
+            "elapsed_ms": int((time.perf_counter() - start) * 1000),
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if redis_ok:
+            if got_mx:
+                try:
+                    release(redis, mx_key)
+                except Exception:
+                    pass
+            if got_global:
+                try:
+                    release(redis, GLOBAL_SEM)
+                except Exception:
+                    pass
+
+
 # ---------------------------------------------
 # Helpers for O01 domain pattern inference/cache
 # ---------------------------------------------
@@ -636,28 +845,53 @@ def _save_inferred_pattern(
 
 
 # ---------------------------------------------
-# R12 wiring: email generation + verify enqueue
+# R12 wiring: email generation + verify enqueue (→ R16)
 # ---------------------------------------------
 
 
-def _enqueue_verify(email: str) -> None:
+def _email_row_id(con: sqlite3.Connection, email: str) -> int | None:
     """
-    Minimal enqueue helper for verification jobs.
-    Uses the 'verify' queue by default.
+    Try to fetch the primary key for an email row.
+    Falls back to rowid if 'id' column is absent.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(emails)").fetchall()}
+        if "id" in cols:
+            row = con.execute("SELECT id FROM emails WHERE email = ?", (email,)).fetchone()
+            return int(row[0]) if row else None
+        # fallback: rowid (works unless WITHOUT ROWID)
+        row = con.execute("SELECT rowid FROM emails WHERE email = ?", (email,)).fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _enqueue_r16_probe(email_id: int | None, email: str, domain: str) -> None:
+    """
+    Enqueue the R16 probe task explicitly. Best-effort (swallows Redis errors).
     """
     try:
-        qname = getattr(getattr(_cfg, "queues", object()), "verify", "verify")
-    except Exception:
-        qname = "verify"
-    q = Queue(name=qname, connection=get_redis())
-    # Keep kwargs to match verify_email_task signature
-    q.enqueue(verify_email_task, email=email)
+        q = Queue(name="verify", connection=get_redis())
+        q.enqueue(
+            task_probe_email,
+            email_id=int(email_id or 0),
+            email=email,
+            domain=domain,
+            force=False,
+            job_timeout=20,
+            retry=None,
+        )
+    except Exception as e:
+        log.warning("R16 enqueue skipped (best-effort): %s", e)
 
 
 def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> dict:
     """
     R12 job: Generate email permutations for a person@domain, persist them as
-    'generated' candidates, and enqueue verification for each.
+    'generated' candidates, and enqueue verification (R16 probe) for each.
 
     O01 enhancement:
       - Collect published examples for the domain.
@@ -716,9 +950,15 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
 
     inserted = 0
     for e in sorted(candidates):
+        # Persist each candidate
         upsert_generated_email(con, person_id, e, dom, source_note="r12")
-        _enqueue_verify(e)
         inserted += 1
+        # Enqueue an R16 probe immediately (best-effort)
+        try:
+            email_id = _email_row_id(con, e)
+            _enqueue_r16_probe(email_id, e, dom)
+        except Exception as ee:
+            log.debug("R16 enqueue failed (best-effort): %s", ee)
 
     con.commit()
 

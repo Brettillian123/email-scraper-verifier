@@ -13,6 +13,11 @@ Goals:
 Queueing policy (best-effort):
 - Always write to the DB first.
 - Attempt to enqueue after DB writes; if queue is unavailable, log and continue.
+
+New in R16:
+- Add a best-effort helper to enqueue SMTP RCPT probes (`task_probe_email`) with
+  {email_id, email, domain}. This *does not* skip freemail domains — acceptance
+  uses gmail.com and similar for manual smoke tests.
 """
 
 from __future__ import annotations
@@ -361,6 +366,97 @@ def _enqueue_mx_resolution(
 
 
 # ---------------------------------------------------------------------------
+# R16: enqueue SMTP RCPT probe (best-effort; DOES NOT skip freemail)
+# ---------------------------------------------------------------------------
+
+
+def _enqueue_probe_email(
+    email_id: int,
+    email: str,
+    domain: str | None,
+    *,
+    force: bool = False,
+) -> None:
+    """
+    Enqueue the R16 SMTP RCPT probe for a specific email row.
+
+    Behavior:
+    - Best-effort; never raises.
+    - DOES NOT skip freemail domains (acceptance probes frequently target large ISPs).
+    - Uses the ingest enqueue shim (what tests spy on) and *also* attempts real RQ enqueue
+      on the 'verify' queue.
+    - Idempotency: task_probe_email itself should be idempotent/safe; duplicate enqueues are OK.
+    """
+    try:
+        canon_dom = norm_domain(domain) if domain else None
+        if not canon_dom:
+            # Derive from the email if possible
+            try:
+                canon_dom = norm_domain(email.split("@", 1)[1])
+            except Exception:
+                logger.info("R16 probe enqueue skipped (no domain/email): %r", email)
+                return
+
+        # 1) Preferred: ingest enqueue shim
+        try:
+            from src.ingest import enqueue as ingest_enqueue  # type: ignore
+
+            ingest_enqueue(
+                "task_probe_email",
+                {
+                    "email_id": int(email_id),
+                    "email": str(email),
+                    "domain": str(canon_dom),
+                    "force": bool(force),
+                },
+            )
+            logger.info(
+                "R16 probe enqueue via ingest shim: email_id=%s email=%s domain=%s",
+                email_id,
+                email,
+                canon_dom,
+            )
+            # Do not early return; also try real RQ in runtime environments.
+        except Exception as e:
+            logger.debug("ingest.enqueue unavailable for probe; will attempt RQ: %s", e)
+
+        # 2) Real RQ enqueue on 'verify'
+        try:
+            from rq import Queue  # type: ignore
+
+            from src.queueing.redis_conn import get_redis  # type: ignore
+            from src.queueing.tasks import task_probe_email  # type: ignore
+        except Exception:
+            return  # environment without RQ/Redis installed
+
+        try:
+            q = Queue("verify", connection=get_redis())
+            q.enqueue(
+                task_probe_email,
+                email_id=email_id,
+                email=email,
+                domain=canon_dom,
+                force=force,
+                job_timeout=20,
+                retry=None,
+            )
+            logger.info(
+                "R16 probe enqueue via RQ: email_id=%s email=%s domain=%s",
+                email_id,
+                email,
+                canon_dom,
+            )
+        except (ConnectionError, TimeoutError, OSError) as e:
+            logger.warning("Queue degraded (probe not enqueued): %s", e)
+        except Exception as e:
+            logger.warning("Queue degraded (probe unexpected): %s", e)
+
+    except Exception as e:
+        # Never block ingest on enqueue errors.
+        logger.debug("Ignoring R16 probe enqueue error (best-effort): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # People/lead persistence
 # ---------------------------------------------------------------------------
 
@@ -503,6 +599,10 @@ def persist_best_effort(normalized: dict[str, Any]) -> None:
         if domain:
             _enqueue_mx_resolution(company_id, domain, force=False)
 
+        # NOTE (R16): We do NOT enqueue probe jobs here because this module doesn't
+        # create emails. Probes should be enqueued where email rows are created
+        # (e.g., R12 generation or extractors) using `_enqueue_probe_email(...)`.
+
         con.commit()
     finally:
         con.close()
@@ -556,6 +656,9 @@ def persist_rows(rows: Iterable[dict[str, Any]]) -> int:
             # R15: enqueue MX resolver for concrete non-freemail domains
             if domain:
                 _enqueue_mx_resolution(company_id, domain, force=False)
+
+            # NOTE (R16): As above, this file doesn’t create emails; call
+            # _enqueue_probe_email(...) at the point where an email row is created.
 
         con.commit()
         return n

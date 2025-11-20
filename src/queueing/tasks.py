@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,7 @@ from src.resolve.domain import resolve
 from src.resolve.mx import resolve_mx as _resolve_mx  # R15
 from src.verify.catchall import check_catchall_for_domain  # R17 domain-level catch-all
 from src.verify.smtp import probe_rcpt  # R16 SMTP probe core
+from src.verify.status import VerificationSignals, classify  # R18 classifier
 
 log = logging.getLogger(__name__)
 _cfg = load_settings()
@@ -600,7 +603,7 @@ task_check_catchall.__wrapped__ = _task_check_catchall  # type: ignore[attr-defi
 
 
 # -------------------------------
-# R16: SMTP RCPT probe queue task (+ O07 fallback)
+# R16: SMTP RCPT probe queue task (+ O07 fallback, R18 classification)
 # -------------------------------
 
 
@@ -793,6 +796,176 @@ def _maybe_run_fallback(email_str: str, category: str) -> tuple[str | None, Any 
     return None, None
 
 
+def _utcnow_iso() -> str:
+    """Return an ISO-8601 UTC timestamp like '2025-11-20T19:45:03Z'."""
+    dt = datetime.utcnow().replace(microsecond=0)
+    return dt.isoformat() + "Z"
+
+
+def _load_catchall_status_for_domain(db_path: str, domain: str) -> str | None:
+    """
+    Best-effort helper for R18: load the latest catch_all_status from
+    domain_resolutions for a given domain. Swallows errors so R16/R06
+    tests can run against minimal schemas without R17 applied.
+    """
+    dom = (domain or "").strip().lower()
+    if not dom:
+        return None
+
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                """
+                SELECT catch_all_status
+                FROM domain_resolutions
+                WHERE chosen_domain = ? OR user_hint = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (dom, dom),
+            ).fetchone()
+            if not row:
+                return None
+            val = row["catch_all_status"]
+            return str(val) if val is not None else None
+        finally:
+            con.close()
+    except Exception:
+        log.debug(
+            "R18: failed to load catch_all_status for domain",
+            exc_info=True,
+            extra={"domain": dom},
+        )
+        return None
+
+
+def _persist_probe_result_r18(
+    *,
+    db_path: str,
+    email_id: int,
+    email: str,
+    domain: str,
+    mx_host: str | None,
+    category: str | None,
+    code: Any,
+    error: str | None,
+    fallback_status: str | None,
+    fallback_raw: Any,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    R18: Best-effort classification + persistence of a verification attempt.
+
+    Returns (verify_status, verify_reason, verified_mx, verified_at_iso), or
+    (None, None, None, None) if persistence fails (e.g. schema not migrated yet).
+    """
+    dom = (domain or "").strip().lower()
+    try:
+        cat_norm = (category or "").strip().lower() or None
+
+        rcpt_code: int | None = None
+        if isinstance(code, int):
+            rcpt_code = code
+        else:
+            try:
+                rcpt_code = int(code) if code is not None else None
+            except Exception:
+                rcpt_code = None
+
+        catch_all_status = _load_catchall_status_for_domain(db_path, dom)
+        ts_iso = _utcnow_iso()
+
+        signals = VerificationSignals(
+            rcpt_category=cat_norm,
+            rcpt_code=rcpt_code,
+            rcpt_msg=None,
+            catch_all_status=catch_all_status,
+            fallback_status=(fallback_status or None),
+            mx_host=mx_host,
+            verified_at=ts_iso,
+        )
+
+        verify_status, verify_reason = classify(signals, now=datetime.utcnow())
+
+        # Prepare low-level fields for storage
+        raw_status = cat_norm or "unknown"
+        raw_reason = error or None
+
+        if fallback_raw is None:
+            fallback_raw_text: str | None = None
+        elif isinstance(fallback_raw, str):
+            fallback_raw_text = fallback_raw
+        else:
+            try:
+                fallback_raw_text = json.dumps(fallback_raw, default=str)
+            except Exception:
+                fallback_raw_text = str(fallback_raw)
+
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute(
+                """
+                INSERT INTO verification_results (
+                  email_id,
+                  mx_host,
+                  status,
+                  reason,
+                  checked_at,
+                  fallback_status,
+                  fallback_raw,
+                  fallback_checked_at,
+                  verify_status,
+                  verify_reason,
+                  verified_mx,
+                  verified_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(email_id),
+                    mx_host,
+                    raw_status,
+                    raw_reason,
+                    ts_iso,
+                    fallback_status,
+                    fallback_raw_text,
+                    ts_iso if fallback_status is not None else None,
+                    verify_status,
+                    verify_reason,
+                    mx_host,
+                    ts_iso,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        # Swallow errors so pre-R18 tests (with minimal schemas) continue to run.
+        log.exception(
+            "R18: failed to persist verification_results row",
+            extra={"email_id": email_id, "email": email, "domain": dom, "mx_host": mx_host},
+        )
+        return None, None, None, None
+
+    return verify_status, verify_reason, mx_host, ts_iso
+
+
+def _init_redis_for_probe() -> tuple[Redis | None, bool]:
+    """
+    Initialize Redis connection for probe tasks and indicate availability.
+    """
+    try:
+        redis_obj: Redis = get_redis()
+    except Exception:
+        return None, False
+    try:
+        redis_obj.ping()
+    except Exception:
+        return redis_obj, False
+    return redis_obj, True
+
+
 @job("verify", timeout=20)
 def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
     """
@@ -804,7 +977,10 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
         call verify_with_fallback(email) if available and surface
         fallback_status / fallback_raw in the returned dict.
 
-    Does NOT write verification_results; persistence happens in R18.
+    R18 enhancement:
+      - After each probe (and optional O07 fallback), classify the outcome into
+        canonical verify_status / verify_reason and persist a row into
+        verification_results including verified_mx / verified_at.
     """
     normalized = _normalize_probe_inputs(email_id, email, domain)
     if isinstance(normalized, dict):
@@ -815,17 +991,7 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
     start = time.perf_counter()
     mx_host, behavior_hint = _mx_info(dom, force=bool(force), db_path=db_path)
 
-    redis_obj: Redis | None = None
-    redis_ok = False
-    try:
-        redis_obj = get_redis()
-        try:
-            redis_obj.ping()
-            redis_ok = True
-        except Exception:
-            redis_ok = False
-    except Exception:
-        redis_ok = False
+    redis_obj, redis_ok = _init_redis_for_probe()
 
     mx_key = MX_SEM.format(mx=mx_host)
     got_global = False
@@ -843,6 +1009,24 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             start=start,
         )
         if throttle_error is not None:
+            # R18: best-effort classification + persistence for throttled attempts.
+            v_status, v_reason, v_mx, v_at = _persist_probe_result_r18(
+                db_path=db_path,
+                email_id=int(email_id),
+                email=email_str,
+                domain=dom,
+                mx_host=mx_host,
+                category=throttle_error.get("category"),
+                code=throttle_error.get("code"),
+                error=throttle_error.get("error"),
+                fallback_status=None,
+                fallback_raw=None,
+            )
+            if v_status is not None:
+                throttle_error["verify_status"] = v_status
+                throttle_error["verify_reason"] = v_reason
+                throttle_error["verified_mx"] = v_mx
+                throttle_error["verified_at"] = v_at
             return throttle_error
 
         result = probe_rcpt(
@@ -878,10 +1062,29 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             base["fallback_status"] = fallback_status
             base["fallback_raw"] = fallback_raw
 
+        # R18: classify + persist canonical status.
+        v_status, v_reason, v_mx, v_at = _persist_probe_result_r18(
+            db_path=db_path,
+            email_id=int(email_id),
+            email=email_str,
+            domain=dom,
+            mx_host=base["mx_host"],
+            category=category,
+            code=code,
+            error=error_val,
+            fallback_status=fallback_status,
+            fallback_raw=fallback_raw,
+        )
+        if v_status is not None:
+            base["verify_status"] = v_status
+            base["verify_reason"] = v_reason
+            base["verified_mx"] = v_mx
+            base["verified_at"] = v_at
+
         return base
 
     except Exception as e:
-        return {
+        error_payload: dict[str, Any] = {
             "ok": False,
             "category": "unknown",
             "code": None,
@@ -892,6 +1095,27 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             "elapsed_ms": int((time.perf_counter() - start) * 1000),
             "error": f"{type(e).__name__}: {e}",
         }
+
+        # R18: best-effort classification + persistence for unexpected errors.
+        v_status, v_reason, v_mx, v_at = _persist_probe_result_r18(
+            db_path=db_path,
+            email_id=int(email_id),
+            email=email_str,
+            domain=dom,
+            mx_host=mx_host,
+            category=error_payload["category"],
+            code=error_payload["code"],
+            error=error_payload["error"],
+            fallback_status=None,
+            fallback_raw=None,
+        )
+        if v_status is not None:
+            error_payload["verify_status"] = v_status
+            error_payload["verify_reason"] = v_reason
+            error_payload["verified_mx"] = v_mx
+            error_payload["verified_at"] = v_at
+
+        return error_payload
     finally:
         if redis_ok and redis_obj is not None:
             if got_mx:

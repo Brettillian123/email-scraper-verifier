@@ -25,6 +25,11 @@ Behavior:
 This module is intentionally conservative: failures to call the provider
 (network errors, bad JSON, etc.) never raise; they simply return
 status="unknown" with an error note in `raw`.
+
+R18 note:
+  - This module remains pure HTTP. Classification + persistence of the
+    fallback result are handled by the R18 pipeline (task_probe_email)
+    which passes FallbackResult.status/raw into the classifier.
 """
 
 from __future__ import annotations

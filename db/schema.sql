@@ -51,10 +51,23 @@ CREATE TABLE IF NOT EXISTS emails (
 CREATE TABLE IF NOT EXISTS verification_results (
   id INTEGER PRIMARY KEY,
   email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+
+  -- R16: primary SMTP probe outcome (low-level)
   mx_host TEXT,
-  status TEXT NOT NULL,            -- valid | risky_catch_all | invalid | unknown_timeout
-  reason TEXT,
-  checked_at TEXT DEFAULT (datetime('now'))
+  status TEXT,                      -- legacy/raw status (kept for backwards-compat)
+  reason TEXT,                      -- legacy/raw reason
+  checked_at TEXT DEFAULT (datetime('now')),
+
+  -- O07: vendor fallback status (low-level)
+  fallback_status TEXT,             -- e.g. "deliverable" | "undeliverable" | "unknown"
+  fallback_raw TEXT,                -- raw vendor payload / JSON blob
+  fallback_checked_at TEXT,         -- ISO-8601 UTC timestamp
+
+  -- R18: canonical classification
+  verify_status TEXT,               -- "valid" | "risky_catch_all" | "invalid" | "unknown_timeout"
+  verify_reason TEXT,               -- short machine-readable reason (rcpt_2xx_non_catchall, ...)
+  verified_mx TEXT,                 -- MX host actually used for classification
+  verified_at TEXT                  -- ISO-8601 UTC timestamp of last classification
 );
 
 -- suppression (global/tenant-wide do-not-verify/contact)
@@ -125,3 +138,74 @@ CREATE TABLE IF NOT EXISTS domain_resolutions (
 
 CREATE INDEX IF NOT EXISTS idx_domain_resolutions_company_id
   ON domain_resolutions(company_id);
+
+-- ---------------------------------------------------------------------------
+-- View: v_emails_latest
+--   Latest verification result per email, joined to people/companies.
+--   Exposes R18 canonical verify_status/verify_reason/verified_at.
+-- ---------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_emails_latest;
+
+CREATE VIEW v_emails_latest AS
+WITH latest_verification AS (
+  SELECT
+    vr.email_id,
+    vr.id AS verification_result_id,
+    COALESCE(vr.verified_at, vr.checked_at) AS effective_verified_at
+  FROM verification_results AS vr
+  JOIN (
+    SELECT
+      email_id,
+      MAX(COALESCE(verified_at, checked_at)) AS max_effective_verified_at
+    FROM verification_results
+    GROUP BY email_id
+  ) AS x
+    ON x.email_id = vr.email_id
+   AND COALESCE(vr.verified_at, vr.checked_at) = x.max_effective_verified_at
+)
+SELECT
+  e.id          AS email_id,
+  e.email,
+  e.company_id,
+  e.person_id,
+  e.is_published,
+  e.source_url  AS email_source_url,
+  e.icp_score,
+  e.created_at  AS email_created_at,
+  e.updated_at  AS email_updated_at,
+
+  p.first_name,
+  p.last_name,
+  p.full_name,
+  p.title,
+  p.source_url  AS person_source_url,
+
+  c.name        AS company_name,
+  c.domain      AS company_domain,
+  c.website_url,
+  c.official_domain,
+  c.official_domain_source,
+  c.official_domain_confidence,
+  c.official_domain_checked_at,
+
+  -- low-level / legacy verification fields (pre-R18)
+  vr.mx_host,
+  vr.status     AS legacy_status,
+  vr.reason     AS legacy_reason,
+  vr.checked_at,
+
+  -- R18 canonical fields
+  vr.verify_status,
+  vr.verify_reason,
+  vr.verified_mx,
+  vr.verified_at
+
+FROM emails AS e
+LEFT JOIN people AS p
+  ON p.id = e.person_id
+LEFT JOIN companies AS c
+  ON c.id = e.company_id
+LEFT JOIN latest_verification AS lv
+  ON lv.email_id = e.id
+LEFT JOIN verification_results AS vr
+  ON vr.id = lv.verification_result_id;

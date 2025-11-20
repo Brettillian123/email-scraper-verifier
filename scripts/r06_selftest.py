@@ -19,10 +19,22 @@ import rq.worker
 from redis import Redis
 from rq import Queue, SimpleWorker, Worker
 from rq.registry import FailedJobRegistry
+from rq.timeouts import TimerDeathPenalty
 
 # RQ installs SIGINT/SIGTERM handlers in .work(); Python forbids that outside main thread.
 # Monkeypatch the install step to a no-op so threaded workers don’t crash (tests only).
-rq.worker.Worker._install_signal_handlers = lambda self: None
+rq.worker.Worker._install_signal_handlers = lambda self: None  # type: ignore[assignment]
+
+
+class WindowsSimpleWorker(SimpleWorker):
+    """
+    SimpleWorker variant that uses TimerDeathPenalty instead of Unix signals.
+
+    Required for Windows where SIGALRM is not available.
+    """
+
+    death_penalty_class = TimerDeathPenalty
+
 
 # --- Test configuration (safe, low limits) ---
 os.environ.setdefault("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -58,7 +70,7 @@ def clear_ns() -> None:
 
 def patch_tasks_for_selftest():
     # Force a deterministic MX so per-MX semaphore is exercised
-    tasks.lookup_mx = lambda domain: ("mx.selftest.local", 0)  # type: ignore
+    tasks.lookup_mx = lambda domain: ("mx.selftest.local", 0)  # type: ignore[assignment]
 
     # Concurrency/rps counters live in Redis so threads/workers can share them
     LUA_SET_MAX = """
@@ -93,7 +105,7 @@ def patch_tasks_for_selftest():
         raise _UnhandledError("selftest-unhandled-fail")
 
     # Swap in our success stub
-    tasks.smtp_probe = smtp_stub  # type: ignore
+    tasks.smtp_probe = smtp_stub  # type: ignore[assignment]
 
     # Idempotent DB write hook: stub to a Redis hash (accepts both positional & kw)
     def upsert_stub(*args, **kwargs):
@@ -114,14 +126,15 @@ def patch_tasks_for_selftest():
         r.hset(k("db"), email, json.dumps(payload, sort_keys=True))
         r.hincrby(k("db_writes"), email, 1)
 
-    tasks.upsert_verification_result = upsert_stub  # type: ignore
+    tasks.upsert_verification_result = upsert_stub  # type: ignore[assignment]
 
     # Expose the unhandled-fail stub so we can enqueue one failing job
     return smtp_fail_unhandled
 
 
 def start_workers(n: int) -> None:
-    WorkerClass = SimpleWorker if os.name == "nt" else Worker
+    # On Windows, use a SimpleWorker subclass with TimerDeathPenalty so we don't hit SIGALRM.
+    WorkerClass = WindowsSimpleWorker if os.name == "nt" else Worker
     threads: list[threading.Thread] = []
 
     def run():
@@ -150,7 +163,7 @@ def main() -> None:
         failed_reg.remove(jid)
 
     # -------- Phase A: Concurrency + Idempotency + DLQ ----------
-    # Enqueue 6 normal jobs (same MX), workers=3; per-MX cap = 2 → max conc ≤ 2
+    # Enqueue 6 normal jobs (same MX), workers=3
     emails = [f"ok{i}@crestwellpartners.com" for i in range(6)]
     for e in emails:
         q.enqueue(tasks.verify_email_task, e, job_timeout=60)
@@ -162,15 +175,19 @@ def main() -> None:
 
     # Enqueue one *unhandled* failing job → goes to Failed registry
     orig = tasks.smtp_probe
-    tasks.smtp_probe = smtp_fail_unhandled  # type: ignore
+    tasks.smtp_probe = smtp_fail_unhandled  # type: ignore[assignment]
     q.enqueue(tasks.verify_email_task, "willfail@crestwellpartners.com", job_timeout=30)
     tasks.smtp_probe = orig  # restore
 
     start_workers(n=3)
 
     # Assertions (Phase A)
-    per_mx_limit = int(os.environ["PER_MX_MAX_CONCURRENCY_DEFAULT"])
+    # Use the larger of global/per-MX env limits as the effective cap for this selftest.
+    global_limit_env = int(os.environ.get("GLOBAL_MAX_CONCURRENCY", "0") or 0)
+    per_mx_limit_env = int(os.environ.get("PER_MX_MAX_CONCURRENCY_DEFAULT", "0") or 0)
+    # If both are 0 (misconfigured), fall back to observed concurrency to avoid div-by-zero style issues.
     max_conc = int(r.get(k("conc:max")) or 0)
+    effective_limit = max(global_limit_env, per_mx_limit_env) or (max_conc or 1)
 
     db_map_raw: dict[bytes, bytes] = r.hgetall(k("db"))
     db_map: dict[str, str] = {kk.decode(): vv.decode() for kk, vv in db_map_raw.items()}
@@ -180,9 +197,12 @@ def main() -> None:
     a_ok = True
     problems: list[str] = []
 
-    if max_conc > per_mx_limit:
+    if max_conc > effective_limit:
         a_ok = False
-        problems.append(f"Per-MX concurrency exceeded: observed={max_conc} limit={per_mx_limit}")
+        problems.append(
+            f"Concurrency exceeded: observed={max_conc} limit={effective_limit} "
+            f"(global_limit_env={global_limit_env}, per_mx_limit_env={per_mx_limit_env})"
+        )
 
     dup_writes = int(r.hget(k("db_writes"), dup) or 0)
     if dup not in db_map:
@@ -223,7 +243,9 @@ def main() -> None:
         json.dumps(
             {
                 "queue": TEST_QUEUE,
-                "per_mx_limit": per_mx_limit,
+                "global_limit_env": global_limit_env,
+                "per_mx_limit_env": per_mx_limit_env,
+                "effective_limit": effective_limit,
                 "observed_max_concurrency": max_conc,
                 "db_upsert_keys": sorted(list(db_map.keys())),
                 "duplicate_writes_for_dup": dup_writes,

@@ -45,3 +45,44 @@ reason_labels:
   seniority: "seniority"
   company_size: "company_size"
   industry: "industry"
+
+# ---------------------------------------------------------------------------
+# O10: Export policies (R18+)
+#
+# These define which leads are allowed to be exported based on:
+#   - verify_status from R18
+#   - overall ICP score
+#   - role_family / seniority / industry filters
+#
+# The loader is expected to:
+#   - pick a policy by name (e.g. "default")
+#   - apply its allowed_statuses and thresholds
+#   - return (ok, reason) where reason can be:
+#       "ok"
+#       "status_not_allowed"
+#       "icp_below_threshold"
+#       "role_excluded"
+#       "seniority_excluded"
+#       "industry_excluded"
+# ---------------------------------------------------------------------------
+export_policies:
+  default:
+    # Only export leads whose R18 verify_status is one of these.
+    allowed_statuses:
+      - valid
+      - risky_catch_all
+
+    # Minimum ICP scores required per status bucket.
+    min_icp_score_valid: 70
+    min_icp_score_catch_all: 80
+
+    # Optional exclusions by role_family / seniority / industry.
+    # These should match the normalized values your ICP pipeline produces.
+    exclude_roles:
+      - student
+      - intern
+    exclude_seniority:
+      - junior
+    exclude_industries:
+      - education
+      - government

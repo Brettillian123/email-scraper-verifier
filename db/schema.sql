@@ -112,6 +112,14 @@ CREATE TABLE IF NOT EXISTS domain_resolutions (
   reason           TEXT,                      -- short human-readable decision note
   resolver_version TEXT NOT NULL,             -- e.g. 'r08.3'
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  -- R17: cached catch-all verdict (domain-level)
+  catch_all_status      TEXT,                 -- "catch_all" | "not_catch_all" | "tempfail" | "no_mx" | "error"
+  catch_all_checked_at  TEXT,                 -- ISO8601 UTC (when we last probed)
+  catch_all_localpart   TEXT,                 -- random local-part used in the probe
+  catch_all_smtp_code   INTEGER,              -- raw RCPT code (e.g. 250, 550)
+  catch_all_smtp_msg    TEXT,                 -- shortened/decoded SMTP message (optional)
+
   FOREIGN KEY(company_id) REFERENCES companies(id)
 );
 

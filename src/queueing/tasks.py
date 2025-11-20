@@ -1,4 +1,3 @@
-# src/queueing/tasks.py
 from __future__ import annotations
 
 import logging
@@ -58,6 +57,7 @@ from src.queueing.rate_limit import (
 from src.queueing.redis_conn import get_redis
 from src.resolve.domain import resolve
 from src.resolve.mx import resolve_mx as _resolve_mx  # R15
+from src.verify.catchall import check_catchall_for_domain  # R17 domain-level catch-all
 from src.verify.smtp import probe_rcpt  # R16 SMTP probe core
 
 log = logging.getLogger(__name__)
@@ -412,8 +412,7 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
       {"ok", "company_id", "domain", "lowest_mx", "mx_hosts", "preference_map",
        "cached", "failure", "row_id"}
     """
-    import os
-    import time
+    import time as _time
 
     dom = (domain or "").strip().lower()
     if not dom:
@@ -431,7 +430,7 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
     except Exception:
         redis_ok = False
 
-    start = time.perf_counter()
+    start = _time.perf_counter()
     got_global = False
     got_key = False
     sem_key = MX_SEM.format(mx=dom)  # per-domain key pre-MX to avoid herd
@@ -461,7 +460,7 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
                 }
 
             # RPS smoothing (optional)
-            sec = int(time.time())
+            sec = int(_time.time())
             key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
             key_dom_rps = RPS_KEY_MX.format(mx=dom, sec=sec)
 
@@ -491,7 +490,7 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
         db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
         res = _resolve_mx(company_id=company_id, domain=dom, force=force, db_path=db_path)
 
-        latency_ms = int((time.perf_counter() - start) * 1000)
+        latency_ms = int((_time.perf_counter() - start) * 1000)
         log.info(
             "R15 resolved MX",
             extra={
@@ -540,7 +539,68 @@ def task_resolve_mx(company_id: int, domain: str, force: bool = False) -> dict:
 
 
 # -------------------------------
-# R16: SMTP RCPT probe queue task
+# R17: domain-level catch-all task
+# -------------------------------
+
+
+def _task_check_catchall(domain: str, force: bool = False) -> dict:
+    """
+    Core implementation for R17 catch-all detection.
+
+    Returns a short dict for logging:
+      {
+        "domain": ...,
+        "status": ...,
+        "rcpt_code": ...,
+        "cached": ...,
+        "mx_host": ...,
+        ...
+      }
+    """
+    dom = (domain or "").strip().lower()
+    if not dom:
+        return {"ok": False, "error": "empty_domain"}
+
+    try:
+        res = check_catchall_for_domain(dom, force=force)
+    except Exception as e:
+        log.exception(
+            "R17 task_check_catchall failed",
+            extra={"domain": dom, "exc": str(e)},
+        )
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "domain": dom,
+        }
+
+    return {
+        "ok": True,
+        "domain": res.domain,
+        "status": res.status,
+        "rcpt_code": res.rcpt_code,
+        "cached": res.cached,
+        "mx_host": res.mx_host,
+        "elapsed_ms": int(res.elapsed_ms),
+        "error": res.error,
+    }
+
+
+@job("mx", timeout=10)
+def task_check_catchall(domain: str, force: bool = False) -> dict:
+    """
+    R17 queue task: thin RQ wrapper around _task_check_catchall, so tests can
+    call __wrapped__ to exercise the core logic inline.
+    """
+    return _task_check_catchall(domain, force=force)
+
+
+# Expose core implementation for tests via __wrapped__ (pytest expects this)
+task_check_catchall.__wrapped__ = _task_check_catchall  # type: ignore[attr-defined]
+
+
+# -------------------------------
+# R16: SMTP RCPT probe queue task (+ O07 fallback)
 # -------------------------------
 
 
@@ -554,8 +614,12 @@ def _mx_info(domain: str, *, force: bool, db_path: str | None) -> tuple[str, dic
         from src.resolve.mx import get_or_resolve_mx as _gomx  # type: ignore
 
         res = _gomx(domain, force=force, db_path=db_path)
-        mxh = getattr(res, "lowest_mx", None) or domain
-        beh = getattr(res, "behavior", None) or getattr(res, "mx_behavior", None)
+        if isinstance(res, dict):
+            mxh = res.get("lowest_mx") or domain
+            beh = res.get("behavior") or res.get("mx_behavior")
+        else:
+            mxh = getattr(res, "lowest_mx", None) or domain
+            beh = getattr(res, "behavior", None) or getattr(res, "mx_behavior", None)
         return (mxh, beh)
     except Exception:
         pass
@@ -571,15 +635,15 @@ def _mx_info(domain: str, *, force: bool, db_path: str | None) -> tuple[str, dic
         return (mxh, None)
 
 
-@job("verify", timeout=20)
-def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
+def _normalize_probe_inputs(
+    email_id: int,
+    email: str,
+    domain: str,
+) -> tuple[str, str] | dict[str, Any]:
     """
-    R16 queue task: Resolve MX if needed, enforce R06 throttling per-MX,
-    run RCPT probe via src.verify.smtp.probe_rcpt, and return a structured dict.
-
-    Does NOT write verification_results; persistence happens in R18.
+    Normalize email/domain inputs and return either (email_str, domain)
+    or an error payload suitable for early return.
     """
-    # Normalize inputs
     email_str = (email or "").strip()
     dom = (domain or "").strip().lower() or (
         email_str.split("@", 1)[1].strip().lower() if "@" in email_str else ""
@@ -596,93 +660,191 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             "email": email_str,
             "elapsed_ms": 0,
         }
+    return email_str, dom
 
-    # Resolve MX and get behavior hint from cache (O06)
+
+def _throttle_error_result(
+    *,
+    error: str,
+    mx_host: str | None,
+    dom: str,
+    email_id: int,
+    email_str: str,
+    start: float,
+) -> dict[str, Any]:
+    """Build a standardized throttle/error result dict."""
+    return {
+        "ok": False,
+        "error": error,
+        "category": "unknown",
+        "code": None,
+        "mx_host": mx_host,
+        "domain": dom,
+        "email_id": email_id,
+        "email": email_str,
+        "elapsed_ms": int((time.perf_counter() - start) * 1000),
+    }
+
+
+def _acquire_throttles(
+    *,
+    redis_ok: bool,
+    redis: Redis | None,
+    mx_host: str,
+    mx_key: str,
+    dom: str,
+    email_id: int,
+    email_str: str,
+    start: float,
+) -> tuple[bool, bool, dict[str, Any] | None]:
+    """
+    Acquire global + per-MX concurrency and RPS slots.
+
+    Returns (got_global, got_mx, error_payload). error_payload is None on success.
+    """
+    got_global = False
+    got_mx = False
+
+    if not redis_ok or redis is None:
+        return got_global, got_mx, None
+
+    got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
+    if not got_global:
+        err = _throttle_error_result(
+            error="global concurrency cap reached",
+            mx_host=mx_host,
+            dom=dom,
+            email_id=email_id,
+            email_str=email_str,
+            start=start,
+        )
+        return got_global, got_mx, err
+
+    got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
+    if not got_mx:
+        err = _throttle_error_result(
+            error="per-MX concurrency cap reached",
+            mx_host=mx_host,
+            dom=dom,
+            email_id=email_id,
+            email_str=email_str,
+            start=start,
+        )
+        return got_global, got_mx, err
+
+    sec = int(time.time())
+    key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
+    key_mx_rps = RPS_KEY_MX.format(mx=mx_host, sec=sec)
+
+    if _cfg.rate.global_rps and not can_consume_rps(
+        redis,
+        key_global_rps,
+        int(_cfg.rate.global_rps),
+    ):
+        err = _throttle_error_result(
+            error="global RPS throttle",
+            mx_host=mx_host,
+            dom=dom,
+            email_id=email_id,
+            email_str=email_str,
+            start=start,
+        )
+        return got_global, got_mx, err
+
+    if _cfg.rate.per_mx_rps_default and not can_consume_rps(
+        redis,
+        key_mx_rps,
+        int(_cfg.rate.per_mx_rps_default),
+    ):
+        err = _throttle_error_result(
+            error="MX RPS throttle",
+            mx_host=mx_host,
+            dom=dom,
+            email_id=email_id,
+            email_str=email_str,
+            start=start,
+        )
+        return got_global, got_mx, err
+
+    return got_global, got_mx, None
+
+
+def _maybe_run_fallback(email_str: str, category: str) -> tuple[str | None, Any | None]:
+    """
+    O07: invoke verify_with_fallback(email) for ambiguous classifications.
+
+    Returns (fallback_status, fallback_raw), both None when not applicable.
+    """
+    if category not in {"unknown", "temp_fail"}:
+        return None, None
+
+    try:
+        fb = globals().get("verify_with_fallback")
+        if callable(fb):
+            fb_res = fb(email_str)  # type: ignore[misc]
+            status = getattr(fb_res, "status", None)
+            raw = getattr(fb_res, "raw", None)
+            return status, raw
+    except Exception as e:
+        log.exception(
+            "O07 verify_with_fallback failed",
+            extra={"email": email_str, "exc": str(e)},
+        )
+    return None, None
+
+
+@job("verify", timeout=20)
+def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
+    """
+    R16 queue task: Resolve MX if needed, enforce R06 throttling per-MX,
+    run RCPT probe via src.verify.smtp.probe_rcpt, and return a structured dict.
+
+    O07 enhancement:
+      - When classification is ambiguous (category 'unknown' or 'temp_fail'),
+        call verify_with_fallback(email) if available and surface
+        fallback_status / fallback_raw in the returned dict.
+
+    Does NOT write verification_results; persistence happens in R18.
+    """
+    normalized = _normalize_probe_inputs(email_id, email, domain)
+    if isinstance(normalized, dict):
+        return normalized
+    email_str, dom = normalized
+
     db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
     start = time.perf_counter()
     mx_host, behavior_hint = _mx_info(dom, force=bool(force), db_path=db_path)
 
-    # Throttling (R06): global + per-MX concurrency and RPS
+    redis_obj: Redis | None = None
     redis_ok = False
     try:
-        redis: Redis = get_redis()
+        redis_obj = get_redis()
         try:
-            redis.ping()
+            redis_obj.ping()
             redis_ok = True
         except Exception:
             redis_ok = False
     except Exception:
         redis_ok = False
 
+    mx_key = MX_SEM.format(mx=mx_host)
     got_global = False
     got_mx = False
-    sec = int(time.time())
-    key_global_rps = RPS_KEY_GLOBAL.format(sec=sec)
-    key_mx_rps = RPS_KEY_MX.format(mx=mx_host, sec=sec)
-    mx_key = MX_SEM.format(mx=mx_host)
 
     try:
-        if redis_ok:
-            got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
-            if not got_global:
-                return {
-                    "ok": False,
-                    "error": "global concurrency cap reached",
-                    "category": "unknown",
-                    "code": None,
-                    "mx_host": mx_host,
-                    "domain": dom,
-                    "email_id": email_id,
-                    "email": email_str,
-                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                }
+        got_global, got_mx, throttle_error = _acquire_throttles(
+            redis_ok=redis_ok,
+            redis=redis_obj,
+            mx_host=mx_host,
+            mx_key=mx_key,
+            dom=dom,
+            email_id=int(email_id),
+            email_str=email_str,
+            start=start,
+        )
+        if throttle_error is not None:
+            return throttle_error
 
-            got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
-            if not got_mx:
-                return {
-                    "ok": False,
-                    "error": "per-MX concurrency cap reached",
-                    "category": "unknown",
-                    "code": None,
-                    "mx_host": mx_host,
-                    "domain": dom,
-                    "email_id": email_id,
-                    "email": email_str,
-                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                }
-
-            # RPS smoothing
-            if _cfg.rate.global_rps and not can_consume_rps(
-                redis, key_global_rps, int(_cfg.rate.global_rps)
-            ):
-                return {
-                    "ok": False,
-                    "error": "global RPS throttle",
-                    "category": "unknown",
-                    "code": None,
-                    "mx_host": mx_host,
-                    "domain": dom,
-                    "email_id": email_id,
-                    "email": email_str,
-                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                }
-
-            if _cfg.rate.per_mx_rps_default and not can_consume_rps(
-                redis, key_mx_rps, int(_cfg.rate.per_mx_rps_default)
-            ):
-                return {
-                    "ok": False,
-                    "error": "MX RPS throttle",
-                    "category": "unknown",
-                    "code": None,
-                    "mx_host": mx_host,
-                    "domain": dom,
-                    "email_id": email_id,
-                    "email": email_str,
-                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
-                }
-
-        # Execute probe
         result = probe_rcpt(
             email_str,
             mx_host,
@@ -693,19 +855,30 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             behavior_hint=behavior_hint,
         )
 
-        return {
+        category = result.get("category", "unknown")
+        code = result.get("code")
+        elapsed_res = result.get("elapsed_ms")
+        error_val = result.get("error")
+
+        fallback_status, fallback_raw = _maybe_run_fallback(email_str, category)
+
+        base: dict[str, Any] = {
             "ok": bool(result.get("ok", True)),
-            "category": result.get("category", "unknown"),
-            "code": result.get("code"),
+            "category": category,
+            "code": code,
             "mx_host": result.get("mx_host", mx_host),
             "domain": dom,
             "email_id": int(email_id),
             "email": email_str,
-            "elapsed_ms": int(
-                result.get("elapsed_ms") or int((time.perf_counter() - start) * 1000)
-            ),
-            "error": result.get("error"),
+            "elapsed_ms": int(elapsed_res or int((time.perf_counter() - start) * 1000)),
+            "error": error_val,
         }
+
+        if fallback_status is not None:
+            base["fallback_status"] = fallback_status
+            base["fallback_raw"] = fallback_raw
+
+        return base
 
     except Exception as e:
         return {
@@ -720,15 +893,15 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             "error": f"{type(e).__name__}: {e}",
         }
     finally:
-        if redis_ok:
+        if redis_ok and redis_obj is not None:
             if got_mx:
                 try:
-                    release(redis, mx_key)
+                    release(redis_obj, mx_key)
                 except Exception:
                     pass
             if got_global:
                 try:
-                    release(redis, GLOBAL_SEM)
+                    release(redis_obj, GLOBAL_SEM)
                 except Exception:
                     pass
 

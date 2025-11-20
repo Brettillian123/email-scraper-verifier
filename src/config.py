@@ -50,6 +50,25 @@ def _getenv_list_str(name: str, default_csv: str) -> list[str]:
     return out
 
 
+def _getenv_bool(name: str, default: bool) -> bool:
+    """
+    Read a loosely-typed boolean from the environment.
+
+    Treats "1", "true", "yes", "on" (case-insensitive) as True;
+    "0", "false", "no", "off", "" as False. If unset, returns default.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off", ""}:
+        return False
+    # Fallback: any other non-empty value -> True
+    return True
+
+
 # Load .env from project root if present
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
@@ -129,6 +148,15 @@ SMTP_HELO_DOMAIN = os.getenv("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com
 SMTP_MAIL_FROM = os.getenv("SMTP_MAIL_FROM", f"bounce@{SMTP_HELO_DOMAIN}")
 SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", "10"))
 SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", "10"))
+
+# -------------------------------
+# O07: Third-party verifier fallback config
+# -------------------------------
+THIRD_PARTY_VERIFY_URL: str = os.getenv("THIRD_PARTY_VERIFY_URL", "").strip()
+THIRD_PARTY_VERIFY_API_KEY: str = os.getenv("THIRD_PARTY_VERIFY_API_KEY", "").strip()
+# Default disabled; can be enabled via env flag and will typically also
+# check for URL/API key presence at call sites.
+THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool("THIRD_PARTY_VERIFY_ENABLED", False)
 
 
 @dataclass(frozen=True)
@@ -260,7 +288,7 @@ def load_icp_config() -> dict[str, Any]:
         stretch: ...
         reject: ...
       null_penalty: ...
-      cap: ...
+        cap: ...
 
     Additional keys (e.g., fields, normalization_rules) are preserved but not
     required by the scorer.
@@ -317,4 +345,8 @@ __all__ = [
     "SMTP_MAIL_FROM",
     "SMTP_CONNECT_TIMEOUT",
     "SMTP_COMMAND_TIMEOUT",
+    # O07 fallback config
+    "THIRD_PARTY_VERIFY_URL",
+    "THIRD_PARTY_VERIFY_API_KEY",
+    "THIRD_PARTY_VERIFY_ENABLED",
 ]

@@ -24,23 +24,23 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
     Document shape (keys are stable; values may be None/missing depending on schema):
 
         {
-          "id": "email:<emails.id>",
-          "email": "...",
-          "first_name": "...",
-          "last_name": "...",
-          "full_name": "...",
-          "title": "...",
-          "role_family": "...",
-          "seniority": "...",
-          "company": "...",
-          "domain": "...",
-          "verify_status": "...",
+          "id": "email:alice.anderson@crestwellpartners.com",
+          "email": "alice.anderson@crestwellpartners.com",
+          "first_name": "Alice",
+          "last_name": "Anderson",
+          "full_name": "Alice Anderson",
+          "title": "VP of Sales",
+          "role_family": "sales",
+          "seniority": "vp",
+          "company": "Crestwell Partners",
+          "domain": "crestwellpartners.com",
+          "verify_status": "valid",
           "icp_score": 92,
           "industry": "B2B SaaS",
           "company_size": "50-200",
           "tech_keywords": ["salesforce", "hubspot"],
           "verified_at": "2025-11-28T20:00:00Z",
-          "source_url": "https://...",
+          "source_url": "https://example.com/source"
         }
 
     This is intentionally close to what R22/R23's /leads/search will want.
@@ -50,30 +50,29 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
     # DBs, you can adjust the query to match your actual schema.
     sql = """
         SELECT
-          ve.id            AS email_id,
-          ve.email         AS email,
-          ve.person_id     AS person_id,
-          ve.verify_status AS verify_status,
-          ve.verified_at   AS verified_at,
-          ve.source_url    AS email_source_url,
+          ve.email          AS email,
+          ve.person_id      AS person_id,
+          ve.verify_status  AS verify_status,
+          ve.verified_at    AS verified_at,
+          ve.source_url     AS email_source_url,
 
-          p.first_name     AS first_name,
-          p.last_name      AS last_name,
-          p.full_name      AS full_name,
-          p.title          AS title,
-          p.title_norm     AS title_norm,
-          p.role_family    AS role_family,
-          p.seniority      AS seniority,
-          p.icp_score      AS icp_score,
-          p.source_url     AS person_source_url,
+          p.first_name      AS first_name,
+          p.last_name       AS last_name,
+          p.full_name       AS full_name,
+          p.title           AS title,
+          p.title_norm      AS title_norm,
+          p.role_family     AS role_family,
+          p.seniority       AS seniority,
+          p.icp_score       AS icp_score,
+          p.source_url      AS person_source_url,
 
-          c.id             AS company_id,
-          c.name           AS company_name_raw,
-          c.name_norm      AS company_name_norm,
-          c.domain         AS company_domain_raw,
+          c.id              AS company_id,
+          c.name            AS company_name_raw,
+          c.name_norm       AS company_name_norm,
+          c.domain          AS company_domain_raw,
           c.official_domain AS company_domain_official,
-          c.website_url    AS company_website_url,
-          c.attrs          AS company_attrs
+          c.website_url     AS company_website_url,
+          c.attrs           AS company_attrs
         FROM v_emails_latest AS ve
         JOIN people AS p
           ON p.id = ve.person_id
@@ -84,7 +83,6 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
     cur = conn.execute(sql)
     for row in cur:
         # Base identity fields
-        email_id = row["email_id"]
         email = row["email"]
 
         full_name = row["full_name"]
@@ -122,7 +120,9 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
                 pass
 
         doc: dict[str, Any] = {
-            "id": f"email:{email_id}",
+            # Use the email itself as the stable ID. Since ux_emails_email exists,
+            # emails are unique.
+            "id": f"email:{email}",
             "email": email,
             "first_name": row["first_name"],
             "last_name": row["last_name"],

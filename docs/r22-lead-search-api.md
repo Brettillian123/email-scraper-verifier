@@ -60,7 +60,7 @@ All parameters are **optional** unless noted otherwise. List-type parameters are
 | `recency_days` | integer                  | no       | (no limit) | `recency_days=30`                                                                            | Only include leads verified/seen in the last N days. Uses `verified_at` primarily. |
 | `sort`         | string                   | no       | `icp_desc` | `sort=icp_desc` or `sort=verified_desc`                                                     | Sort order; **R22 supports only `icp_desc` (default) and `verified_desc`**. Others are rejected with 400. |
 | `limit`        | integer                  | no       | `50`       | `limit=25`                                                                                   | Page size. Clamped to `1 ≤ limit ≤ 100`. |
-| `cursor`       | string (opaque)          | no       | —          | `cursor=eyJzb3J0IjoiaWNwX2Rlc2MiLCJpY3Bfc2NvcmUiOjg3LCJwZXJzb25faWQiOjEyM30`                  | Keyset pagination cursor returned from a previous page. Treated as opaque by clients. |
+| `cursor`       | string (opaque)          | no       | —          | `cursor=cursor_example_token`                                                               | Keyset pagination cursor returned from a previous page. Treated as opaque by clients. |
 
 ### 3.2 Notes on list parameters
 
@@ -195,7 +195,7 @@ Copy code
   ],
   "limit": 50,
   "sort": "icp_desc",
-  "next_cursor": "eyJzb3J0IjoiaWNwX2Rlc2MiLCJpY3Bfc2NvcmUiOjg3LCJwZXJzb25faWQiOjEyM30"
+  "next_cursor": "cursor_example_token"
 }
 Notes:
 
@@ -323,13 +323,13 @@ Copy code
   "results": [ /* 20 leads */ ],
   "limit": 20,
   "sort": "icp_desc",
-  "next_cursor": "eyJzb3J0IjoiaWNwX2Rlc2MiLCJpY3Bfc2NvcmUiOjg3LCJwZXJzb25faWQiOjEyM30"
+  "next_cursor": "cursor_example_token"
 }
 Second page:
 
 http
 Copy code
-GET /leads/search?q=marketing&icp_min=70&limit=20&cursor=eyJzb3J0IjoiaWNwX2Rlc2MiLCJpY3Bfc2NvcmUiOjg3LCJwZXJzb25faWQiOjEyM30 HTTP/1.1
+GET /leads/search?q=marketing&icp_min=70&limit=20&cursor=cursor_example_token HTTP/1.1
 Accept: application/json
 Server uses the cursor to continue after the last lead from page 1.
 

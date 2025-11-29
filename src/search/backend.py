@@ -1,4 +1,3 @@
-# src/search/backend.py
 from __future__ import annotations
 
 import sqlite3
@@ -22,7 +21,7 @@ class SearchBackend(Protocol):
     protocol without changing the calling code.
     """
 
-    def search(self, params: LeadSearchParams) -> list[dict[str, Any]]:
+    def search_leads(self, params: LeadSearchParams) -> list[dict[str, Any]]:
         """
         Execute a lead search and return a list of plain dicts.
 
@@ -39,6 +38,18 @@ class SearchBackend(Protocol):
         by DB triggers and migrations. For remote search engines
         (Meilisearch/OpenSearch), this will typically perform a bulk index
         operation.
+        """
+        ...
+
+    # Backwards-compat: older code/tests may still call `search()`.
+    # We declare it in the protocol so type-checkers know it exists,
+    # but SqliteFtsBackend implements it as a thin alias.
+    def search(self, params: LeadSearchParams) -> list[dict[str, Any]]:
+        """
+        Backwards-compatible alias for search_leads().
+
+        New code should prefer search_leads(); older callers can keep using
+        search() without changes.
         """
         ...
 
@@ -59,12 +70,23 @@ class SqliteFtsBackend:
     def conn(self) -> sqlite3.Connection:
         """
         Expose the underlying connection for rare escape hatches (e.g. ad-hoc
-        diagnostics). Prefer using the search() method in normal code.
+        diagnostics). Prefer using the search_* methods in normal code.
         """
         return self._conn
 
-    def search(self, params: LeadSearchParams) -> list[dict[str, Any]]:
+    def search_leads(self, params: LeadSearchParams) -> list[dict[str, Any]]:
+        """
+        Primary search entrypoint used by R22 (/leads/search) and the cache
+        layer. Delegates to search_people_leads().
+        """
         return search_people_leads(self._conn, params)
+
+    def search(self, params: LeadSearchParams) -> list[dict[str, Any]]:
+        """
+        Backwards-compatible alias so any existing R21 tests or callers that
+        still use backend.search(...) keep working.
+        """
+        return self.search_leads(params)
 
     def index_batch(self, docs: Iterable[dict[str, Any]]) -> None:
         """

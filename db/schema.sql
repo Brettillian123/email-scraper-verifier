@@ -143,6 +143,11 @@ CREATE INDEX IF NOT EXISTS idx_domain_resolutions_company_id
 -- View: v_emails_latest
 --   Latest verification result per email, joined to people/companies.
 --   Exposes R18 canonical verify_status/verify_reason/verified_at.
+--   R20 additions:
+--     - title_norm/title_raw aliases for export
+--     - company_domain derived from email's domain
+--     - canonical source_url via COALESCE(email_source_url, person_source_url)
+--     - back-compat "reason" column used by older tools/checks
 -- ---------------------------------------------------------------------------
 DROP VIEW IF EXISTS v_emails_latest;
 
@@ -178,15 +183,21 @@ SELECT
   p.last_name,
   p.full_name,
   p.title,
+  p.title       AS title_raw,
+  p.title       AS title_norm,
   p.source_url  AS person_source_url,
 
   c.name        AS company_name,
-  c.domain      AS company_domain,
+  LOWER(SUBSTR(e.email, INSTR(e.email, '@') + 1)) AS company_domain,
+  c.domain      AS company_domain_raw,
   c.website_url,
   c.official_domain,
   c.official_domain_source,
   c.official_domain_confidence,
   c.official_domain_checked_at,
+
+  -- R20 canonical source URL for this lead
+  COALESCE(e.source_url, p.source_url) AS source_url,
 
   -- low-level / legacy verification fields (pre-R18)
   vr.mx_host,
@@ -198,7 +209,10 @@ SELECT
   vr.verify_status,
   vr.verify_reason,
   vr.verified_mx,
-  vr.verified_at
+  vr.verified_at,
+
+  -- Back-compat column expected by scripts/check_view.py and early tooling
+  COALESCE(vr.verify_reason, vr.reason) AS reason
 
 FROM emails AS e
 LEFT JOIN people AS p

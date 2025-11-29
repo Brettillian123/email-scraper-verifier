@@ -191,6 +191,53 @@ class ExportPolicy:
         # 6) Passed all checks.
         return True, "ok"
 
+    def is_exportable_row(
+        self,
+        *,
+        email: str,
+        verify_status: str | None,
+        icp_score: float | None,
+        extra: Mapping[str, Any],
+    ) -> tuple[bool, str]:
+        """
+        R20-compatible export decision API.
+
+        This is a thin wrapper around should_export(lead), which expects a
+        row-like mapping. iter_exportable_leads/export_leads call this with
+        the fields broken out plus the full row as `extra`.
+
+        Parameters
+        ----------
+        email:
+            Email address from v_emails_latest.email (not used by the current
+            policy rules, but included for completeness / future use).
+        verify_status:
+            Canonical verification status from R18 (e.g. "valid",
+            "risky_catch_all", "invalid", "unknown_timeout").
+        icp_score:
+            ICP score from v_emails_latest.icp_score (0..100).
+        extra:
+            The full row from v_emails_latest (sqlite3.Row or dict-like). May
+            contain additional fields (role_family, seniority, industry, etc.)
+            that should_export uses.
+
+        Returns
+        -------
+        (ok, reason):
+            ok is True if the row should be exported, False otherwise.
+            reason is one of the short strings documented in should_export().
+        """
+        # Start from the underlying row mapping.
+        lead = dict(extra)
+
+        # Ensure core fields are present/overridden explicitly.
+        # This keeps the policy logic centralized in should_export().
+        lead["email"] = email
+        lead["verify_status"] = verify_status
+        lead["icp_score"] = icp_score
+
+        return self.should_export(lead)
+
 
 def load_policy(config: Mapping[str, Any], name: str = "default") -> ExportPolicy:
     """

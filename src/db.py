@@ -30,6 +30,22 @@ def get_conn() -> sqlite3.Connection:
     return con
 
 
+def get_connection(db_path: str | None = None) -> sqlite3.Connection:
+    """
+    Shared SQLite connection helper for libraries and scripts.
+
+    - If db_path is None, uses _db_path() (DATABASE_URL/DATABASE_PATH/dev.db).
+    - Ensures foreign key enforcement.
+    - Sets row_factory to sqlite3.Row for dict-like/dot-style access.
+    """
+    if db_path is None:
+        db_path = _db_path()
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
 def _table_columns(cur, table: str) -> dict[str, dict]:
     """
     Returns {col_name: {name,type,notnull,default,pk}} for table.

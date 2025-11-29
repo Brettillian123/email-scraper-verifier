@@ -12,3 +12,6 @@ time-machine>=2.14,<3.0
 
 # Internationalization (O09)
 Unidecode>=1.3
+
+fastapi
+uvicorn[standard]

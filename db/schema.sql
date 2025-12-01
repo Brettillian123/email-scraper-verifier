@@ -249,3 +249,19 @@ CREATE TABLE IF NOT EXISTS lead_search_docs (
   created_at TEXT,                 -- when this doc was first materialized
   updated_at TEXT                  -- last refresh timestamp
 );
+
+-- ---------------------------------------------------------------------------
+-- O23: Admin audit log
+--
+-- Best-effort audit trail for sensitive admin actions (e.g. viewing
+-- metrics/analytics). The writer (src/admin/audit.py) swallows failures so
+-- missing tables or migration gaps do not break admin endpoints.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,          -- ISO-8601 UTC timestamp
+  action TEXT NOT NULL,      -- short action key (view_metrics, view_analytics, ...)
+  user_id TEXT,              -- optional logical user identifier
+  remote_ip TEXT,            -- client IP as seen by FastAPI/uvicorn
+  metadata TEXT              -- JSON blob with request context
+);

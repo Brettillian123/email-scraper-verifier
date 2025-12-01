@@ -449,9 +449,16 @@ def _build_order_by(sort: str) -> str:
 
 def search_people_leads(conn: sqlite3.Connection, params: LeadSearchParams) -> list[dict[str, Any]]:
     """
-    Perform a full-text search over people_fts + joins to people, companies, v_emails_latest.
+    Validate query and normalize sort, raising ValueError on invalid input.
+    """
+    if not params.query or not params.query.strip():
+        raise ValueError("LeadSearchParams.query must be a non-empty string")
 
-    This is the main helper R22's /leads/search will call on SQLite. It:
+    sort = params.sort or "icp_desc"
+    if sort not in {"icp_desc", "verified_desc"}:
+        msg = f"Unsupported sort value for search_people_leads: {sort!r}"
+        raise ValueError(msg)
+    return sort
 
       * Uses FTS5 (people_fts) to match the text query.
       * Joins back to people, companies, v_emails_latest for metadata and filters.

@@ -1,0 +1,812 @@
+<!-- src/api/templates/admin.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Email Scraper – Admin Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+                sans-serif;
+            color-scheme: dark light;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            color: #e5e7eb;
+        }
+
+        .page {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 24px 16px 40px;
+        }
+
+        h1,
+        h2,
+        h3 {
+            margin: 0 0 12px;
+            font-weight: 600;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+        }
+
+        h2 {
+            font-size: 1.2rem;
+        }
+
+        h3 {
+            font-size: 1rem;
+        }
+
+        .subtitle {
+            margin-top: 4px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            color: #9ca3af;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+            gap: 16px;
+        }
+
+        @media (max-width: 900px) {
+            .grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
+
+        .card {
+            background: #020617;
+            border-radius: 12px;
+            padding: 16px 18px 14px;
+            box-shadow: 0 10px 25px rgba(15, 23, 42, 0.7);
+            border: 1px solid #1f2937;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .badge {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            border: 1px solid #374151;
+            color: #9ca3af;
+            white-space: nowrap;
+        }
+
+        .pill {
+            border-radius: 999px;
+            padding: 3px 9px;
+            font-size: 0.75rem;
+            background: #111827;
+            border: 1px solid #1f2937;
+        }
+
+        .pill span {
+            color: #9ca3af;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.82rem;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 4px 6px;
+            border-bottom: 1px solid #111827;
+            vertical-align: middle;
+        }
+
+        th {
+            font-weight: 500;
+            color: #9ca3af;
+            border-bottom: 1px solid #1f2937;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        .muted {
+            color: #6b7280;
+        }
+
+        .ok {
+            color: #22c55e;
+        }
+
+        .warn {
+            color: #eab308;
+        }
+
+        .err {
+            color: #f97316;
+        }
+
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                "Liberation Mono", "Courier New", monospace;
+        }
+
+        .metrics-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 4px 0 6px;
+        }
+
+        .metric {
+            font-size: 0.8rem;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: #020617;
+            border: 1px solid #1f2937;
+        }
+
+        .metric strong {
+            margin-right: 4px;
+        }
+
+        .footer {
+            margin-top: 18px;
+            font-size: 0.75rem;
+            color: #6b7280;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 999px;
+            margin-right: 4px;
+        }
+
+        .status-ok {
+            background: #22c55e;
+        }
+
+        .status-warn {
+            background: #eab308;
+        }
+
+        .status-err {
+            background: #f97316;
+        }
+
+        .status-unknown {
+            background: #4b5563;
+        }
+
+        .error-banner {
+            margin-bottom: 12px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid #b91c1c;
+            background: rgba(127, 29, 29, 0.6);
+            font-size: 0.8rem;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 8px;
+        }
+
+        .refresh-info {
+            font-size: 0.75rem;
+            color: #6b7280;
+        }
+
+        .subtle-label {
+            font-size: 0.78rem;
+            color: #9ca3af;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+        <header class="header-row">
+            <div>
+                <h1>Email Scraper – Admin</h1>
+                <div class="subtitle">
+                    R24/O17 dashboard for queues, workers, verification, cost proxies, and basic analytics.
+                </div>
+            </div>
+            <div class="refresh-info">
+                Last update:
+                <span id="last-update" class="mono muted">–</span><br />
+                Auto-refresh every 10s
+            </div>
+        </header>
+
+        <div id="error-banner" class="error-banner hidden">
+            Failed to load admin metrics/analytics. Check that the API server and Redis are running.
+        </div>
+
+        <section class="grid">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Queues</h2>
+                    <div class="badge">RQ queue health</div>
+                </div>
+                <div class="metrics-row">
+                    <div class="metric">
+                        <strong>Total queued</strong>
+                        <span id="queues-total-queued" class="mono muted">0</span>
+                    </div>
+                    <div class="metric">
+                        <strong>Total failed</strong>
+                        <span id="queues-total-failed" class="mono muted">0</span>
+                    </div>
+                </div>
+                <table id="queues-table">
+                    <thead>
+                        <tr>
+                            <th>Queue</th>
+                            <th class="mono">Queued</th>
+                            <th class="mono">Started</th>
+                            <th class="mono">Failed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="muted" colspan="4">Loading…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>Workers</h2>
+                    <div class="badge">RQ workers</div>
+                </div>
+                <table id="workers-table">
+                    <thead>
+                        <tr>
+                            <th>Worker</th>
+                            <th>State</th>
+                            <th>Queues</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="muted" colspan="3">Loading…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="grid" style="margin-top: 16px">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Verification</h2>
+                    <div class="badge">Lead surface</div>
+                </div>
+                <div class="metrics-row">
+                    <div class="metric">
+                        <strong>Total emails</strong>
+                        <span id="verif-total" class="mono muted">0</span>
+                    </div>
+                    <div class="metric">
+                        <strong>Valid rate</strong>
+                        <span id="verif-valid-rate" class="mono muted">0%</span>
+                    </div>
+                </div>
+                <table id="verif-table">
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th class="mono">Count</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="muted" colspan="2">Loading…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>Cost proxies</h2>
+                    <div class="badge">Volume counters</div>
+                </div>
+                <table id="costs-table">
+                    <thead>
+                        <tr>
+                            <th>Counter</th>
+                            <th class="mono">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="muted" colspan="2">Loading…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="grid" style="margin-top: 16px">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Verification trend</h2>
+                    <div class="badge">Last 30 days</div>
+                </div>
+                <div class="subtle-label" style="margin-bottom: 4px;">
+                    Daily totals and valid rate over the recent verification window.
+                </div>
+                <table id="timeseries-table">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th class="mono">Total</th>
+                            <th class="mono">Valid</th>
+                            <th class="mono">Invalid</th>
+                            <th class="mono">Catch-all</th>
+                            <th class="mono">Valid rate</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="muted" colspan="6">Loading…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>Domains &amp; errors</h2>
+                    <div class="badge">Top 10 each</div>
+                </div>
+                <div class="subtle-label" style="margin-bottom: 4px;">
+                    Hot spots by company_domain and common verification errors.
+                </div>
+                <div style="display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 8px;">
+                    <table id="domains-table">
+                        <thead>
+                            <tr>
+                                <th>Domain</th>
+                                <th class="mono">Total</th>
+                                <th class="mono">Valid %</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td class="muted" colspan="3">Loading…</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <table id="errors-table">
+                        <thead>
+                            <tr>
+                                <th>Error</th>
+                                <th class="mono">Count</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td class="muted" colspan="2">Loading…</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <footer class="footer">
+            <div>
+                <span class="status-dot status-ok"></span>Green = no failures ·
+                <span class="status-dot status-warn"></span>Yellow = some failures ·
+                <span class="status-dot status-err"></span>Orange = heavy failures
+            </div>
+            <div>
+                Backed by
+                <span class="mono">GET /admin/metrics</span> and
+                <span class="mono">GET /admin/analytics</span>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        function classifyQueueState(queued, failed) {
+            if (failed > 0 && failed >= queued) {
+                return "err";
+            }
+            if (failed > 0) {
+                return "warn";
+            }
+            return "ok";
+        }
+
+        function statusDotClass(kind) {
+            if (kind === "ok") return "status-dot status-ok";
+            if (kind === "warn") return "status-dot status-warn";
+            if (kind === "err") return "status-dot status-err";
+            return "status-dot status-unknown";
+        }
+
+        function updateQueues(queues) {
+            const tbody = document.querySelector("#queues-table tbody");
+            tbody.innerHTML = "";
+
+            if (!queues || queues.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 4;
+                cell.textContent = "No queues found.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                document.getElementById("queues-total-queued").textContent = "0";
+                document.getElementById("queues-total-failed").textContent = "0";
+                return;
+            }
+
+            let totalQueued = 0;
+            let totalFailed = 0;
+
+            queues.forEach((q) => {
+                const row = document.createElement("tr");
+
+                const state = classifyQueueState(
+                    Number(q.queued || 0),
+                    Number(q.failed || 0)
+                );
+
+                const nameCell = document.createElement("td");
+                nameCell.textContent = q.name || "(unknown)";
+                row.appendChild(nameCell);
+
+                const queuedCell = document.createElement("td");
+                queuedCell.textContent = q.queued;
+                queuedCell.className = "mono";
+                row.appendChild(queuedCell);
+
+                const startedCell = document.createElement("td");
+                startedCell.textContent = q.started;
+                startedCell.className = "mono muted";
+                row.appendChild(startedCell);
+
+                const failedCell = document.createElement("td");
+                failedCell.textContent = q.failed;
+                failedCell.className = "mono " + (state === "ok" ? "muted" : state);
+                row.appendChild(failedCell);
+
+                tbody.appendChild(row);
+
+                totalQueued += Number(q.queued || 0);
+                totalFailed += Number(q.failed || 0);
+            });
+
+            document.getElementById("queues-total-queued").textContent =
+                String(totalQueued);
+            document.getElementById("queues-total-failed").textContent =
+                String(totalFailed);
+        }
+
+        function updateWorkers(workers) {
+            const tbody = document.querySelector("#workers-table tbody");
+            tbody.innerHTML = "";
+
+            if (!workers || workers.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 3;
+                cell.textContent = "No workers reported.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            workers.forEach((w) => {
+                const row = document.createElement("tr");
+
+                const nameCell = document.createElement("td");
+                nameCell.textContent = w.name || "(unnamed)";
+                row.appendChild(nameCell);
+
+                const stateCell = document.createElement("td");
+                const state = (w.state || "unknown").toLowerCase();
+                const span = document.createElement("span");
+                span.innerHTML =
+                    '<span class="' +
+                    statusDotClass(
+                        state === "busy" || state === "idle" ? "ok" : "unknown"
+                    ) +
+                    '"></span>' +
+                    state;
+                stateCell.appendChild(span);
+                row.appendChild(stateCell);
+
+                const queuesCell = document.createElement("td");
+                queuesCell.textContent = (w.queues || []).join(", ");
+                queuesCell.className = "muted";
+                row.appendChild(queuesCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateVerification(verif) {
+            const total = Number(verif.total_emails || 0);
+            document.getElementById("verif-total").textContent = String(total);
+
+            const validRate = Number(verif.valid_rate || 0);
+            const pct = (validRate * 100).toFixed(1) + "%";
+            document.getElementById("verif-valid-rate").textContent = pct;
+
+            const tbody = document.querySelector("#verif-table tbody");
+            tbody.innerHTML = "";
+
+            const byStatus = verif.by_status || {};
+            const statuses = Object.keys(byStatus);
+            if (statuses.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 2;
+                cell.textContent = "No verification data yet.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            statuses.sort().forEach((status) => {
+                const row = document.createElement("tr");
+
+                const statusCell = document.createElement("td");
+                statusCell.textContent = status;
+                row.appendChild(statusCell);
+
+                const countCell = document.createElement("td");
+                countCell.textContent = byStatus[status];
+                countCell.className = "mono";
+                row.appendChild(countCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateCosts(costs) {
+            const tbody = document.querySelector("#costs-table tbody");
+            tbody.innerHTML = "";
+
+            const entries = [
+                ["SMTP probes", costs.smtp_probes],
+                ["Catch-all checks", costs.catchall_checks],
+                ["Domains resolved", costs.domains_resolved],
+                ["Pages crawled", costs.pages_crawled],
+            ];
+
+            entries.forEach(([label, value]) => {
+                const row = document.createElement("tr");
+
+                const labelCell = document.createElement("td");
+                labelCell.textContent = label;
+                row.appendChild(labelCell);
+
+                const valueCell = document.createElement("td");
+                valueCell.textContent = Number(value || 0);
+                valueCell.className = "mono";
+                row.appendChild(valueCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateTimeSeries(points) {
+            const tbody = document.querySelector("#timeseries-table tbody");
+            tbody.innerHTML = "";
+
+            if (!points || points.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 6;
+                cell.textContent = "No verification history yet.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            points.forEach((p) => {
+                const row = document.createElement("tr");
+
+                const dCell = document.createElement("td");
+                dCell.textContent = p.date;
+                row.appendChild(dCell);
+
+                const totalCell = document.createElement("td");
+                totalCell.textContent = p.total;
+                totalCell.className = "mono";
+                row.appendChild(totalCell);
+
+                const validCell = document.createElement("td");
+                validCell.textContent = p.valid;
+                validCell.className = "mono";
+                row.appendChild(validCell);
+
+                const invalidCell = document.createElement("td");
+                invalidCell.textContent = p.invalid;
+                invalidCell.className = "mono";
+                row.appendChild(invalidCell);
+
+                const riskyCell = document.createElement("td");
+                riskyCell.textContent = p.risky_catch_all;
+                riskyCell.className = "mono";
+                row.appendChild(riskyCell);
+
+                const vrCell = document.createElement("td");
+                const pct = ((p.valid_rate || 0) * 100).toFixed(1) + "%";
+                vrCell.textContent = pct;
+                vrCell.className = "mono";
+                row.appendChild(vrCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateDomains(domains) {
+            const tbody = document.querySelector("#domains-table tbody");
+            tbody.innerHTML = "";
+
+            if (!domains || domains.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 3;
+                cell.textContent = "No domain breakdown available.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            domains.forEach((d) => {
+                const row = document.createElement("tr");
+
+                const domCell = document.createElement("td");
+                domCell.textContent = d.domain;
+                row.appendChild(domCell);
+
+                const totalCell = document.createElement("td");
+                totalCell.textContent = d.total;
+                totalCell.className = "mono";
+                row.appendChild(totalCell);
+
+                const vrCell = document.createElement("td");
+                const pct = ((d.valid_rate || 0) * 100).toFixed(1) + "%";
+                vrCell.textContent = pct;
+                vrCell.className = "mono";
+                row.appendChild(vrCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateErrors(errors) {
+            const tbody = document.querySelector("#errors-table tbody");
+            tbody.innerHTML = "";
+
+            const entries = errors ? Object.entries(errors) : [];
+            if (entries.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 2;
+                cell.textContent = "No error breakdown available.";
+                cell.className = "muted";
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            entries.forEach(([key, count]) => {
+                const row = document.createElement("tr");
+
+                const keyCell = document.createElement("td");
+                keyCell.textContent = key;
+                row.appendChild(keyCell);
+
+                const countCell = document.createElement("td");
+                countCell.textContent = count;
+                countCell.className = "mono";
+                row.appendChild(countCell);
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateLastUpdate() {
+            const el = document.getElementById("last-update");
+            const now = new Date();
+            const hh = String(now.getHours()).padStart(2, "0");
+            const mm = String(now.getMinutes()).padStart(2, "0");
+            const ss = String(now.getSeconds()).padStart(2, "0");
+            el.textContent = `${hh}:${mm}:${ss}`;
+        }
+
+        async function fetchMetrics() {
+            const resp = await fetch("/admin/metrics", {
+                headers: {
+                    Accept: "application/json",
+                },
+            });
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            updateQueues(data.queues || []);
+            updateWorkers(data.workers || []);
+            updateVerification(data.verification || {});
+            updateCosts(data.costs || {});
+        }
+
+        async function fetchAnalytics() {
+            const resp = await fetch("/admin/analytics?window_days=30&top_domains=10&top_errors=10", {
+                headers: {
+                    Accept: "application/json",
+                },
+            });
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            updateTimeSeries(data.verification_time_series || []);
+            updateDomains(data.domain_breakdown || []);
+            updateErrors(data.error_breakdown || {});
+        }
+
+        async function refreshAll() {
+            const errorBanner = document.getElementById("error-banner");
+            try {
+                await fetchMetrics();
+                await fetchAnalytics();
+                updateLastUpdate();
+                errorBanner.classList.add("hidden");
+            } catch (err) {
+                console.error("Failed to load admin metrics/analytics", err);
+                errorBanner.classList.remove("hidden");
+            }
+        }
+
+        window.addEventListener("load", () => {
+            refreshAll();
+            setInterval(refreshAll, 10000);
+        });
+    </script>
+</body>
+
+</html>

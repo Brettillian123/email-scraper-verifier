@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from src.api import admin as admin_routes
 from src.api.middleware.body_limit import BodySizeLimitMiddleware
 from src.search.backend import SearchBackend, SearchResult, SqliteFtsBackend
 from src.search.indexing import LeadSearchParams
@@ -20,6 +21,9 @@ app = FastAPI(title="Email Scraper API")
 
 # Register early so limits apply to all routes
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=BODY_LIMIT_BYTES)
+
+# R24: admin UI + metrics JSON
+app.include_router(admin_routes.router)
 
 
 def _error_response(status_code: int, error: str, detail: str) -> JSONResponse:

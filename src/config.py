@@ -112,10 +112,16 @@ FETCH_DEFAULT_DELAY_SEC: int = _getenv_int("FETCH_DEFAULT_DELAY_SEC", 3)
 FETCH_TIMEOUT_SEC: int = _getenv_int("FETCH_TIMEOUT_SEC", 5)
 FETCH_CONNECT_TIMEOUT_SEC: int = _getenv_int("FETCH_CONNECT_TIMEOUT_SEC", 5)
 FETCH_CACHE_TTL_SEC: int = _getenv_int("FETCH_CACHE_TTL_SEC", 3600)  # 1h default for HTML
-ROBOTS_CACHE_TTL_SEC: int = _getenv_int("ROBOTS_CACHE_TTL_SEC", 86400)  # 24h for robots.txt
+ROBOTS_CACHE_TTL_SEC: int = _getenv_int(
+    "ROBOTS_CACHE_TTL_SEC",
+    86400,
+)  # 24h for robots.txt
 # jittered backoff handled by caller
 FETCH_MAX_RETRIES: int = _getenv_int("FETCH_MAX_RETRIES", 2)
-FETCH_MAX_BODY_BYTES: int = _getenv_int("FETCH_MAX_BODY_BYTES", 2_000_000)  # ≈2MB cap
+FETCH_MAX_BODY_BYTES: int = _getenv_int(
+    "FETCH_MAX_BODY_BYTES",
+    2_000_000,
+)  # ≈2MB cap
 FETCH_ALLOWED_CONTENT_TYPES: list[str] = _getenv_list_str(
     "FETCH_ALLOWED_CONTENT_TYPES",
     "text/html,text/plain",
@@ -153,7 +159,10 @@ SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", "10"))
 # O07: Third-party verifier fallback config
 # -------------------------------
 THIRD_PARTY_VERIFY_URL: str = os.getenv("THIRD_PARTY_VERIFY_URL", "").strip()
-THIRD_PARTY_VERIFY_API_KEY: str = os.getenv("THIRD_PARTY_VERIFY_API_KEY", "").strip()
+THIRD_PARTY_VERIFY_API_KEY: str = os.getenv(
+    "THIRD_PARTY_VERIFY_API_KEY",
+    "",
+).strip()
 # Default disabled; can be enabled via env flag and will typically also
 # check for URL/API key presence at call sites.
 THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool("THIRD_PARTY_VERIFY_ENABLED", False)
@@ -169,6 +178,11 @@ class Settings:
     # NEW: fields required by tests
     DB_URL: str = _getenv_str("DB_URL", DEFAULT_DB_URL)
     USER_AGENT: str = _getenv_user_agent("USER_AGENT", DEFAULT_USER_AGENT)
+    # O23: admin auth / hardening
+    ADMIN_API_KEY: str = _getenv_str("ADMIN_API_KEY", "")
+    ADMIN_ALLOWED_IPS: list[str] = field(
+        default_factory=lambda: _getenv_list_str("ADMIN_ALLOWED_IPS", "")
+    )
 
     # existing fields
     RQ_REDIS_URL: str = os.getenv("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -240,19 +254,28 @@ def load_settings() -> AppConfig:
     rate = RateLimitConfig(
         global_max_concurrency=_getenv_int("GLOBAL_MAX_CONCURRENCY", 12),
         global_rps=_getenv_int("GLOBAL_RPS", 6),
-        per_mx_max_concurrency_default=_getenv_int("PER_MX_MAX_CONCURRENCY_DEFAULT", 2),
+        per_mx_max_concurrency_default=_getenv_int(
+            "PER_MX_MAX_CONCURRENCY_DEFAULT",
+            2,
+        ),
         per_mx_rps_default=_getenv_int("PER_MX_RPS_DEFAULT", 1),
     )
     retry_timeout = RetryTimeoutConfig(
         verify_max_attempts=_getenv_int("VERIFY_MAX_ATTEMPTS", 5),
         verify_base_backoff_seconds=_getenv_int("VERIFY_BASE_BACKOFF_SECONDS", 2),
         verify_max_backoff_seconds=_getenv_int("VERIFY_MAX_BACKOFF_SECONDS", 90),
-        smtp_connect_timeout_seconds=_getenv_int("SMTP_CONNECT_TIMEOUT_SECONDS", 20),
+        smtp_connect_timeout_seconds=_getenv_int(
+            "SMTP_CONNECT_TIMEOUT_SECONDS",
+            20,
+        ),
         smtp_cmd_timeout_seconds=_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 30),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
     )
     smtp_identity = SmtpIdentityConfig(
-        helo_domain=_getenv_str("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com"),
+        helo_domain=_getenv_str(
+            "SMTP_HELO_DOMAIN",
+            "verifier.crestwellpartners.com",
+        ),
     )
     fetch = FetchConfig(
         user_agent=FETCH_USER_AGENT,

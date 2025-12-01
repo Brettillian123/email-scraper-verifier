@@ -158,6 +158,11 @@ THIRD_PARTY_VERIFY_API_KEY: str = os.getenv("THIRD_PARTY_VERIFY_API_KEY", "").st
 # check for URL/API key presence at call sites.
 THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool("THIRD_PARTY_VERIFY_ENABLED", False)
 
+# -------------------------------
+# O14/R23: Facet materialized view feature flag
+# -------------------------------
+FACET_USE_MV: bool = _getenv_bool("FACET_USE_MV", True)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -349,4 +354,6 @@ __all__ = [
     "THIRD_PARTY_VERIFY_URL",
     "THIRD_PARTY_VERIFY_API_KEY",
     "THIRD_PARTY_VERIFY_ENABLED",
+    # O14/R23 facets MV flag
+    "FACET_USE_MV",
 ]

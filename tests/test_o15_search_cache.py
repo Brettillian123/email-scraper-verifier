@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from src.search.backend import SearchResult
 from src.search.cache import search_with_cache
 from src.search.indexing import LeadSearchParams
 
@@ -15,17 +16,23 @@ class FakeBackend:
     """
     Simple in-memory SearchBackend stub for cache tests.
 
-    Tracks how many times search_leads() was called and returns a fixed list
-    of rows for a given invocation.
+    Tracks how many times search() was called and returns a fixed SearchResult
+    for a given invocation.
     """
 
     rows_to_return: list[dict[str, Any]]
+    next_cursor: str | None = None
+    facets_to_return: dict[str, list[dict[str, Any]]] | None = None
     call_count: int = 0
 
-    def search_leads(self, params: LeadSearchParams) -> list[dict[str, Any]]:  # type: ignore[override]
+    def search(self, params: LeadSearchParams) -> SearchResult:  # type: ignore[override]
         self.call_count += 1
-        # For test purposes, echo back the rows unmodified.
-        return list(self.rows_to_return)
+        # For test purposes, echo back the configured rows/facets unmodified.
+        return SearchResult(
+            leads=list(self.rows_to_return),
+            next_cursor=self.next_cursor,
+            facets=self.facets_to_return,
+        )
 
 
 class FakeRedis:
@@ -50,13 +57,21 @@ class FakeRedis:
 # ---------------------------------------------------------------------------
 
 
-def test_cache_hits_on_second_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_hits_on_second_call_including_facets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     search_with_cache should call the backend only once for identical params
-    when Redis is available and no cursor is set.
+    when Redis is available and no cursor is set, and it should cache both
+    leads and facets.
     """
     fake_backend = FakeBackend(
         rows_to_return=[{"email": "a@example.com", "icp_score": 90}],
+        next_cursor="next123",
+        facets_to_return={
+            "verify_status": [{"value": "valid", "count": 1}],
+            "icp_bucket": [{"value": "80-100", "count": 1}],
+        },
     )
     fake_redis = FakeRedis()
 
@@ -74,15 +89,28 @@ def test_cache_hits_on_second_call(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     # First call: should hit backend and populate cache.
-    rows1 = search_with_cache(fake_backend, params)
-    assert rows1 == fake_backend.rows_to_return
+    result1 = search_with_cache(fake_backend, params)
+    assert result1.leads == fake_backend.rows_to_return
+    assert result1.next_cursor == "next123"
+    assert result1.facets == fake_backend.facets_to_return
     assert fake_backend.call_count == 1
     assert fake_redis.setex_calls, "expected cache to be written on first call"
 
+    # Mutate backend to prove second call is served from cache, not backend.
+    fake_backend.rows_to_return = [{"email": "changed@example.com", "icp_score": 50}]
+    fake_backend.facets_to_return = {
+        "verify_status": [{"value": "invalid", "count": 1}],
+    }
+    fake_backend.next_cursor = "changed_cursor"
+
     # Second call: should hit cache and NOT call backend again.
-    rows2 = search_with_cache(fake_backend, params)
-    assert rows2 == fake_backend.rows_to_return
-    assert fake_backend.call_count == 1, "backend.search_leads should not be called again"
+    result2 = search_with_cache(fake_backend, params)
+    assert fake_backend.call_count == 1, "backend.search should not be called again"
+
+    # Cached result should still match the original payload, not the mutated one.
+    assert result2.leads == result1.leads
+    assert result2.next_cursor == result1.next_cursor
+    assert result2.facets == result1.facets
 
 
 def test_cache_key_changes_when_params_change(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,11 +140,49 @@ def test_cache_key_changes_when_params_change(monkeypatch: pytest.MonkeyPatch) -
         limit=10,
     )
 
-    rows1 = search_with_cache(fake_backend, params1)
-    rows2 = search_with_cache(fake_backend, params2)
+    result1 = search_with_cache(fake_backend, params1)
+    result2 = search_with_cache(fake_backend, params2)
 
-    assert rows1 == rows2 == fake_backend.rows_to_return
+    assert result1.leads == result2.leads == fake_backend.rows_to_return
     # Each distinct param set should trigger a backend call at least once.
+    assert fake_backend.call_count == 2
+
+
+def test_facets_affect_cache_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Different requested facet sets should produce different cache keys,
+    even if all other filters are identical.
+    """
+    fake_backend = FakeBackend(
+        rows_to_return=[{"email": "a@example.com", "icp_score": 90}],
+        facets_to_return={"verify_status": [{"value": "valid", "count": 1}]},
+    )
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(
+        "src.search.cache._get_redis_client",
+        lambda: fake_redis,
+    )
+
+    params1 = LeadSearchParams(
+        query="sales",
+        icp_min=80,
+        sort="icp_desc",
+        limit=10,
+        facets=["verify_status"],
+    )
+    params2 = LeadSearchParams(
+        query="sales",
+        icp_min=80,
+        sort="icp_desc",
+        limit=10,
+        facets=["verify_status", "icp_bucket"],  # different facet set
+    )
+
+    result1 = search_with_cache(fake_backend, params1)
+    result2 = search_with_cache(fake_backend, params2)
+
+    assert result1.leads == result2.leads == fake_backend.rows_to_return
+    # Backend should have been called twice, once per distinct facet set.
     assert fake_backend.call_count == 2
 
 
@@ -144,8 +210,8 @@ def test_cursor_pages_bypass_cache(monkeypatch: pytest.MonkeyPatch) -> None:
         cursor_person_id=1,
     )
 
-    rows = search_with_cache(fake_backend, params_with_cursor)
-    assert rows == fake_backend.rows_to_return
+    result = search_with_cache(fake_backend, params_with_cursor)
+    assert result.leads == fake_backend.rows_to_return
 
     # Backend should have been called, but cache should not have been used.
     assert fake_backend.call_count == 1
@@ -173,9 +239,9 @@ def test_no_redis_falls_back_to_backend(monkeypatch: pytest.MonkeyPatch) -> None
         limit=10,
     )
 
-    rows1 = search_with_cache(fake_backend, params)
-    rows2 = search_with_cache(fake_backend, params)
+    result1 = search_with_cache(fake_backend, params)
+    result2 = search_with_cache(fake_backend, params)
 
-    assert rows1 == rows2 == fake_backend.rows_to_return
+    assert result1.leads == result2.leads == fake_backend.rows_to_return
     # With no Redis, both calls should go to the backend.
     assert fake_backend.call_count == 2

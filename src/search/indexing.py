@@ -8,6 +8,10 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
 
+from src.config import FACET_USE_MV
+
+FacetCounts = dict[str, list[dict[str, object]]]
+
 
 @dataclass
 class LeadSearchParams:
@@ -73,10 +77,9 @@ class LeadSearchParams:
             HTTP.
 
         cursor_icp:
-            Keyset pagination cursor component for icp_desc. When sort ==
-            "icp_desc" and both cursor_icp and cursor_person_id are set, the
-            query continues from strictly after that (icp_score, person_id)
-            tuple.
+            Keyset pagination cursor component for icp_desc. When sort == "icp_desc"
+            and both cursor_icp and cursor_person_id are set, the query continues
+            from strictly after that (icp_score, person_id) tuple.
 
         cursor_verified_at:
             Keyset pagination cursor component for verified_desc. When sort ==
@@ -87,9 +90,13 @@ class LeadSearchParams:
         cursor_person_id:
             Keyset pagination cursor component common to both sort modes. Used
             as a stable tiebreaker within a given primary sort key.
+
+        facets:
+            Optional list of facet names (e.g. "verify_status", "icp_bucket")
+            to compute counts for under the current filters.
     """
 
-    query: str
+    query: str | None = None
 
     verify_status: Sequence[str] | None = None
     icp_min: int | None = None
@@ -109,6 +116,16 @@ class LeadSearchParams:
     cursor_icp: int | None = None
     cursor_verified_at: str | None = None  # ISO timestamp, or None
     cursor_person_id: int | None = None
+
+    # facets requested for this search
+    facets: Sequence[str] | None = None
+
+
+@dataclass
+class _FacetSchemaInfo:
+    has_company_attrs: bool
+    industry_expr: str
+    size_expr: str
 
 
 def _rows_to_dicts(cursor: sqlite3.Cursor, rows: Sequence[Sequence[Any]]) -> list[dict[str, Any]]:
@@ -359,6 +376,11 @@ def _apply_source_filter(
     conditions.append(f"ve.source IN ({', '.join(placeholders)})")
 
 
+def _compute_recency_cutoff(recency_days: int) -> str:
+    cutoff_dt = datetime.utcnow() - timedelta(days=recency_days)
+    return cutoff_dt.isoformat(sep=" ", timespec="seconds")
+
+
 def _apply_recency_filter(
     params: LeadSearchParams,
     conditions: list[str],
@@ -367,8 +389,7 @@ def _apply_recency_filter(
     if params.recency_days is None:
         return
 
-    cutoff_dt = datetime.utcnow() - timedelta(days=params.recency_days)
-    cutoff_str = cutoff_dt.isoformat(sep=" ", timespec="seconds")
+    cutoff_str = _compute_recency_cutoff(params.recency_days)
     sql_params["recency_cutoff"] = cutoff_str
     conditions.append(
         "ve.verified_at IS NOT NULL AND ve.verified_at >= :recency_cutoff",
@@ -498,6 +519,336 @@ def search_people_leads(conn: sqlite3.Connection, params: LeadSearchParams) -> l
     cur = conn.execute(base_sql, sql_params)
     rows = cur.fetchall()
     return _rows_to_dicts(cur, rows)
+
+
+def _build_join_facet_base_sql(
+    conn: sqlite3.Connection,
+    params: LeadSearchParams,
+) -> tuple[str, dict[str, Any], _FacetSchemaInfo]:
+    """
+    Build the FROM/JOIN/WHERE clause used for facet counts when we are not
+    using the materialized view. This mirrors the filters used by
+    search_people_leads, but without keyset pagination or ordering.
+    """
+    has_company_attrs, industry_expr, size_expr, _attrs_expr = _detect_company_schema(conn)
+    has_ve_source, _source_expr, _source_url_expr = _detect_ve_schema(conn)
+
+    base_sql = """
+        FROM people_fts
+        JOIN people AS p
+          ON p.id = people_fts.rowid
+        JOIN v_emails_latest AS ve
+          ON ve.person_id = p.id
+        JOIN companies AS c
+          ON c.id = p.company_id
+        WHERE 1=1
+    """
+    sql_params: dict[str, Any] = {}
+    conditions: list[str] = []
+
+    if params.query and params.query.strip():
+        conditions.append("people_fts MATCH :query")
+        sql_params["query"] = params.query
+
+    _apply_icp_filter(params, conditions, sql_params)
+    _apply_verify_status_filter(params, conditions, sql_params)
+    _apply_roles_filter(params, conditions, sql_params)
+    _apply_seniority_filter(params, conditions, sql_params)
+    _apply_industry_filter(params, has_company_attrs, conditions, sql_params)
+    _apply_size_filter(params, has_company_attrs, conditions, sql_params)
+    _apply_tech_filter(params, has_company_attrs, conditions, sql_params)
+    _apply_source_filter(params, has_ve_source, conditions, sql_params)
+    _apply_recency_filter(params, conditions, sql_params)
+
+    if conditions:
+        base_sql += " AND " + " AND ".join(conditions)
+
+    schema_info = _FacetSchemaInfo(
+        has_company_attrs=has_company_attrs,
+        industry_expr=industry_expr,
+        size_expr=size_expr,
+    )
+    return base_sql, sql_params, schema_info
+
+
+def _run_join_facet_query(
+    conn: sqlite3.Connection,
+    facet_name: str,
+    base_sql: str,
+    base_params: dict[str, Any],
+    schema_info: _FacetSchemaInfo,
+) -> list[dict[str, object]] | None:
+    """
+    Execute a facet GROUP BY over the main search joins. Returns a list of
+    {value, count} dicts, or None if the facet is unknown.
+    """
+    if facet_name == "verify_status":
+        sql = f"""
+            SELECT ve.verify_status AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY ve.verify_status
+            ORDER BY count DESC
+        """
+    elif facet_name == "icp_bucket":
+        sql = f"""
+            SELECT
+              CASE
+                WHEN p.icp_score >= 80 THEN '80-100'
+                WHEN p.icp_score >= 60 THEN '60-79'
+                WHEN p.icp_score >= 40 THEN '40-59'
+                ELSE '0-39'
+              END AS value,
+              COUNT(*) AS count
+            {base_sql}
+            GROUP BY value
+            ORDER BY value
+        """
+    elif facet_name == "role_family":
+        sql = f"""
+            SELECT p.role_family AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY p.role_family
+            ORDER BY count DESC
+        """
+    elif facet_name == "seniority":
+        sql = f"""
+            SELECT p.seniority AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY p.seniority
+            ORDER BY count DESC
+        """
+    elif facet_name == "company_size_bucket":
+        if not schema_info.has_company_attrs:
+            return []
+        sql = f"""
+            SELECT {schema_info.size_expr} AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY value
+            ORDER BY count DESC
+        """
+    elif facet_name == "company_industry":
+        if not schema_info.has_company_attrs:
+            return []
+        sql = f"""
+            SELECT {schema_info.industry_expr} AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY value
+            ORDER BY count DESC
+        """
+    else:
+        # Unknown facet (including tech_keyword for now): ignore.
+        return None
+
+    cur = conn.execute(sql, base_params)
+    rows = cur.fetchall()
+    dict_rows = _rows_to_dicts(cur, rows)
+    return [
+        {"value": row["value"], "count": row["count"]}
+        for row in dict_rows
+        if row["value"] is not None
+    ]
+
+
+def _build_mv_base_sql(params: LeadSearchParams) -> tuple[str, dict[str, Any]]:
+    """
+    Build the FROM/WHERE clause for facet counts over the O14 materialized
+    view lead_search_docs. This table is expected to contain the columns needed
+    for filtering & faceting; we intentionally do not join back to the full
+    search graph here.
+    """
+    base_sql = """
+        FROM lead_search_docs AS d
+        WHERE 1=1
+    """
+    sql_params: dict[str, Any] = {}
+    conditions: list[str] = []
+
+    if params.icp_min is not None:
+        conditions.append("d.icp_score IS NOT NULL AND d.icp_score >= :icp_min")
+        sql_params["icp_min"] = params.icp_min
+
+    if params.verify_status:
+        placeholders = []
+        for idx, status in enumerate(params.verify_status):
+            key = f"vs_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = status
+        conditions.append(f"d.verify_status IN ({', '.join(placeholders)})")
+
+    if params.roles:
+        placeholders = []
+        for idx, role in enumerate(params.roles):
+            key = f"role_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = role
+        conditions.append(f"d.role_family IN ({', '.join(placeholders)})")
+
+    if params.seniority:
+        placeholders = []
+        for idx, s in enumerate(params.seniority):
+            key = f"sen_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = s
+        conditions.append(f"d.seniority IN ({', '.join(placeholders)})")
+
+    if params.industries:
+        placeholders = []
+        for idx, industry in enumerate(params.industries):
+            key = f"ind_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = industry
+        conditions.append(f"d.company_industry IN ({', '.join(placeholders)})")
+
+    if params.sizes:
+        placeholders = []
+        for idx, size in enumerate(params.sizes):
+            key = f"size_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = size
+        conditions.append(f"d.company_size_bucket IN ({', '.join(placeholders)})")
+
+    if params.source:
+        placeholders = []
+        for idx, src in enumerate(params.source):
+            key = f"src_{idx}"
+            placeholders.append(f":{key}")
+            sql_params[key] = src
+        conditions.append(f"d.source IN ({', '.join(placeholders)})")
+
+    if params.recency_days is not None:
+        cutoff_str = _compute_recency_cutoff(params.recency_days)
+        sql_params["recency_cutoff"] = cutoff_str
+        conditions.append(
+            "d.verified_at IS NOT NULL AND d.verified_at >= :recency_cutoff",
+        )
+
+    if conditions:
+        base_sql += " AND " + " AND ".join(conditions)
+
+    return base_sql, sql_params
+
+
+def _run_mv_facet_query(
+    conn: sqlite3.Connection,
+    facet_name: str,
+    base_sql: str,
+    base_params: dict[str, Any],
+) -> list[dict[str, object]] | None:
+    """
+    Execute a facet GROUP BY over the lead_search_docs materialized view.
+    Returns a list of {value, count} dicts, or None if the facet is unknown.
+    """
+    if facet_name == "verify_status":
+        sql = f"""
+            SELECT d.verify_status AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY d.verify_status
+            ORDER BY count DESC
+        """
+    elif facet_name == "icp_bucket":
+        sql = f"""
+            SELECT
+              CASE
+                WHEN d.icp_score >= 80 THEN '80-100'
+                WHEN d.icp_score >= 60 THEN '60-79'
+                WHEN d.icp_score >= 40 THEN '40-59'
+                ELSE '0-39'
+              END AS value,
+              COUNT(*) AS count
+            {base_sql}
+            GROUP BY value
+            ORDER BY value
+        """
+    elif facet_name == "role_family":
+        sql = f"""
+            SELECT d.role_family AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY d.role_family
+            ORDER BY count DESC
+        """
+    elif facet_name == "seniority":
+        sql = f"""
+            SELECT d.seniority AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY d.seniority
+            ORDER BY count DESC
+        """
+    elif facet_name == "company_size_bucket":
+        sql = f"""
+            SELECT d.company_size_bucket AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY d.company_size_bucket
+            ORDER BY count DESC
+        """
+    elif facet_name == "company_industry":
+        sql = f"""
+            SELECT d.company_industry AS value, COUNT(*) AS count
+            {base_sql}
+            GROUP BY d.company_industry
+            ORDER BY count DESC
+        """
+    else:
+        return None
+
+    cur = conn.execute(sql, base_params)
+    rows = cur.fetchall()
+    dict_rows = _rows_to_dicts(cur, rows)
+    return [
+        {"value": row["value"], "count": row["count"]}
+        for row in dict_rows
+        if row["value"] is not None
+    ]
+
+
+def compute_facets(conn: sqlite3.Connection, params: LeadSearchParams) -> FacetCounts:
+    """
+    Compute facet counts for the requested dimensions under the current filters.
+
+    By default this groups over the same joins that search_people_leads uses.
+    When FACET_USE_MV is true and the lead_search_docs table exists (O14),
+    and when there is no full-text query, we instead group over the
+    materialized view for better performance.
+    """
+    if not params.facets:
+        return {}
+
+    # Decide whether to use the O14 materialized view.
+    use_mv = False
+    if FACET_USE_MV and (not params.query or not params.query.strip()):
+        try:
+            cur = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'lead_search_docs'
+                """
+            )
+            use_mv = cur.fetchone() is not None
+        except sqlite3.Error:
+            use_mv = False
+
+    # For now, avoid MV when tech filters are present since lead_search_docs
+    # does not model tech-keyword details.
+    if use_mv and params.tech:
+        use_mv = False
+
+    facets: FacetCounts = {}
+
+    if use_mv:
+        base_sql, base_params = _build_mv_base_sql(params)
+        for facet_name in params.facets:
+            rows = _run_mv_facet_query(conn, facet_name, base_sql, base_params)
+            if rows is not None:
+                facets[facet_name] = rows
+        return facets
+
+    base_sql, base_params, schema_info = _build_join_facet_base_sql(conn, params)
+    for facet_name in params.facets:
+        rows = _run_join_facet_query(conn, facet_name, base_sql, base_params, schema_info)
+        if rows is not None:
+            facets[facet_name] = rows
+
+    return facets
 
 
 def simple_similarity(a: str, b: str) -> float:

@@ -223,3 +223,29 @@ LEFT JOIN latest_verification AS lv
   ON lv.email_id = e.id
 LEFT JOIN verification_results AS vr
   ON vr.id = lv.verification_result_id;
+
+-- ---------------------------------------------------------------------------
+-- O14: Materialized view table for facet-friendly lead docs
+--
+-- This denormalized table pre-joins the fields needed for filtering &
+-- faceting so R23 facet queries can avoid heavy joins under load.
+--
+-- It is populated/refreshed by scripts/backfill_o14_lead_search_docs.py
+-- and consulted by the search indexing layer when FACET_USE_MV is enabled.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lead_search_docs (
+  person_id INTEGER PRIMARY KEY,   -- 1:1 with people.id / primary lead row
+  email TEXT,                      -- canonical email for this lead
+  verify_status TEXT,              -- latest verify_status
+  icp_score INTEGER,               -- normalized ICP score (0-100)
+  role_family TEXT,                -- canonical role_family
+  seniority TEXT,                  -- canonical seniority
+  company_size_bucket TEXT,        -- e.g. "1-10", "11-50", "51-200", ...
+  company_industry TEXT,           -- e.g. "B2B SaaS", "Fintech"
+
+  -- Optional: pre-bucketed columns for faster GROUP BY in facets
+  icp_bucket TEXT,                 -- "0-39", "40-59", "60-79", "80-100"
+
+  created_at TEXT,                 -- when this doc was first materialized
+  updated_at TEXT                  -- last refresh timestamp
+);

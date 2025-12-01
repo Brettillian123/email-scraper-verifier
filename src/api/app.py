@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from src.api.middleware.body_limit import BodySizeLimitMiddleware
-from src.search.backend import SearchBackend, SqliteFtsBackend
+from src.search.backend import SearchBackend, SearchResult, SqliteFtsBackend
 from src.search.indexing import LeadSearchParams
 
 # Configurable via env; default 5 MiB
@@ -298,17 +298,20 @@ def _search_leads_with_cache(
     backend: SearchBackend,
     params: LeadSearchParams,
     cursor: str | None,
-) -> list[dict[str, Any]]:
+) -> SearchResult:
     """
     Optional O15 cache layer: only cache first pages (no cursor).
+
+    Returns a SearchResult so higher layers can access leads, facets, and
+    next_cursor (if/when the backend starts emitting it directly).
     """
     if cursor is not None:
-        return backend.search_leads(params)
+        return backend.search(params)
 
     try:
         from src.search.cache import search_with_cache
     except ImportError:  # O15 not present yet
-        return backend.search_leads(params)
+        return backend.search(params)
     return search_with_cache(backend, params)
 
 
@@ -377,9 +380,10 @@ async def leads_search(
     sort: str = "icp_desc",
     limit: str | None = None,
     cursor: str | None = None,
+    facets: str | None = None,
 ):
     """
-    R22: /leads/search API.
+    R22/R23: /leads/search API.
 
     Query parameters are parsed into a LeadSearchParams instance, passed to the
     SearchBackend, and returned as a stable JSON shape suitable for clients.
@@ -393,6 +397,7 @@ async def leads_search(
       - recency_days
       - sort: icp_desc (default), verified_desc
       - keyset pagination via opaque cursor
+      - facets: comma-separated list of facet names, e.g. "verify_status,icp_bucket"
     """
     if not q or not q.strip():
         return _error_response(
@@ -424,6 +429,7 @@ async def leads_search(
     sizes_list = _parse_csv_param(sizes)
     tech_list = _parse_csv_param(tech)
     source_list = _parse_csv_param(source)
+    facets_list = _parse_csv_param(facets)
 
     cursor_icp, cursor_verified_at, cursor_person_id, cursor_error = _parse_cursor(
         cursor,
@@ -448,16 +454,18 @@ async def leads_search(
         cursor_icp=cursor_icp,
         cursor_verified_at=cursor_verified_at,
         cursor_person_id=cursor_person_id,
+        facets=facets_list,
     )
 
     backend = _get_search_backend(request)
-    rows = _search_leads_with_cache(backend, params, cursor)
-    results = [_row_to_lead(row) for row in rows]
-    next_cursor = _build_next_cursor(rows, normalized_sort, limit_val)
+    result = _search_leads_with_cache(backend, params, cursor)
+    results = [_row_to_lead(row) for row in result.leads]
+    next_cursor = _build_next_cursor(result.leads, normalized_sort, limit_val)
 
     return {
         "results": results,
         "limit": limit_val,
         "sort": normalized_sort,
         "next_cursor": next_cursor,
+        "facets": result.facets or {},
     }

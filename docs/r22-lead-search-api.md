@@ -1,10 +1,12 @@
-# /leads/search API (R22)
+# /leads/search API (R22 + R23)
 
 Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
 
 - **Checklist item:** R22 – Lead Search API (/leads/search)
+- **Checklist item:** R23 – Faceting & counts
 - **Optional:** O15 – Query/cache layer for repeated searches (15–60 min TTL)
-- **Status:** Draft contract for current SQLite-based implementation; designed to be stable enough for future Postgres or search-engine backends.
+- **Optional:** O14 – Materialized view for fast facets
+- **Status:** R22/R23 contract for current SQLite-based implementation; designed to be stable enough for future Postgres or search-engine backends.
 
 ---
 
@@ -20,10 +22,17 @@ Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
   - company size / industry / tech keywords
 - Recency of verification.
 - Sort order with **keyset pagination** (opaque cursor).
+- **Facet counts (R23)** over the filtered universe of leads:
+  - `verify_status`
+  - `icp_bucket` (0–39, 40–59, 60–79, 80–100)
+  - `role_family`
+  - `seniority`
+  - `company_size_bucket`
+  - `company_industry`
+  - (optionally `tech_keyword` in future extensions)
 
-**Non-goals for R22:**
+**Non-goals for R22/R23:**
 
-- No facet counts (R23).
 - No total hit count.
 - No multi-tenant auth yet (will be handled later with R23/R24/R27).
 
@@ -46,21 +55,22 @@ All parameters are **optional** unless noted otherwise. List-type parameters are
 
 ### 3.1 Parameter reference
 
-| Name           | Type                     | Required | Default    | Example                                                                                      | Notes |
-|----------------|--------------------------|----------|------------|----------------------------------------------------------------------------------------------|-------|
-| `q`            | string                   | no       | `""`       | `q=sales+operations`                                                                         | Free-text query over person name, title, company name, and any additional indexed text. |
-| `verify_status`| comma-separated strings  | no       | (any)      | `verify_status=valid,risky_catch_all`                                                       | Filters by canonical R18 statuses. Unknown values are rejected with 400. |
-| `icp_min`      | integer                  | no       | `70`       | `icp_min=80`                                                                                 | Minimum ICP score. If omitted, API uses a recommended default (e.g. 70). |
-| `roles`        | comma-separated strings  | no       | (any)      | `roles=sales,marketing,revops`                                                               | Filters by canonical `role_family` values (from title normalization / O02). |
-| `seniority`    | comma-separated strings  | no       | (any)      | `seniority=director,vp,cxo`                                                                 | Filters by canonical `seniority` values. |
-| `industries`   | comma-separated strings  | no       | (any)      | `industries=B2B%20SaaS,Fintech`                                                              | Filters by company industry tags (from `companies.attrs`). |
-| `sizes`        | comma-separated strings  | no       | (any)      | `sizes=1-10,11-50,51-200`                                                                    | Filters by company size buckets (from `companies.attrs`, e.g. `51-200`). |
-| `tech`         | comma-separated strings  | no       | (any)      | `tech=salesforce,hubspot`                                                                    | Filters by detected tech keywords (from `companies.attrs.tech_keywords`). |
-| `source`       | comma-separated strings  | no       | (any)      | `source=published,generated`                                                                 | Filters by lead source: typically `published` (R11) vs `generated` (R12). |
-| `recency_days` | integer                  | no       | (no limit) | `recency_days=30`                                                                            | Only include leads verified/seen in the last N days. Uses `verified_at` primarily. |
-| `sort`         | string                   | no       | `icp_desc` | `sort=icp_desc` or `sort=verified_desc`                                                     | Sort order; **R22 supports only `icp_desc` (default) and `verified_desc`**. Others are rejected with 400. |
-| `limit`        | integer                  | no       | `50`       | `limit=25`                                                                                   | Page size. Clamped to `1 ≤ limit ≤ 100`. |
-| `cursor`       | string (opaque)          | no       | —          | `cursor=cursor_example_token`                                                               | Keyset pagination cursor returned from a previous page. Treated as opaque by clients. |
+| Name            | Type                     | Required | Default    | Example                                                                                      | Notes |
+|-----------------|--------------------------|----------|------------|----------------------------------------------------------------------------------------------|-------|
+| `q`             | string                   | no       | `""`       | `q=sales+operations`                                                                         | Free-text query over person name, title, company name, and any additional indexed text. |
+| `verify_status` | comma-separated strings  | no       | (any)      | `verify_status=valid,risky_catch_all`                                                       | Filters by canonical R18 statuses. Unknown values are rejected with 400. |
+| `icp_min`       | integer                  | no       | `70`       | `icp_min=80`                                                                                 | Minimum ICP score. If omitted, API uses a recommended default (e.g. 70). |
+| `roles`         | comma-separated strings  | no       | (any)      | `roles=sales,marketing,revops`                                                               | Filters by canonical `role_family` values (from title normalization / O02). |
+| `seniority`     | comma-separated strings  | no       | (any)      | `seniority=director,vp,cxo`                                                                 | Filters by canonical `seniority` values. |
+| `industries`    | comma-separated strings  | no       | (any)      | `industries=B2B%20SaaS,Fintech`                                                              | Filters by company industry tags (from `companies.attrs`). |
+| `sizes`         | comma-separated strings  | no       | (any)      | `sizes=1-10,11-50,51-200`                                                                    | Filters by company size buckets (from `companies.attrs`, e.g. `51-200`). |
+| `tech`          | comma-separated strings  | no       | (any)      | `tech=salesforce,hubspot`                                                                    | Filters by detected tech keywords (from `companies.attrs.tech_keywords`). |
+| `source`        | comma-separated strings  | no       | (any)      | `source=published,generated`                                                                 | Filters by lead source: typically `published` (R11) vs `generated` (R12). |
+| `recency_days`  | integer                  | no       | (no limit) | `recency_days=30`                                                                            | Only include leads verified/seen in the last N days. Uses `verified_at` primarily. |
+| `sort`          | string                   | no       | `icp_desc` | `sort=icp_desc` or `sort=verified_desc`                                                     | Sort order; **R22 supports only `icp_desc` (default) and `verified_desc`**. Others are rejected with 400. |
+| `limit`         | integer                  | no       | `50`       | `limit=25`                                                                                   | Page size. Clamped to `1 ≤ limit ≤ 100`. |
+| `cursor`        | string (opaque)          | no       | —          | `cursor=cursor_example_token`                                                               | Keyset pagination cursor returned from a previous page. Treated as opaque by clients. |
+| `facets`        | comma-separated strings  | no       | (none)     | `facets=verify_status,icp_bucket,role_family`                                               | **R23:** which facet dimensions to compute counts for under the current filters. Unknown facet names are ignored. |
 
 ### 3.2 Notes on list parameters
 
@@ -73,6 +83,7 @@ All list-like parameters are provided as comma-separated strings:
 - `sizes=51-200,201-500`
 - `tech=salesforce,hubspot`
 - `source=generated,published`
+- `facets=verify_status,icp_bucket,role_family`
 
 The API:
 
@@ -81,6 +92,7 @@ The API:
 - Rejects empty values (e.g. `roles=,sales,` is invalid).
 
 If any value in a filter is invalid (e.g. unknown `verify_status` or unsupported `sort`), the request returns `400 Bad Request` with a structured error payload (see §6).
+Unknown `facets` values are simply ignored; they do not cause an error.
 
 ---
 
@@ -195,7 +207,19 @@ Copy code
   ],
   "limit": 50,
   "sort": "icp_desc",
-  "next_cursor": "cursor_example_token"
+  "next_cursor": "cursor_example_token",
+  "facets": {
+    "verify_status": [
+      { "value": "valid", "count": 10 },
+      { "value": "risky_catch_all", "count": 3 },
+      { "value": "invalid", "count": 1 }
+    ],
+    "icp_bucket": [
+      { "value": "80-100", "count": 8 },
+      { "value": "60-79", "count": 5 },
+      { "value": "40-59", "count": 1 }
+    ]
+  }
 }
 Notes:
 
@@ -212,6 +236,14 @@ String cursor for the next page, if more results are available.
 null if there are no more pages.
 
 The presence of a non-null next_cursor is the only indicator that another page exists. There is no total count.
+
+facets (R23):
+
+Object keyed by facet name.
+
+Each value is a list of { "value": <bucket>, "count": <integer> }.
+
+Omitted or {} if no facets were requested (facets parameter not provided).
 
 5.2 Lead object fields
 Field	Type	Description
@@ -235,6 +267,54 @@ source	string | null	Lead origin, typically published (R11 extraction) or genera
 source_url	string | null	Provenance URL (page where the email was found, or a canonical company/person URL).
 
 Additional fields can be added in future versions, but existing fields and semantics should remain stable.
+
+5.3 Facets object (R23)
+The facets object is present when the client provides a non-empty facets parameter.
+
+Shape:
+
+jsonc
+Copy code
+{
+  "facets": {
+    "verify_status": [
+      { "value": "valid", "count": 123 },
+      { "value": "risky_catch_all", "count": 45 },
+      { "value": "invalid", "count": 17 }
+    ],
+    "icp_bucket": [
+      { "value": "80-100", "count": 90 },
+      { "value": "60-79", "count": 55 },
+      { "value": "40-59", "count": 8 },
+      { "value": "0-39", "count": 4 }
+    ],
+    "role_family": [
+      { "value": "sales", "count": 70 },
+      { "value": "marketing", "count": 20 }
+    ]
+  }
+}
+Each facet key corresponds to one of the allowed facet names:
+
+verify_status
+
+icp_bucket
+
+role_family
+
+seniority
+
+company_size_bucket
+
+company_industry
+
+For icp_bucket, the server uses fixed buckets:
+
+0-39, 40-59, 60-79, 80-100.
+
+Values with count = 0 are omitted.
+
+Null values are omitted (e.g. leads missing that attribute).
 
 6. Error responses
 Errors are returned as JSON with an HTTP 4xx/5xx status.
@@ -266,6 +346,8 @@ invalid_roles / invalid_seniority – unknown role/seniority.
 
 invalid_param – generic parameter error; detail will specify which param and why.
 
+Unknown facets values are ignored rather than causing an error.
+
 6.2 500 Internal Server Error
 Unexpected server-side errors (DB issues, etc.):
 
@@ -289,7 +371,7 @@ All have verify_status="valid" and icp_score >= 80.
 
 Sorted by icp_desc (default).
 
-7.2 SaaS sales leadership, recent verification
+7.2 SaaS sales leadership, recent verification, with facets
 http
 Copy code
 GET /leads/search?\
@@ -304,9 +386,10 @@ tech=salesforce,hubspot&\
 source=generated,published&\
 recency_days=30&\
 sort=icp_desc&\
+facets=verify_status,icp_bucket,role_family&\
 limit=50 HTTP/1.1
 Accept: application/json
-Example use case: “Give me SaaS GTM leadership at mid-sized companies using Salesforce/HubSpot, recently verified.”
+Example use case: “Give me SaaS GTM leadership at mid-sized companies using Salesforce/HubSpot, recently verified, and show me how they break down by verify_status, ICP bucket, and role family.”
 
 7.3 Pagination with cursor
 First page:
@@ -317,13 +400,14 @@ GET /leads/search?q=marketing&icp_min=70&limit=20 HTTP/1.1
 Accept: application/json
 Response (truncated):
 
-json
+jsonc
 Copy code
 {
   "results": [ /* 20 leads */ ],
   "limit": 20,
   "sort": "icp_desc",
-  "next_cursor": "cursor_example_token"
+  "next_cursor": "cursor_example_token",
+  "facets": { "verify_status": [ /* counts for page-1 universe */ ] }
 }
 Second page:
 
@@ -335,6 +419,8 @@ Server uses the cursor to continue after the last lead from page 1.
 
 page1 and page2 IDs will not overlap.
 
+By design, facets are typically computed only on the first page; subsequent pages may omit facets or return {}.
+
 When next_cursor becomes null, there are no further pages.
 
 8. O15: Query/cache layer behavior (summary)
@@ -342,7 +428,7 @@ R22 pairs with O15 to avoid hammering the DB for common queries.
 
 High-level cache rules:
 
-Only first pages are cached (cursor is absent).
+Only first pages are cached (cursor is absent and no keyset fields set).
 
 The cache key is derived from a normalized representation of:
 
@@ -350,7 +436,7 @@ text
 Copy code
 q, verify_status, icp_min, roles, seniority,
 industries, sizes, tech, source, recency_days,
-sort, limit
+sort, limit, facets
 The normalized key is JSON-encoded with sorted keys and then hashed (e.g. SHA-256), producing something like:
 
 text
@@ -360,35 +446,40 @@ TTL: ~15 minutes to start (e.g. 900 seconds).
 
 On cache hit:
 
-Returns the cached result list directly.
+Returns the cached SearchResult (leads + facets + next_cursor) directly.
 
 On cache miss:
 
 Runs the search against the backend.
 
-Writes result list into cache with TTL.
+Writes the result object into cache with TTL.
 
-Returns result list.
+Returns the result.
 
 Cursor pages (cursor present) always bypass the cache.
 
 Implementation details live in src/search/cache.py, but this document defines the observable behavior: callers do not need to know whether a specific response was cached.
 
 9. Future extensions
-Planned but not part of R22:
+Planned but not part of current R22/R23 scope:
 
 Additional sort orders:
 
 icp_asc, created_desc, etc.
 
-Facets and counts:
+Additional / higher-cardinality facets:
 
-/leads/facets (R23).
+e.g. tech_keyword, geo/region facets, etc.
 
-Total hit count.
+Total hit count:
+
+Either approximate or exact count.
 
 Per-tenant auth and API keys (R23/R24/R27).
 
-Materialized views backing search/facets (O14).
+Richer materialized views and/or external search engines:
+
+O14 introduces a simple lead_search_docs materialized table for facets;
+future versions may expand this or mirror into Postgres/Search-as-a-service.
 
 When these are introduced, this document will be extended but existing fields/behavior will remain backward compatible wherever possible.

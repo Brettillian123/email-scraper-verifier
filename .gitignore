@@ -18,3 +18,5 @@ __pycache__/
 data/
 
 *.egg-info/
+
+.env

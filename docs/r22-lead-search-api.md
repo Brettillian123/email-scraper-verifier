@@ -1,4 +1,4 @@
-# /leads/search API (R22 + R23)
+# /leads/search API (R22 + R23 + O26)
 
 Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
 
@@ -6,6 +6,7 @@ Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
 - **Checklist item:** R23 – Faceting & counts
 - **Optional:** O15 – Query/cache layer for repeated searches (15–60 min TTL)
 - **Optional:** O14 – Materialized view for fast facets
+- **Optional:** O26 – Verification labels + primary/alternate selection
 - **Status:** R22/R23 contract for current SQLite-based implementation; designed to be stable enough for future Postgres or search-engine backends.
 
 ---
@@ -30,6 +31,9 @@ Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
   - `company_size_bucket`
   - `company_industry`
   - (optionally `tech_keyword` in future extensions)
+- **Verification labels (O26)**:
+  - `verify_label` – second-dimension label on top of `verify_status` (native vs catch-all tested, primary vs alternate).
+  - `is_primary_for_person` – marks the canonical “primary” email for a person when one exists.
 
 **Non-goals for R22/R23:**
 
@@ -91,8 +95,7 @@ The API:
 - Trims surrounding whitespace for each value.
 - Rejects empty values (e.g. `roles=,sales,` is invalid).
 
-If any value in a filter is invalid (e.g. unknown `verify_status` or unsupported `sort`), the request returns `400 Bad Request` with a structured error payload (see §6).
-Unknown `facets` values are simply ignored; they do not cause an error.
+If any value in a filter is invalid (e.g. unknown `verify_status` or unsupported `sort`), the request returns `400 Bad Request` with a structured error payload (see §6). Unknown `facets` values are simply ignored; they do not cause an error.
 
 ---
 
@@ -136,7 +139,7 @@ LIMIT :limit
 Clients never see the raw SQL; they just pass the opaque cursor string.
 
 4.3 Cursor encoding format
-The cursor is an URL-safe base64-encoded JSON object. Clients MUST treat it as opaque; the structure below is documented only for debugging and future compatibility.
+The cursor is a URL-safe base64-encoded JSON object. Clients MUST treat it as opaque; the structure below is documented only for debugging and future compatibility.
 
 For sort=icp_desc:
 
@@ -156,7 +159,7 @@ Copy code
   "verified_at": "2025-11-01T15:24:16Z",
   "person_id": 123
 }
-This JSON is encoded via base64.urlsafe_b64encode (no padding changes required; server will handle padding if missing).
+This JSON is encoded via base64.urlsafe_b64encode. The server will restore padding if missing.
 
 Server behavior:
 
@@ -168,9 +171,9 @@ May be eligible for caching (O15).
 
 If cursor is present:
 
-Decodes cursor.
+Decodes the cursor.
 
-Validates that sort in the cursor matches the requested sort (or the default icp_desc if none specified).
+Validates that sort in the cursor matches the requested sort (or default icp_desc).
 
 Applies the appropriate keyset predicate.
 
@@ -200,6 +203,8 @@ Copy code
       "tech": ["salesforce", "hubspot"],
       "icp_score": 87,
       "verify_status": "valid",
+      "verify_label": "valid_native_primary",
+      "is_primary_for_person": true,
       "verified_at": "2025-11-01T15:24:16Z",
       "source": "generated",
       "source_url": "https://example.com/team/alice"
@@ -262,6 +267,8 @@ company_size	string | null	Size bucket (e.g. 1-10, 11-50, 51-200, 201-500, 500+)
 tech	string[]	List of tech keywords for the company (from companies.attrs.tech_keywords).
 icp_score	integer | null	ICP score (0–100) from R14.
 verify_status	string | null	Canonical verify status from R18 (valid, risky_catch_all, invalid, unknown_timeout, etc.).
+verify_label	string | null	O26 verification label. Common values: valid_native_primary, valid_native_alternate, valid_catchall_tested_primary, valid_catchall_tested_alternate, plus non-valid labels (invalid, risky_catch_all, unknown_timeout, unknown). See §5.4.
+is_primary_for_person	boolean | null	O26 primary/alternate flag. true for the canonical primary valid email for a person, false for other emails for that person, null/absent when no valid primary exists for that person.
 verified_at	string | null	ISO 8601 timestamp when verification last ran for this email (UTC, ...Z).
 source	string | null	Lead origin, typically published (R11 extraction) or generated (R12 permutations).
 source_url	string | null	Provenance URL (page where the email was found, or a canonical company/person URL).
@@ -312,9 +319,52 @@ For icp_bucket, the server uses fixed buckets:
 
 0-39, 40-59, 60-79, 80-100.
 
-Values with count = 0 are omitted.
+Values with count = 0 are omitted. Null values are omitted (e.g. leads missing that attribute).
 
-Null values are omitted (e.g. leads missing that attribute).
+5.4 Verification labels (O26)
+verify_label is a derived, second-dimension label on top of verify_status. It lets clients distinguish:
+
+Native vs catch-all-tested valids.
+
+Primary vs alternate emails for the same person.
+
+Common values:
+
+For valid emails:
+
+valid_native_primary – native valid, chosen as the canonical primary email for this person.
+
+valid_native_alternate – native valid, but secondary/alternate for this person.
+
+valid_catchall_tested_primary – valid via O26 test-send on a catch-all domain, chosen as primary.
+
+valid_catchall_tested_alternate – valid via O26 test-send, but alternate for this person.
+
+For non-valid statuses:
+
+invalid
+
+risky_catch_all
+
+unknown_timeout
+
+unknown (fallback for any unrecognized combination; should be rare).
+
+is_primary_for_person works in tandem:
+
+When there is at least one valid email for a person:
+
+Exactly one row per person is marked with is_primary_for_person = true.
+
+Other rows for that person have is_primary_for_person = false.
+
+When there are no valid emails for a person:
+
+is_primary_for_person is omitted / null, and verify_label reflects the coarse status (e.g. invalid, risky_catch_all).
+
+Clients that only want “best guess” primary emails can filter on:
+
+verify_status = "valid" AND is_primary_for_person = true.
 
 6. Error responses
 Errors are returned as JSON with an HTTP 4xx/5xx status.
@@ -365,11 +415,13 @@ http
 Copy code
 GET /leads/search?q=sales&verify_status=valid&icp_min=80&limit=25 HTTP/1.1
 Accept: application/json
-Returns at most 25 leads.
+Returns at most 25 leads:
 
 All have verify_status="valid" and icp_score >= 80.
 
 Sorted by icp_desc (default).
+
+Each lead includes verify_label and (for valid leads) is_primary_for_person.
 
 7.2 SaaS sales leadership, recent verification, with facets
 http
@@ -415,7 +467,7 @@ http
 Copy code
 GET /leads/search?q=marketing&icp_min=70&limit=20&cursor=cursor_example_token HTTP/1.1
 Accept: application/json
-Server uses the cursor to continue after the last lead from page 1.
+Server uses the cursor to continue after the last lead from page 1:
 
 page1 and page2 IDs will not overlap.
 
@@ -480,6 +532,7 @@ Per-tenant auth and API keys (R23/R24/R27).
 Richer materialized views and/or external search engines:
 
 O14 introduces a simple lead_search_docs materialized table for facets;
+
 future versions may expand this or mirror into Postgres/Search-as-a-service.
 
 When these are introduced, this document will be extended but existing fields/behavior will remain backward compatible wherever possible.

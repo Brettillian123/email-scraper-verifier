@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from src.api.app import app
 from src.search.backend import SqliteFtsBackend
+from src.verify.labels import VerifyLabel
 
 # ---------------------------------------------------------------------------
 # In-memory DB + TestClient fixtures
@@ -468,3 +469,117 @@ def test_malformed_cursor_returns_400(api_client: TestClient) -> None:
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "invalid_cursor"
+
+
+# ---------------------------------------------------------------------------
+# O26 — verify_label + primary/alternate enrichment tests (API surface)
+# ---------------------------------------------------------------------------
+
+
+def test_api_returns_verify_label_for_single_valid_lead(
+    api_client: TestClient,
+    api_memory_db: SimpleNamespace,
+) -> None:
+    """
+    For a person with a single valid email, /leads/search should surface a
+    primary-native verify_label and is_primary_for_person=True.
+    """
+    db = api_memory_db
+
+    db.seed_lead(
+        full_name="Solo Lead",
+        title="Sales Exec",
+        icp_score=80,
+        email="solo@example.com",
+        verify_status="valid",
+    )
+
+    resp = api_client.get(
+        "/leads/search",
+        params={
+            "q": "sales",
+            "sort": "icp_desc",
+            "limit": "10",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    results = body["results"]
+
+    assert len(results) == 1
+    row = results[0]
+
+    assert row["email"] == "solo@example.com"
+    assert row["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
+    assert row["is_primary_for_person"] is True
+
+
+def test_api_primary_and_alternate_labels_for_multiple_valids(
+    api_client: TestClient,
+    api_memory_db: SimpleNamespace,
+) -> None:
+    """
+    When a person has multiple valid emails, /leads/search should expose a
+    single primary and mark the others as alternates via verify_label and
+    is_primary_for_person.
+    """
+    db = api_memory_db
+
+    # First email: human-looking pattern, e.g. brett.anderson@...
+    person_id = db.seed_lead(
+        full_name="Brett Anderson",
+        title="Sales Exec",
+        icp_score=80,
+        email="brett.anderson@example.com",
+        verify_status="valid",
+        source="generated",
+    )
+
+    # Second email: role-like address for the same person.
+    db.conn.execute(
+        """
+        INSERT INTO v_emails_latest (
+          person_id,
+          email,
+          source,
+          source_url,
+          verify_status,
+          verified_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            person_id,
+            "info@example.com",
+            "generated",
+            "https://example.test/source2",
+            "valid",
+            "2025-01-02 00:00:00",
+        ),
+    )
+
+    resp = api_client.get(
+        "/leads/search",
+        params={
+            "q": "sales",
+            "sort": "icp_desc",
+            "limit": "10",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    results = body["results"]
+
+    # We expect two results for the same person (one primary, one alternate).
+    emails = {r["email"] for r in results}
+    assert emails == {"brett.anderson@example.com", "info@example.com"}
+
+    by_email = {r["email"]: r for r in results}
+    primary = by_email["brett.anderson@example.com"]
+    alternate = by_email["info@example.com"]
+
+    assert primary["is_primary_for_person"] is True
+    assert alternate["is_primary_for_person"] is False
+
+    assert primary["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
+    assert alternate["verify_label"] == VerifyLabel.VALID_NATIVE_ALTERNATE

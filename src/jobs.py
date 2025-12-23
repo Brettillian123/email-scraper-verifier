@@ -7,7 +7,7 @@ from rq import Queue, Retry
 
 from src.config import load_settings
 from src.queueing.redis_conn import get_redis
-from src.queueing.tasks import task_generate_emails
+from src.queueing.tasks import task_generate_emails, task_send_test_email
 
 _cfg = load_settings()
 
@@ -103,6 +103,38 @@ def maybe_enqueue_generation(
     if not (domain or "").strip():
         return None
     return enqueue_generate_emails(person_id, first or "", last or "", domain or "")
+
+
+# ------------------------------
+# O26: test-send / bounce helpers
+# ------------------------------
+
+
+def enqueue_test_send_email(
+    verification_result_id: int,
+    email: str,
+    token: str,
+):
+    """
+    Enqueue the O26 test-send job for bounce-based verification.
+
+    The worker task is responsible for:
+      - Sending a minimal test email to `email`,
+      - Using an envelope sender like bounce+{token}@yourdomain.com,
+      - Calling src.verify.test_send.mark_test_send_sent(...) on success.
+
+    Queue selection:
+      - Uses the 'test_send' queue if configured in settings.queues.test_send,
+      - Otherwise falls back to the default queue.
+    """
+    q = get_queue(_queue_name_for("test_send"))
+    return q.enqueue(
+        task_send_test_email,
+        verification_result_id,
+        email,
+        token,
+        retry=default_retry(),
+    )
 
 
 # ---- Demo/test jobs ----

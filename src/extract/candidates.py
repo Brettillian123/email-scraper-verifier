@@ -1,7 +1,21 @@
-# src/extract/candidates.py
+"""
+R11 / O05 — HTML candidate extractor (broad, AI-refiner friendly).
+
+Given an HTML document, try to find:
+  - email addresses that plausibly belong to the target org
+  - any nearby human-looking name (when available)
+  - lightweight context around the email
+
+and return a list of Candidate objects.
+
+This stage is now intentionally higher-recall: we keep most on-domain
+emails and attach light metadata, then let the AI refiner (O27) decide
+which rows are real people. We still apply a few hard guards to avoid
+obvious garbage (wrong domains, clearly non-email strings, etc.).
+"""
+
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -10,26 +24,36 @@ from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from .stopwords import NAME_STOPWORDS
+
 # --- Public data model -------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class Candidate:
     """
-    A high-confidence person/email candidate extracted from HTML.
+    A candidate email + optional person-ish metadata extracted from HTML.
 
     Fields:
-      - email: normalized email address (lowercased)
-      - first_name / last_name: optional parsed names when confidently available
+      - email: normalized email address (lowercased) when available, else None
       - source_url: the page where the candidate was found
+      - first_name / last_name: optional parsed names when confidently available
       - raw_name: the raw name text captured before normalization/splitting
+      - title: optional nearby title/role text (not yet populated by R11)
+      - source_type: rough type of HTML source (e.g., "mailto_link", "link", "text")
+      - context_snippet: small snippet of nearby text for AI to reason about
+      - is_role_address_guess: True when the local-part looks like a role/alias
     """
 
-    email: str
+    email: str | None
     source_url: str
     first_name: str | None = None
     last_name: str | None = None
     raw_name: str | None = None
+    title: str | None = None
+    source_type: str | None = None
+    context_snippet: str | None = None
+    is_role_address_guess: bool = False
 
 
 # --- Heuristics & regexes ----------------------------------------------------
@@ -39,538 +63,858 @@ EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Splitters for "Name — Title" or "Name | Title", etc.
-NAME_SPLIT_RE = re.compile(r"\s*[–—\-|,]\s+")
-
-# Elements whose visible text we scan for plain emails
-TEXTY_TAGS = {"a", "p", "li", "div", "address", "footer", "td", "th"}
-
-# Ignore these containers entirely
-SKIP_CONTAINERS = {"script", "style", "noscript", "template"}
-
-# Aliases / role mailboxes to skip entirely
-ROLE_ALIASES = {
+# Very generic localparts that are almost always role/placeholder inboxes.
+ROLE_ALIASES: set[str] = {
     "info",
-    "sales",
-    "press",
-    "support",
     "contact",
-    "careers",
-    # conservative extras that frequently show up as role mailboxes
     "hello",
     "hi",
+    "support",
     "help",
-    "jobs",
-    "hr",
-    "team",
-    "admin",
-    "office",
+    "success",
+    "customersuccess",
+    "cs",
+    "sales",
     "marketing",
-    "billing",
-    "inquiries",
+    "growth",
+    "press",
+    "media",
     "pr",
+    "jobs",
+    "job",
+    "careers",
+    "career",
+    "hiring",
+    "recruiting",
+    "recruiter",
+    "talent",
+    "hr",
+    "billing",
+    "payments",
+    "invoices",
+    "accounts",
+    "accounting",
+    "finance",
+    "legal",
+    "privacy",
+    "security",
+    "abuse",
+    "postmaster",
+    "webmaster",
+    "admin",
+    "administrator",
+    "root",
+    "system",
+    "no-reply",
+    "noreply",
+    "donotreply",
+    "newsletter",
+    "news",
+    "updates",
+    "alerts",
+    "notifications",
+    "notify",
+    "bounce",
+    "mailer-daemon",
+    "team",
+    "office",
+    "partners",
+    "partner",
+    "founders",
+    "founder",
+    "example",  # treat example@ as a placeholder/role inbox
 }
 
-TOKEN_BLACKLIST = ROLE_ALIASES | {"it"}
+# Tokens that usually indicate a business concept/section rather than a person.
+_NON_NAME_TOKENS: set[str] = {
+    "executive",
+    "talent",
+    "building",
+    "deliver",
+    "delivery",
+    "pipeline",
+    "revenue",
+    "growth",
+    "demand",
+    "solutions",
+    "solution",
+    "ventures",
+    "capital",
+    "partners",
+    "partner",
+    "group",
+    "agency",
+    "studio",
+    "media",
+    "services",
+    "service",
+    "consulting",
+    "advisors",
+    "advisory",
+    "operations",
+    "success",
+    "customer",
+    "clients",
+    "accounts",
+    "accounting",
+    "leadership",
+    "management",
+    "team",
+    "office",
+    "board",
+    "committee",
+    "council",
+}
 
-# Token must be at least this long to be considered "namey"
-MIN_NAME_TOKEN_LEN = 2
+# Common name suffixes we should ignore when counting tokens
+_NAME_SUFFIXES: set[str] = {
+    "jr",
+    "sr",
+    "ii",
+    "iii",
+    "iv",
+    "cpa",
+    "mba",
+    "phd",
+    "esq",
+}
 
-# O05 (optional): de-obfuscation is behind a flag; enable only where policies/ToS allow.
-# NOTE: We intentionally DO NOT read the env var at import time. Tests (and callers)
-# may set it dynamically; we consult it at call time via _should_deobfuscate().
+# Extra "this is clearly not a person" words for generation purposes.
+# We start with the global NAME_STOPWORDS loaded from name_stopwords.txt,
+# and add a handful of very specific extras that may not appear there.
+GENERATION_NAME_STOPWORDS: set[str] = set(NAME_STOPWORDS) | {
+    # generic non-person / section words
+    "welcome",
+    "team",
+    "office",
+    "info",
+    "support",
+    "example",
+    "contact",
+    "admin",
+    "marketing",
+    "billing",
+    "hello",
+    "hi",
+    "building",
+    "deliver",
+    "delivery",
+    "executive",
+    "executives",
+    "talent",
+    "solution",
+    "solutions",
+    "partner",
+    "partners",
+    "growth",
+    "strategy",
+    "strategic",
+    "turnaround",
+    "restructuring",
+    "pricing",
+    "price",
+    "resources",
+    "resource",
+    "service",
+    "services",
+    "company",
+    "about",
+    "blog",
+    "careers",
+    "leadership",
+    # navigation / section labels (Brandt + generic)
+    "home",
+    "our",
+    "firm",
+    "disclaimers",
+    "privacy",
+    "policy",
+    "documents",
+    "document",
+    "payroll",
+    "contractor",
+    "testimonials",
+    "testimonial",
+    "more",
+    "payment",
+    "payments",
+    "links",
+    "link",
+    "useful",
+    "login",
+    "log",
+    "in",
+    "out",
+    # generic service / category words
+    "individual",
+    "business",
+    "preparation",
+    "tax",
+    "bookkeeping",
+    "clients",
+    "client",
+    # degrees / credentials / titles (we treat as non-name tokens)
+    "cpa",
+    "mba",
+    "esq",
+    "phd",
+    "md",
+    "jd",
+    "certified",
+    "public",
+    "accountant",
+    "advisor",
+    "advisors",
+    "manager",
+    "director",
+    "principal",
+    "owner",
+    "founder",
+    # Crestwell-specific marketing/tagline words we've seen
+    "ambitious",
+    "efficient",
+    "dedicated",
+    "specialized",
+    "expertise",
+    "fractional",
+    "readiness",
+    "quiz",
+    "founderled",
+    "founder-led",
+    "process",
+    "how",
+    "works",
+    "take",
+    "book",
+    "call",
+    "option",
+    "options",
+    "faq",
+    "terms",
+    # LinkedIn pseudo-person
+    "linkedin",
+    "view",
+    # Community Advisor pseudo-person
+    "community",
+}
 
-# De-obfuscation components, e.g. "john [at] acme [dot] com", "mary (at) acme dot co dot uk"
-_OB_AT = r"(?:@|\[at\]|\(at\)|\sat\s| at )"
-_OB_DOT = r"(?:\.|\[dot\]|\(dot\)|\sdot\s| dot )"
-_OB_EMAIL = re.compile(
-    rf"""
-    (?P<local>[A-Za-z0-9._%+\-]+)
-    \s*{_OB_AT}\s*
-    (?P<domain>[A-Za-z0-9\-]+(?:\s*{_OB_DOT}\s*[A-Za-z0-9\-]+)+)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
+# Tokens that are common degree / credential suffixes on names.
+_NAME_DEGREES: set[str] = {
+    "cpa",
+    "mba",
+    "phd",
+    "md",
+    "esq",
+    "jd",
+    "llm",
+    "llb",
+    "cfa",
+    "cma",
+    "cisa",
+    "pe",
+}
+
+# Used by some simple quick checks in other modules
+_NAME_SHAPE_RE = re.compile(r"^[A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,3}$")
 
 
-def _is_role_alias_email(email: str) -> bool:
+# =============================================================================
+# ISSUE 2 FIX: Unicode escape decoder for emails from JSON/JS
+# =============================================================================
+
+# Pattern to match uXXXX at the start of a string (without backslash)
+_UNICODE_ESCAPE_START_RE = re.compile(r"^u([0-9a-fA-F]{4})")
+
+
+def _decode_unicode_escapes(s: str) -> str:
     """
-    Return True if the email's local-part matches a known role/distribution alias.
+    Decode Unicode escape sequences that appear in extracted emails.
+
+    Handles two cases:
+    1. Proper escapes: \\u003e -> >
+    2. Broken escapes: u003e at start of string -> >
+
+    This fixes emails extracted from inline JSON/JavaScript where
+    characters like < and > are Unicode-escaped.
+
+    Examples:
+        "u003ehr@outreach.io" -> "hr@outreach.io"
+        "\\u003chr@outreach.io" -> "<hr@outreach.io" -> "hr@outreach.io"
     """
-    try:
-        local = email.split("@", 1)[0].lower()
-    except Exception:
+    if not s:
+        return s
+
+    # Case 1: Handle proper \uXXXX escapes (backslash present)
+    if "\\u" in s:
+        try:
+            s = s.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+
+    # Case 2: Handle "uXXXX" without backslash at START of string
+    # This catches cases like "u003ehr@domain.com" -> ">hr@domain.com"
+    # Loop in case there are multiple (unlikely but defensive)
+    max_iterations = 5  # Prevent infinite loop
+    for _ in range(max_iterations):
+        match = _UNICODE_ESCAPE_START_RE.match(s)
+        if not match:
+            break
+        try:
+            char = chr(int(match.group(1), 16))
+            s = char + s[5:]  # Replace uXXXX with the character
+        except Exception:
+            break
+
+    # Strip any decoded < or > characters from edges (these are HTML artifacts)
+    s = s.strip("<>").strip()
+
+    return s
+
+
+# --- Internal helpers (also used by demo_autodiscovery.py) -------------------
+
+
+def normalize_generated_name(raw: str) -> str | None:
+    """
+    Take a heading like 'BRITTANY BRANDT, CPA' or 'CERTIFIED PUBLIC ACCOUNTANT'
+    and either:
+      - return a cleaned person name like 'Brittany Brandt', or
+      - return None if it's not a real person (Our Firm, Useful Links, etc).
+    """
+    if not raw:
+        return None
+
+    # Normalize whitespace + strip weird characters but keep letters, spaces, and comma
+    cleaned = re.sub(r"[^A-Za-z ,]+", " ", raw)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return None
+
+    # If there is a comma, almost always "Name, CPA/MBA/..." → keep the left part
+    if "," in cleaned:
+        cleaned, _ = cleaned.split(",", 1)
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return None
+
+    words = cleaned.split()
+    if not words:
+        return None
+
+    kept: list[str] = []
+    for w in words:
+        wl = w.lower()
+        # Drop obvious non-name tokens
+        if wl in GENERATION_NAME_STOPWORDS:
+            continue
+        if len(wl) <= 1:
+            continue
+        if not wl.isalpha():
+            continue
+        kept.append(w.title())
+
+    # Require at least first + last name to consider this a "real person"
+    if len(kept) < 2:
+        return None
+
+    return " ".join(kept)
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_punctuation(text: str) -> str:
+    # Keep apostrophes and hyphens, drop trailing commas, pipes, etc.
+    return text.strip(" \t\r\n,;:|/·•")
+
+
+def _is_concepty_token(tok: str) -> bool:
+    t = tok.lower()
+    if t in _NON_NAME_TOKENS or t in NAME_STOPWORDS:
+        return True
+    # Common endings for abstract/business nouns
+    if len(t) >= 6 and (
+        t.endswith("ing")
+        or t.endswith("ment")
+        or t.endswith("tion")
+        or t.endswith("sion")
+        or t.endswith("ship")
+        or t.endswith("ness")
+    ):
+        return True
+    # Obvious abbreviations / entities
+    if t in {"llc", "inc", "ltd", "corp", "co", "gmbh", "sa", "plc", "srl"}:
+        return True
+    return False
+
+
+def _looks_human_name(text: str) -> bool:
+    """
+    Very conservative "is this string plausibly a human full name?" check.
+
+    Goals:
+      - Accept: "Brett Anderson", "BRITTANY BRANDT, CPA", "Ana-Maria O'Neil"
+      - Reject: "Executive Talent", "Our Firm", "Useful Links", "Log In",
+                "Certified Public Accountant", "Accountant and Tax Advisor"
+    """
+    if not text:
         return False
-    return local in ROLE_ALIASES
 
+    s = _normalize_space(text)
+    if not s:
+        return False
 
-# --- Env helpers for de-obfuscation -----------------------------------------
+    # Quick hard guards
+    if "@" in s:
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
 
+    # Strip any emails that slipped into the label
+    s = EMAIL_RE.sub(" ", s)
 
-def _truthy_env(name: str, default: bool = False) -> bool:
-    """
-    Return True iff the env var is one of: 1, true, yes, on (case-insensitive).
-    """
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "on"}
+    # Strip obvious trailing sections like "- VP Sales" or "| Sales"
+    s = re.split(r"[|/·•]", s, maxsplit=1)[0]
+    s = re.split(r"\s+-\s+", s, maxsplit=1)[0]
+    s = re.split(r"\s+–\s+", s, maxsplit=1)[0]
+    s = _strip_punctuation(s)
 
+    raw_tokens = [t for t in s.split() if t]
+    # We want "First Last" or "First Middle Last" + optional suffix (CPA, MBA)
+    if len(raw_tokens) < 2 or len(raw_tokens) > 5:
+        return False
 
-def _should_deobfuscate(explicit: bool | None) -> bool:
-    """
-    If caller provided a bool, use it; otherwise consult EXTRACT_DEOBFUSCATE at runtime.
-    """
-    if explicit is not None:
-        return bool(explicit)
-    return _truthy_env("EXTRACT_DEOBFUSCATE", default=False)
+    core_tokens: list[str] = []
+    name_like_count = 0  # tokens that look like actual name parts
 
-
-# --- Public API --------------------------------------------------------------
-
-
-def extract_candidates(
-    html: str,
-    source_url: str,
-    official_domain: str | None = None,
-    *,
-    deobfuscate: bool | None = None,
-) -> list[Candidate]:
-    """
-    Extract (email, first_name, last_name, source_url[, raw_name]) records
-    from an HTML document.
-
-    Extraction order:
-      1) mailto: links (high precision)
-      2) conservative regex inside typical contact/person blocks
-      3) cautious fallback name inference from email local-part
-      4) (O05 when enabled) de-obfuscated patterns in page text
-
-    Filtering:
-      - If `official_domain` is provided, only return emails whose domain is the
-        same domain or a subdomain of it (strict-to-org default).
-
-    Dedup:
-      - Dedup in-memory by email; prefer candidates that have a human name.
-    """
-    soup = BeautifulSoup(html or "", "html.parser")
-
-    by_email: dict[str, Candidate] = {}
-
-    # 0) (O05) De-obfuscation pass over full page text — only when enabled
-    use_deob = _should_deobfuscate(deobfuscate)
-    if use_deob:
-        page_text = soup.get_text(" ", strip=True)
-        for email in _scan_deobfuscated_emails(page_text):
-            if _is_role_alias_email(email):
-                continue
-            if not _in_scope(email, official_domain):
-                continue
-            cand = _candidate_with_best_name(email, None, source_url)
-            _insert_or_upgrade(by_email, cand)
-
-    # 1) mailto: links (most precise)
-    for email, name_guess in _scan_mailto_links(soup):
-        if _is_role_alias_email(email):  # drop role/distribution addresses
-            continue
-        if not _in_scope(email, official_domain):
-            continue
-        cand = _candidate_with_best_name(email, name_guess, source_url)
-        _insert_or_upgrade(by_email, cand)
-
-    # 2) plain text emails inside texty blocks
-    for email, ctx_name in _scan_text_blocks(soup):
-        if _is_role_alias_email(email):  # drop role/distribution addresses
-            continue
-        if not _in_scope(email, official_domain):
-            continue
-        cand = _candidate_with_best_name(email, ctx_name, source_url)
-        _insert_or_upgrade(by_email, cand)
-
-    return list(by_email.values())
-
-
-# --- Core scanners -----------------------------------------------------------
-
-
-def _scan_mailto_links(soup: BeautifulSoup) -> Iterator[tuple[str, str | None]]:
-    """
-    Yield (email, name_text) pairs from <a href="mailto:...">.
-    If the link text is just the email, name_text may be None.
-    """
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        if not href.lower().startswith("mailto:"):
+    for tok in raw_tokens:
+        tok_clean = _strip_punctuation(tok)
+        if not tok_clean:
             continue
 
-        raw = href[len("mailto:") :]
-        raw = raw.split("?")[0]  # strip query (subject, cc, etc.)
-        raw = unquote(raw)
+        low = tok_clean.lower()
 
-        # mailto may contain comma-separated addresses
-        for addr in (t.strip() for t in raw.split(",") if t.strip()):
-            m = EMAIL_RE.search(addr)
-            if not m:
-                continue
-            email = m.group(0).lower()
-
-            # Try to extract a human-looking name from link text or nearby labels
-            link_text = (a.get_text(" ", strip=True) or "").strip()
-            name_text = _extract_name_from_link_or_context(a, link_text, email)
-
-            yield email, name_text
-
-
-def _scan_text_blocks(soup: BeautifulSoup) -> Iterator[tuple[str, str | None]]:
-    """
-    Scan typical text containers and yield (email, nearby_name_guess).
-    We avoid scanning script/style/noscript/template.
-    """
-    for el in soup.find_all(TEXTY_TAGS):
-        if _is_inside_skip_container(el):
-            continue
-        # Avoid double-counting mailto anchors here
-        if el.name == "a":
+        # Ignore simple suffixes when counting tokens (Jr, Sr, II, III, IV, CPA, MBA, etc.).
+        if low in _NAME_SUFFIXES:
             continue
 
-        text = el.get_text(" ", strip=True)
-        if not text:
+        # Treat stopwords / concept tokens as non-name words, but do NOT
+        # immediately reject the whole string; we'll require that at least
+        # 2 tokens are *not* in these sets.
+        if low in GENERATION_NAME_STOPWORDS or low in _NON_NAME_TOKENS:
+            core_tokens.append(tok_clean)
             continue
 
-        # Decode HTML entities so patterns like "bob&#64;acme.com" become "bob@acme.com"
-        text = unescape(text)
+        # Normalize all-caps names to title case:
+        if tok_clean.isupper() and len(tok_clean) > 3:
+            tok_norm = tok_clean.title()
+        else:
+            tok_norm = tok_clean
 
-        for m in EMAIL_RE.finditer(text):
-            email = m.group(0).lower()
-            # Try to find a nearby label (strong/h* sibling or parent context)
-            nearby_name = _nearest_label_name(el)
-            yield email, nearby_name
+        # Basic charset / shape check: letters + ' . -
+        if not re.match(r"^[A-Za-z][A-Za-z'.-]*$", tok_norm):
+            return False
+
+        # Strong bias toward title-case: "Brett", "Anderson"
+        if not tok_norm[0].isupper():
+            return False
+
+        core_tokens.append(tok_norm)
+        name_like_count += 1
+
+    # After removing suffixes and non-name words, we want at least 2 "real"
+    # name-like tokens (e.g., first + last).
+    if name_like_count < 2:
+        return False
+
+    # And we still don't want absurdly long phrases after stripping suffixes.
+    if len(core_tokens) > 4:
+        return False
+
+    return True
 
 
-def _scan_deobfuscated_emails(text: str) -> list[str]:
+def _split_first_last(full_name: str) -> tuple[str | None, str | None]:
     """
-    (O05) Find obfuscated emails like "name [at] acme [dot] com" within plain text.
-    Also benefits from HTML entity unescaping to catch things like "user&#64;example.com".
+    Simple first/last splitter.
+
+    Keeps everything after the first token in last_name so we can preserve
+    middle names and multi-word surnames.
     """
-    txt = unescape(text or "")
-    found: set[str] = set()
-
-    for m in _OB_EMAIL.finditer(txt):
-        local = (m.group("local") or "").strip()
-        domain = _normalize_obfuscated_domain(m.group("domain") or "")
-        if not local or not domain:
-            continue
-        email = f"{local}@{domain}".lower()
-        # Validate with our standard email regex to avoid oddities
-        if EMAIL_RE.fullmatch(email):
-            found.add(email)
-
-    # A light extra pass: after unescape, the standard regex will catch any plain emails
-    # that were previously encoded (e.g., "&#64;"). We only add what wasn't already added.
-    for m in EMAIL_RE.finditer(txt):
-        found.add(m.group(0).lower())
-
-    return sorted(found)
-
-
-def _normalize_obfuscated_domain(dom_s: str) -> str:
-    """Turn 'acme [dot] co [dot] uk' → 'acme.co.uk' and remove stray spaces."""
-    s = re.sub(_OB_DOT, ".", dom_s, flags=re.IGNORECASE)
-    return re.sub(r"\s+", "", s)
-
-
-# --- Context/name helpers ----------------------------------------------------
-
-
-def _extract_name_from_link_or_context(a: Tag, link_text: str, email: str) -> str | None:
-    """
-    Decide the best raw name to associate with an email found in an anchor.
-    Preference order:
-      - Link text, if not the email itself and looks like a name (optionally split off titles)
-      - A nearest label: strong/b/h* sibling or within the same card/row
-      - None
-    """
-    if link_text and link_text.lower() != email:
-        candidate = _choose_name_piece(link_text)
-        if _looks_human_name(candidate):
-            return candidate
-
-    # Try nearest labels if link text is the email or not name-like
-    # 1) previous siblings like <strong>, <b>, headings
-    for sib in a.previous_siblings:
-        if isinstance(sib, Tag) and sib.name in {"strong", "b", "h1", "h2", "h3", "h4", "h5", "h6"}:
-            t = sib.get_text(" ", strip=True)
-            candidate = _choose_name_piece(t)
-            if _looks_human_name(candidate):
-                return candidate
-        if isinstance(sib, NavigableString):
-            t = str(sib).strip()
-            if t:
-                candidate = _choose_name_piece(t)
-                if _looks_human_name(candidate):
-                    return candidate
-
-    # 2) labels within the same parent
-    parent = a.parent
-    if isinstance(parent, Tag):
-        # Prefer strong/b/headings within the same block
-        for label in parent.find_all({"strong", "b", "h1", "h2", "h3", "h4", "h5", "h6"}, limit=3):
-            t = label.get_text(" ", strip=True)
-            candidate = _choose_name_piece(t)
-            if _looks_human_name(candidate):
-                return candidate
-
-        # Fallback: use parent text without the email itself
-        pt = parent.get_text(" ", strip=True).replace(email, "").strip()
-        candidate = _choose_name_piece(pt)
-        if _looks_human_name(candidate):
-            return candidate
-
-    return None
-
-
-def _nearest_label_name(node: Tag) -> str | None:
-    """
-    From a general text node containing an email, try to find a nearby label that
-    reads like a person's name (e.g., a bold/heading sibling or parent).
-    """
-    # 1) immediate strong/b/heading children
-    if isinstance(node, Tag):
-        for label in node.find_all({"strong", "b", "h1", "h2", "h3", "h4", "h5", "h6"}, limit=3):
-            t = label.get_text(" ", strip=True)
-            candidate = _choose_name_piece(t)
-            if _looks_human_name(candidate):
-                return candidate
-
-    # 2) previous siblings text
-    for sib in node.previous_siblings:
-        if isinstance(sib, Tag) and sib.name in {"strong", "b"} | {f"h{i}" for i in range(1, 7)}:
-            t = sib.get_text(" ", strip=True)
-            candidate = _choose_name_piece(t)
-            if _looks_human_name(candidate):
-                return candidate
-        if isinstance(sib, NavigableString):
-            t = str(sib).strip()
-            candidate = _choose_name_piece(t)
-            if _looks_human_name(candidate):
-                return candidate
-
-    # 3) parent context
-    parent = node.parent
-    if isinstance(parent, Tag):
-        t = parent.get_text(" ", strip=True)
-        candidate = _choose_name_piece(t)
-        if _looks_human_name(candidate):
-            return candidate
-
-    return None
+    s = _normalize_space(full_name)
+    if not s:
+        return None, None
+    parts = s.split()
+    if len(parts) == 1:
+        return parts[0], None
+    return parts[0], " ".join(parts[1:])
 
 
 def _choose_name_piece(text: str) -> str:
     """
-    If the text includes both name and title separated by a common separator,
-    return the leading piece that is most likely the name.
+    From a noisy label like:
+
+        "Brett Anderson – VP Sales"
+        "Brett Anderson, VP Sales"
+        "VP Sales – Brett Anderson"
+
+    try to pick the part that looks like a human name.
+
+    Returns "" if we don't find a plausible name segment.
     """
     if not text:
         return ""
-    # Remove embedded emails from the label text
-    text = EMAIL_RE.sub("", text).strip()
 
-    # Split on common separators and pick the earliest "human-like" piece
-    parts = [p.strip() for p in NAME_SPLIT_RE.split(text) if p.strip()]
-    for p in parts:
-        if _looks_human_name(p):
-            return p
-    # If none look clearly human, return the first chunk (may be empty)
-    return parts[0] if parts else ""
+    t = unescape(text)
+    t = _normalize_space(t)
+
+    # Strip email addresses out of the text entirely.
+    t = EMAIL_RE.sub(" ", t)
+
+    # Split on hard separators first: pipes, slashes, bullets
+    segments: list[str] = []
+    for seg in re.split(r"[|/·•]", t):
+        seg = seg.strip()
+        if not seg:
+            continue
+        segments.append(seg)
+
+    candidates: list[str] = []
+
+    for seg in segments:
+        # Within each segment, split on commas and dashes.
+        pieces = re.split(r"[,;/]", seg)
+        more: list[str] = []
+        for p in pieces:
+            more.extend(re.split(r"\s+-\s+|\s+–\s+", p))
+        if not more:
+            more = [seg]
+
+        for piece in more:
+            piece = _strip_punctuation(piece)
+            if not piece:
+                continue
+            if _looks_human_name(piece):
+                candidates.append(piece)
+
+    if candidates:
+        # Prefer the earliest name-y piece.
+        return candidates[0]
+
+    # No strong candidate → as a last resort, if *entire* string looks like a
+    # name, take it; otherwise, return empty so callers can treat as "no name".
+    if _looks_human_name(t):
+        return t
+
+    return ""
 
 
-def _looks_human_name(text: str | None) -> bool:
+def _normalize_email(raw: str) -> str | None:
     """
-    Very conservative check: looks like 1–3 tokens, alphabetic with min length.
+    Extract and normalize an email from a string like:
+      "mailto:brett.anderson@crestwellpartners.com?subject=Hello"
+
+    Also handles Unicode-escaped emails from JSON/JS like:
+      "u003ehr@outreach.io" -> "hr@outreach.io"
     """
-    if not text:
-        return False
-    tokens = _name_tokens(text)
-    if not (1 <= len(tokens) <= 3):
-        return False
-    # Avoid pure roles/titles
-    lowered = [t.lower() for t in tokens]
-    if any(t in TOKEN_BLACKLIST for t in lowered):
-        return False
-    return all(_is_namey_token(t) for t in tokens)
-
-
-def _is_namey_token(tok: str) -> bool:
-    # Accept hyphens and apostrophes within tokens
-    core = tok.replace("-", "").replace("’", "").replace("'", "")
-    return core.isalpha() and len(core) >= MIN_NAME_TOKEN_LEN
-
-
-def _name_tokens(text: str) -> list[str]:
-    # Compact whitespace and split; drop empty tokens
-    text = re.sub(r"\s+", " ", text.strip())
-    return [t for t in text.split(" ") if t]
-
-
-def _localpart_to_name(local: str) -> tuple[str, str, str] | None:
-    """
-    Cautious fallback: infer (raw_name, first, last) from the email local-part.
-    - Split on dot/underscore/hyphen
-    - Drop short and blacklisted tokens
-    - Require at least two tokens that look like names
-    """
-    if local in ROLE_ALIASES:
+    if not raw:
         return None
 
-    raw_tokens = re.split(r"[._\-]+", local)
-    tokens = [t for t in raw_tokens if _is_namey_token(t) and t.lower() not in TOKEN_BLACKLIST]
+    # ISSUE 2 FIX: Decode Unicode escapes first
+    s = _decode_unicode_escapes(raw)
 
-    if len(tokens) < 2:
+    s = unquote(s).strip()
+    # Strip mailto:
+    if s.lower().startswith("mailto:"):
+        s = s[7:]
+    # Drop query params
+    s = s.split("?", 1)[0].strip()
+
+    # ISSUE 2 FIX: Strip any remaining < or > from edges
+    s = s.strip("<>").strip()
+
+    m = EMAIL_RE.search(s)
+    if not m:
         return None
-
-    # Keep at most two tokens (first, last)
-    first_raw, last_raw = tokens[0], tokens[1]
-    first, last = _smart_titlecase(first_raw), _smart_titlecase(last_raw)
-    raw_name = f"{first} {last}"
-    return raw_name, first, last
+    return m.group(0).lower()
 
 
-def _smart_titlecase(word: str) -> str:
+def _same_org(email_domain: str, official_domain: str | None, source_url: str) -> bool:
     """
-    Title-case with light handling of common surname patterns:
-    - O'Connor, O’Malley
-    - McDonald, MacDonald (keep simple 'Mc' rule)
+    Decide whether an email domain is plausibly "part of" the target org.
+
+    - If official_domain is provided, require exact or subdomain match.
+    - Otherwise, fall back to matching the source_url host.
     """
-    if not word:
-        return word
+    edom = email_domain.lower()
+    if official_domain:
+        base = official_domain.lower()
+        return edom == base or edom.endswith("." + base)
 
-    w = word.lower()
-
-    # O' / O’ prefix
-    if w.startswith("o'") and len(w) > 2:
-        return "O'" + w[2:].capitalize()
-    if w.startswith("o’") and len(w) > 2:
-        return "O’" + w[2:].capitalize()
-
-    # Mc prefix
-    if w.startswith("mc") and len(w) > 2:
-        return "Mc" + w[2:3].upper() + w[3:]
-
-    # Hyphenated parts
-    if "-" in w:
-        return "-".join(_smart_titlecase(p) for p in w.split("-"))
-
-    return w.capitalize()
-
-
-def _split_first_last(raw_name: str) -> tuple[str | None, str | None]:
-    """
-    Split a raw name string into (first, last) applying normalization.
-    Keeps at most two tokens; if only one, last is None.
-    """
-    tokens = _name_tokens(raw_name)
-    if not tokens:
-        return None, None
-    if len(tokens) == 1:
-        return _smart_titlecase(tokens[0]), None
-    first, last = tokens[0], tokens[-1]
-    return _smart_titlecase(first), _smart_titlecase(last)
-
-
-# --- Domain & scope helpers --------------------------------------------------
-
-
-def _in_scope(email: str, official_domain: str | None) -> bool:
-    """
-    If official_domain is provided, restrict to that domain or any subdomain.
-    Otherwise, accept all.
-    """
-    if not official_domain:
-        return True
     try:
-        domain = email.split("@", 1)[1].lower()
+        host = (urlparse(source_url).netloc or "").lower()
     except Exception:
-        return False
-
-    official = official_domain.lower()
-    return domain == official or domain.endswith("." + official)
-
-
-def _is_inside_skip_container(el: Tag) -> bool:
-    parent = el.parent
-    while isinstance(parent, Tag):
-        if parent.name in SKIP_CONTAINERS:
-            return True
-        parent = parent.parent
+        host = ""
+    if not host:
+        return True
+    # Allow simple host/domain match heuristics when we don't know official_domain.
+    if host == edom:
+        return True
+    if host.endswith("." + edom) or edom.endswith("." + host):
+        return True
     return False
 
 
-# --- Candidate assembly / preference ----------------------------------------
-
-
-def _candidate_with_best_name(email: str, raw_name_hint: str | None, source_url: str) -> Candidate:
+def _iter_email_nodes(soup: BeautifulSoup) -> Iterator[tuple[str, Tag | NavigableString]]:
     """
-    Build the richest candidate we can from a hint, else fallback from local-part.
+    Yield (email, node) pairs from:
+      - <a href="mailto:...">
+      - any attribute containing an email
+      - plain text nodes
     """
-    first: str | None = None
-    last: str | None = None
-    raw_name: str | None = None
+    seen: set[str] = set()
 
-    # 1) Try contextual/raw hint (link text / nearby label)
-    if raw_name_hint:
-        raw = _choose_name_piece(raw_name_hint)
-        if _looks_human_name(raw):
-            raw_name = raw
-            first, last = _split_first_last(raw_name)
+    # 1) mailto: links + href attributes
+    for a in soup.find_all("a", href=True):
+        em = _normalize_email(a["href"])
+        if em and em not in seen:
+            seen.add(em)
+            yield em, a
 
-    # 2) Fallback: infer from local-part (e.g., jane.doe@)
-    if not first and not last:
-        local = email.split("@", 1)[0]
-        lp = _localpart_to_name(local)
-        if lp:
-            raw_name, first, last = lp
+        # Sometimes email is in href without mailto:
+        if not em:
+            href_decoded = _decode_unicode_escapes(a["href"])
+            m = EMAIL_RE.search(href_decoded)
+            if m:
+                em2 = m.group(0).lower()
+                if em2 not in seen:
+                    seen.add(em2)
+                    yield em2, a
 
-    return Candidate(
-        email=email.lower().strip(),
-        source_url=source_url,
-        first_name=first,
-        last_name=last,
-        raw_name=raw_name,
-    )
+    # 2) Other attributes
+    for tag in soup.find_all(True):
+        for attr_val in tag.attrs.values():
+            if isinstance(attr_val, str) and "@" in attr_val:
+                # ISSUE 2 FIX: Decode Unicode escapes in attribute values
+                decoded_val = _decode_unicode_escapes(attr_val)
+                for m in EMAIL_RE.finditer(decoded_val):
+                    em = m.group(0).lower()
+                    if em not in seen:
+                        seen.add(em)
+                        yield em, tag
+
+    # 3) Text nodes
+    for node in soup.find_all(string=True):
+        if "@" not in (node or ""):
+            continue
+        text = str(node)
+        # ISSUE 2 FIX: Decode Unicode escapes in text nodes
+        decoded_text = _decode_unicode_escapes(text)
+        for m in EMAIL_RE.finditer(decoded_text):
+            em = m.group(0).lower()
+            if em not in seen:
+                seen.add(em)
+                yield em, node
 
 
-def _insert_or_upgrade(by_email: dict[str, Candidate], cand: Candidate) -> None:
+def _extract_name_near_node(node: Tag | NavigableString) -> str | None:
     """
-    Dedup by email. Prefer the richer record (i.e., the one that has a name).
+    Try a few cheap local-context tricks around the email node to find
+    a human-looking name.
+
+    Priority:
+      1) Text of the parent element (minus the email itself).
+      2) Previous sibling text.
+      3) Previous heading in the same section.
     """
-    existing = by_email.get(cand.email)
-    if existing is None:
-        by_email[cand.email] = cand
-        return
 
-    # If existing has no name but new has, upgrade.
-    existing_has_name = bool(existing.first_name or existing.last_name)
-    new_has_name = bool(cand.first_name or cand.last_name)
+    def clean(txt: str) -> str:
+        return _normalize_space(EMAIL_RE.sub(" ", unescape(txt or "")))
 
-    if new_has_name and not existing_has_name:
-        by_email[cand.email] = cand
-        return
+    # If <a> node or similar, use its text.
+    if isinstance(node, Tag):
+        text = clean(node.get_text(" ", strip=True))
+        piece = _choose_name_piece(text)
+        if piece:
+            return piece
 
-    # If both have names, keep the one with more filled fields (stability)
-    if new_has_name and existing_has_name:
-        existing_fields = int(bool(existing.first_name)) + int(bool(existing.last_name))
-        new_fields = int(bool(cand.first_name)) + int(bool(cand.last_name))
-        if new_fields > existing_fields:
-            by_email[cand.email] = cand
+        # Look at parent
+        parent = node.parent
+        if parent is not None and isinstance(parent, Tag):
+            text = clean(parent.get_text(" ", strip=True))
+            piece = _choose_name_piece(text)
+            if piece:
+                return piece
+
+            # Previous sibling text
+            prev = parent.previous_sibling
+            while isinstance(prev, NavigableString) and not prev.strip():
+                prev = prev.previous_sibling
+            if isinstance(prev, NavigableString):
+                text = clean(str(prev))
+                piece = _choose_name_piece(text)
+                if piece:
+                    return piece
+            elif isinstance(prev, Tag):
+                text = clean(prev.get_text(" ", strip=True))
+                piece = _choose_name_piece(text)
+                if piece:
+                    return piece
+
+            # Walk backwards to find the nearest heading tag
+            for sib in parent.find_all_previous(["h1", "h2", "h3", "h4", "h5", "h6"]):
+                text = clean(sib.get_text(" ", strip=True))
+                piece = _choose_name_piece(text)
+                if piece:
+                    return piece
+
+    # If node is just a NavigableString, see the parent.
+    if isinstance(node, NavigableString):
+        parent = node.parent
+        if isinstance(parent, Tag):
+            text = clean(parent.get_text(" ", strip=True))
+            piece = _choose_name_piece(text)
+            if piece:
+                return piece
+
+    return None
 
 
-# --- Tiny utility (not used externally, but handy for tests) -----------------
+def _local_part_role_like(local: str) -> bool:
+    """
+    Heuristic: does this local-part look like a role/alias inbox?
+    """
+    local_lower = local.lower()
+    if local_lower in ROLE_ALIASES:
+        return True
+    # Also handle e.g. "sales-team", "info_us", "support-emea"
+    stripped = re.sub(r"[^a-z]", "", local_lower)
+    for alias in ROLE_ALIASES:
+        if alias in stripped:
+            return True
+    return False
 
 
-def _domain_of(url: str) -> str:
-    """Extract host from a URL (lowercased), or empty string on failure."""
+def _local_context_snippet(node: Tag | NavigableString) -> str | None:
+    """
+    Build a small context snippet around the email for AI to reason about.
+    """
     try:
-        return (urlparse(url).netloc or "").lower()
+        if isinstance(node, Tag):
+            txt = node.get_text(" ", strip=True)
+        else:
+            txt = str(node)
+        s = _normalize_space(unescape(txt or ""))
+        if not s:
+            return None
+        # Truncate to keep tokens under control.
+        return s[:280]
     except Exception:
-        return ""
+        return None
+
+
+def _source_type_for_node(node: Tag | NavigableString) -> str | None:
+    """
+    Rough source_type tag for diagnostics / AI context.
+    """
+    if isinstance(node, Tag):
+        if node.name == "a":
+            href = (node.get("href") or "").lower()
+            if href.startswith("mailto:"):
+                return "mailto_link"
+            return "link"
+        return node.name
+    return "text"
+
+
+# --- Main API ----------------------------------------------------------------
+
+
+def extract_candidates(
+    html: str,
+    *,
+    source_url: str,
+    official_domain: str | None = None,
+) -> list[Candidate]:
+    """
+    Extract broad (email, optional name, context) candidates from a single HTML page.
+
+    We:
+      - Parse the DOM with BeautifulSoup.
+      - Find emails via attributes + text.
+      - Filter to the same org/domain when official_domain is supplied.
+      - Attach:
+          * is_role_address_guess based on local-part
+          * best-effort human-looking name (when available)
+          * small context snippet and source_type
+
+    We deliberately do **not** try to decide if this is truly a person; that is
+    the AI refiner's job. Downstream code uses:
+      - role/placeholder heuristics to keep role inboxes at company-level, and
+      - AI to filter/normalize person rows.
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Per-page dedup: avoid blasting the AI with dozens of identical
+    # office@example.com rows from the same page.
+    by_key: dict[tuple[str | None, str, bool], Candidate] = {}
+
+    for email, node in _iter_email_nodes(soup):
+        local, _, dom = email.partition("@")
+        if not local or not dom:
+            continue
+
+        # Filter by org/domain, if known.
+        if not _same_org(dom, official_domain, source_url):
+            continue
+
+        # Role-ness is now a flag, not a hard filter.
+        is_role_guess = _local_part_role_like(local)
+
+        # Try to infer a name near this email (best-effort).
+        raw_name = _extract_name_near_node(node)
+        first_name: str | None = None
+        last_name: str | None = None
+
+        if raw_name and _looks_human_name(raw_name):
+            first_name, last_name = _split_first_last(raw_name)
+        else:
+            # If the text we found does not pass the name heuristics,
+            # treat as "no reliable name".
+            raw_name = None
+
+        context_snippet = _local_context_snippet(node)
+        source_type = _source_type_for_node(node)
+
+        candidate = Candidate(
+            email=email.lower(),
+            source_url=source_url,
+            first_name=first_name,
+            last_name=last_name,
+            raw_name=raw_name,
+            title=None,
+            source_type=source_type,
+            context_snippet=context_snippet,
+            is_role_address_guess=is_role_guess,
+        )
+
+        key = (candidate.email, (candidate.raw_name or "").lower(), candidate.is_role_address_guess)
+        existing = by_key.get(key)
+
+        if existing is None:
+            by_key[key] = candidate
+        else:
+            # If we already have this (email, name, role-flag) on this page,
+            # keep the "better" one by a simple heuristic:
+            #   - prefer a candidate with a longer context snippet
+            #   - otherwise keep the first one we saw
+            existing_snip = existing.context_snippet or ""
+            new_snip = candidate.context_snippet or ""
+            if len(new_snip) > len(existing_snip):
+                by_key[key] = candidate
+
+    return list(by_key.values())

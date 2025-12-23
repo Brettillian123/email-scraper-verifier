@@ -1,0 +1,4 @@
+domain,email,expected_verify_status,expected_icp_min
+crestwellpartners.com,banderson@crestwellpartners.com,valid,70
+example.com,bad-address@example.com,invalid,0
+catchall.test,random@catchall.test,risky_catch_all,50

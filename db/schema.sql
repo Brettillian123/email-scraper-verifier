@@ -21,6 +21,29 @@ CREATE TABLE IF NOT EXISTS companies (
 CREATE INDEX IF NOT EXISTS idx_companies_user_supplied_domain
   ON companies(user_supplied_domain);
 
+-- ---------------------------------------------------------------------------
+-- R10 + R26: sources (page-level cache for crawled HTML, tied to companies)
+--
+-- This table backs the crawler/extractor pipeline:
+--   - R10 persists (source_url, html, fetched_at) for each fetched page.
+--   - R26 adds company_id so we can scope extraction by company.
+-- Existing databases should be upgraded via migrate_r26_add_sources_company_id.py;
+-- new databases get the final shape directly from this schema.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sources (
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+  source_url TEXT NOT NULL,                    -- canonical URL of the page
+  html TEXT,                                   -- raw HTML body
+  fetched_at TEXT DEFAULT (datetime('now'))    -- when this page was fetched
+);
+
+CREATE INDEX IF NOT EXISTS idx_sources_company
+  ON sources(company_id);
+
+CREATE INDEX IF NOT EXISTS idx_sources_source_url
+  ON sources(source_url);
+
 -- people
 CREATE TABLE IF NOT EXISTS people (
   id INTEGER PRIMARY KEY,
@@ -67,7 +90,14 @@ CREATE TABLE IF NOT EXISTS verification_results (
   verify_status TEXT,               -- "valid" | "risky_catch_all" | "invalid" | "unknown_timeout"
   verify_reason TEXT,               -- short machine-readable reason (rcpt_2xx_non_catchall, ...)
   verified_mx TEXT,                 -- MX host actually used for classification
-  verified_at TEXT                  -- ISO-8601 UTC timestamp of last classification
+  verified_at TEXT,                 -- ISO-8601 UTC timestamp of last classification
+
+  -- O26: test-send / bounce tracking
+  test_send_status TEXT NOT NULL DEFAULT 'not_requested',
+  test_send_token TEXT,
+  test_send_at TEXT,                -- ISO-8601 UTC (when test email was sent)
+  bounce_code TEXT,                 -- parsed DSN status code, e.g. "5.1.1"
+  bounce_reason TEXT                -- normalized reason, e.g. "user_unknown"
 );
 
 -- suppression (global/tenant-wide do-not-verify/contact)
@@ -90,6 +120,8 @@ DROP INDEX IF EXISTS idx_emails_email;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email);
 
 CREATE INDEX IF NOT EXISTS idx_verif_email ON verification_results(email_id);
+CREATE INDEX IF NOT EXISTS idx_verif_test_send_token
+  ON verification_results(test_send_token);
 
 -- R07 ingestion staging table
 CREATE TABLE IF NOT EXISTS ingest_items (

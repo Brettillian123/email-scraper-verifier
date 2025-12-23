@@ -1,4 +1,3 @@
-# src/search/indexing.py
 from __future__ import annotations
 
 import sqlite3
@@ -131,6 +130,33 @@ class _FacetSchemaInfo:
 def _rows_to_dicts(cursor: sqlite3.Cursor, rows: Sequence[Sequence[Any]]) -> list[dict[str, Any]]:
     cols = [desc[0] for desc in cursor.description]
     return [dict(zip(cols, row, strict=False)) for row in rows]
+
+
+def _normalize_fts_query(raw: str) -> str:
+    """
+    Turn a user query string into a safe FTS5 MATCH expression.
+
+    - If it looks like advanced FTS syntax (boolean ops / column:term), pass
+      it through as-is.
+    - Otherwise, treat it as a literal phrase by wrapping in double quotes.
+      This avoids syntax errors for inputs like domains/emails
+      (e.g. "crestwellpartners.com", "user@example.com").
+    """
+    q = (raw or "").strip()
+    if not q:
+        return q
+
+    upper = q.upper()
+    # Heuristic: if user is clearly using FTS operators or column scoping,
+    # respect it and do not wrap.
+    if any(op in upper for op in (" AND ", " OR ", " NEAR ")):
+        return q
+    if ":" in q:
+        return q
+
+    # Literal phrase mode: strip embedded double quotes to keep syntax valid.
+    q = q.replace('"', " ")
+    return f'"{q}"'
 
 
 def _normalize_query_and_sort(params: LeadSearchParams) -> str:
@@ -490,8 +516,10 @@ def search_people_leads(conn: sqlite3.Connection, params: LeadSearchParams) -> l
 
     base_sql = _build_base_sql(industry_expr, size_expr, attrs_expr, source_expr, source_url_expr)
 
+    match_query = _normalize_fts_query(params.query or "")
+
     sql_params: dict[str, Any] = {
-        "query": params.query,
+        "query": match_query,
         "limit": params.limit,
     }
     conditions: list[str] = []
@@ -548,7 +576,7 @@ def _build_join_facet_base_sql(
 
     if params.query and params.query.strip():
         conditions.append("people_fts MATCH :query")
-        sql_params["query"] = params.query
+        sql_params["query"] = _normalize_fts_query(params.query)
 
     _apply_icp_filter(params, conditions, sql_params)
     _apply_verify_status_filter(params, conditions, sql_params)
@@ -899,7 +927,7 @@ def fuzzy_company_lookup(
               ON c.id = companies_fts.rowid
             WHERE companies_fts MATCH :match
             """,
-            {"match": query},
+            {"match": _normalize_fts_query(query)},
         )
         rows = cur.fetchall()
         for row in _rows_to_dicts(cur, rows):

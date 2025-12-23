@@ -152,8 +152,32 @@ CRAWL_FOLLOW_KEYWORDS: str = os.getenv(
 # -------------------------------
 SMTP_HELO_DOMAIN = os.getenv("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com")
 SMTP_MAIL_FROM = os.getenv("SMTP_MAIL_FROM", f"bounce@{SMTP_HELO_DOMAIN}")
-SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", "10"))
-SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", "10"))
+
+# IMPORTANT:
+# Keep legacy env var names (SMTP_CONNECT_TIMEOUT / SMTP_COMMAND_TIMEOUT),
+# but default them from the structured config env vars when present.
+# This allows callers that import SMTP_CONNECT_TIMEOUT/SMTP_COMMAND_TIMEOUT
+# to behave consistently with load_settings().
+_default_connect_s = str(_getenv_int("SMTP_CONNECT_TIMEOUT_SECONDS", 5))
+_default_cmd_s = str(_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 10))
+SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", _default_connect_s))
+SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", _default_cmd_s))
+
+# Fast-fail / circuit-breaker knobs (used by src.verify.smtp + demo script)
+SMTP_PREFLIGHT_ENABLED: bool = _getenv_bool("SMTP_PREFLIGHT_ENABLED", True)
+SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = float(
+    os.getenv("SMTP_PREFLIGHT_TIMEOUT_SECONDS", "2"),
+)
+SMTP_PREFLIGHT_MAX_ADDRS: int = _getenv_int("SMTP_PREFLIGHT_MAX_ADDRS", 2)
+SMTP_PREFLIGHT_CACHE_TTL_SECONDS: int = _getenv_int(
+    "SMTP_PREFLIGHT_CACHE_TTL_SECONDS",
+    1800,
+)  # 30 minutes
+
+# Limit how many resolved IPs we attempt for a single MX before giving up.
+# This prevents the "4-8 addresses × 10s each" explosion you observed.
+SMTP_MX_MAX_ADDRS: int = _getenv_int("SMTP_MX_MAX_ADDRS", 2)
+SMTP_PREFER_IPV4: bool = _getenv_bool("SMTP_PREFER_IPV4", True)
 
 # -------------------------------
 # O07: Third-party verifier fallback config
@@ -191,6 +215,12 @@ class Settings:
     VERIFY_RETRY_INTERVALS: list[int] = field(
         default_factory=lambda: _parse_intervals(os.getenv("VERIFY_RETRY_INTERVALS"))
     )
+
+    # O27: AI people extraction config
+    openai_api_key: str | None = os.getenv("OPENAI_API_KEY", "").strip() or None
+    ai_people_model: str = _getenv_str("AI_PEOPLE_MODEL", "gpt-5-nano")
+    ai_people_enabled: bool = _getenv_bool("AI_PEOPLE_ENABLED", False)
+    ai_people_max_input_tokens: int = _getenv_int("AI_PEOPLE_MAX_INPUT_TOKENS", 1500)
 
 
 @dataclass(frozen=True)
@@ -236,6 +266,42 @@ class FetchConfig:
     allowed_content_types: list[str]
 
 
+# -------------------------------
+# O26: AWS SES / test-send email config
+# -------------------------------
+
+
+@dataclass(frozen=True)
+class AwsSesConfig:
+    """
+    Minimal AWS SES config.
+
+    Access key / secret are optional; if unset, boto3 will fall back to the
+    default AWS credential chain (env, shared config, EC2/ECS metadata, etc.).
+    """
+
+    region: str
+    access_key_id: str | None
+    secret_access_key: str | None
+
+
+@dataclass(frozen=True)
+class TestSendEmailConfig:
+    """
+    Email-level config for O26 test-sends.
+
+    This is distinct from src.verify.test_send.TestSendConfig, which controls
+    behavioral aspects (delivered_after, update_verify_status).
+    """
+
+    from_address: str
+    reply_to: str | None
+    mail_from_domain: str
+    bounce_prefix: str
+    subject_prefix: str
+    bounces_sqs_url: str | None
+
+
 @dataclass(frozen=True)
 class AppConfig:
     queue: QueueConfig
@@ -266,9 +332,9 @@ def load_settings() -> AppConfig:
         verify_max_backoff_seconds=_getenv_int("VERIFY_MAX_BACKOFF_SECONDS", 90),
         smtp_connect_timeout_seconds=_getenv_int(
             "SMTP_CONNECT_TIMEOUT_SECONDS",
-            20,
+            5,
         ),
-        smtp_cmd_timeout_seconds=_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 30),
+        smtp_cmd_timeout_seconds=_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 10),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
     )
     smtp_identity = SmtpIdentityConfig(
@@ -294,6 +360,72 @@ def load_settings() -> AppConfig:
         retry_timeout=retry_timeout,
         smtp_identity=smtp_identity,
         fetch=fetch,
+    )
+
+
+def load_aws_ses_config() -> AwsSesConfig:
+    """
+    Load AWS SES configuration for O26 test-sends.
+
+    If AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set, callers should
+    rely on boto3's default credential resolution chain.
+    """
+    region = _getenv_str("AWS_REGION", "us-east-1")
+    access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+    if (access_key_id and not secret_access_key) or (secret_access_key and not access_key_id):
+        raise ValueError(
+            "Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set "
+            "together, or neither (to use the default AWS credential chain).",
+        )
+
+    return AwsSesConfig(
+        region=region,
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
+    )
+
+
+def load_test_send_email_config() -> TestSendEmailConfig:
+    """
+    Load SES / email settings for O26 test-sends from environment.
+
+    Expected env vars:
+
+      TEST_SEND_FROM                (required)
+      TEST_SEND_REPLY_TO            (optional)
+      TEST_SEND_MAIL_FROM_DOMAIN    (required)
+      TEST_SEND_BOUNCE_PREFIX       (default: "bounce")
+      TEST_SEND_SUBJECT_PREFIX      (default: "[IQVerifier Test]")
+      TEST_SEND_BOUNCES_SQS_URL     (optional; used by SQS consumer)
+    """
+    from_address = _getenv_str("TEST_SEND_FROM", "")
+    if not from_address:
+        raise ValueError("TEST_SEND_FROM must be set (FROM header for test-sends).")
+
+    reply_to_raw = os.getenv("TEST_SEND_REPLY_TO")
+    reply_to = reply_to_raw.strip() if reply_to_raw is not None else None
+
+    mail_from_domain = _getenv_str("TEST_SEND_MAIL_FROM_DOMAIN", "")
+    if not mail_from_domain:
+        raise ValueError(
+            "TEST_SEND_MAIL_FROM_DOMAIN must be set (MAIL FROM / return-path domain).",
+        )
+
+    bounce_prefix = _getenv_str("TEST_SEND_BOUNCE_PREFIX", "bounce")
+    subject_prefix = _getenv_str("TEST_SEND_SUBJECT_PREFIX", "[IQVerifier Test]")
+
+    bounces_sqs_url_raw = os.getenv("TEST_SEND_BOUNCES_SQS_URL")
+    bounces_sqs_url = bounces_sqs_url_raw.strip() if bounces_sqs_url_raw else None
+
+    return TestSendEmailConfig(
+        from_address=from_address,
+        reply_to=reply_to,
+        mail_from_domain=mail_from_domain,
+        bounce_prefix=bounce_prefix,
+        subject_prefix=subject_prefix,
+        bounces_sqs_url=bounces_sqs_url,
     )
 
 
@@ -344,8 +476,12 @@ __all__ = [
     "RetryTimeoutConfig",
     "SmtpIdentityConfig",
     "FetchConfig",
+    "AwsSesConfig",
+    "TestSendEmailConfig",
     "AppConfig",
     "load_settings",
+    "load_aws_ses_config",
+    "load_test_send_email_config",
     "settings",  # legacy flat object
     "app_config",  # structured object
     # R09 fetch/robots constants
@@ -373,6 +509,12 @@ __all__ = [
     "SMTP_MAIL_FROM",
     "SMTP_CONNECT_TIMEOUT",
     "SMTP_COMMAND_TIMEOUT",
+    "SMTP_PREFLIGHT_ENABLED",
+    "SMTP_PREFLIGHT_TIMEOUT_SECONDS",
+    "SMTP_PREFLIGHT_MAX_ADDRS",
+    "SMTP_PREFLIGHT_CACHE_TTL_SECONDS",
+    "SMTP_MX_MAX_ADDRS",
+    "SMTP_PREFER_IPV4",
     # O07 fallback config
     "THIRD_PARTY_VERIFY_URL",
     "THIRD_PARTY_VERIFY_API_KEY",

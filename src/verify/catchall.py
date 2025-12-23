@@ -130,7 +130,6 @@ def _load_cached_state(
     Returns a dict with:
         {
           "id",
-          "lowest_mx",
           "catch_all_status",
           "catch_all_checked_at",
           "catch_all_localpart",
@@ -142,28 +141,27 @@ def _load_cached_state(
         """
         SELECT
             id,
-            lowest_mx,
             catch_all_status,
             catch_all_checked_at,
             catch_all_localpart,
             catch_all_smtp_code
         FROM domain_resolutions
         WHERE domain = ?
-        ORDER BY resolved_at DESC, id DESC
+           OR (domain IS NULL AND chosen_domain = ?)
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
-        (domain,),
+        (domain, domain),
     )
     row = cur.fetchone()
     if not row:
         return None
     return {
         "id": row[0],
-        "lowest_mx": row[1],
-        "catch_all_status": row[2],
-        "catch_all_checked_at": row[3],
-        "catch_all_localpart": row[4],
-        "catch_all_smtp_code": row[5],
+        "catch_all_status": row[1],
+        "catch_all_checked_at": row[2],
+        "catch_all_localpart": row[3],
+        "catch_all_smtp_code": row[4],
     }
 
 
@@ -185,10 +183,11 @@ def _update_cached_state(
         SELECT id
         FROM domain_resolutions
         WHERE domain = ?
-        ORDER BY resolved_at DESC, id DESC
+           OR (domain IS NULL AND chosen_domain = ?)
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
-        (domain,),
+        (domain, domain),
     )
     row = cur.fetchone()
     if not row:
@@ -203,7 +202,8 @@ def _update_cached_state(
             catch_all_checked_at  = ?,
             catch_all_localpart   = ?,
             catch_all_smtp_code   = ?,
-            catch_all_smtp_msg    = ?
+            catch_all_smtp_msg    = ?,
+            domain                = COALESCE(domain, ?)
         WHERE id = ?
         """,
         (
@@ -212,6 +212,7 @@ def _update_cached_state(
             localpart,
             rcpt_code,
             (rcpt_msg or None),
+            domain,
             row_id,
         ),
     )
@@ -333,7 +334,7 @@ def check_catchall_for_domain(
         return CatchallResult(
             domain=dom,
             status=cached_row["catch_all_status"],
-            mx_host=cached_row["lowest_mx"],
+            mx_host=None,  # we don't store MX host in this table yet
             rcpt_code=cached_row["catch_all_smtp_code"],
             cached=True,
             localpart=cached_row["catch_all_localpart"],

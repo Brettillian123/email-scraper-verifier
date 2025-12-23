@@ -1,6 +1,5 @@
-# src/verify/smtp.py
 """
-R16 — Core SMTP RCPT probe (+ O06 behavior-aware timeouts)
+R16 — Core SMTP RCPT probe (+ O06 behavior-aware timeouts + fast-fail preflight)
 
 Public function:
 
@@ -10,14 +9,15 @@ Public function:
         *,
         helo_domain: str,
         mail_from: str,
-        connect_timeout: float = 10.0,
-        command_timeout: float = 10.0,
+        connect_timeout: float = 20.0,
+        command_timeout: float = 20.0,
         behavior_hint: dict | None = None,
     ) -> dict
 
 Responsibilities:
 - Light email normalization (trim, split, IDNA for domain; preserve local-part case).
 - Require a non-empty MX host.
+- Optional fast-fail TCP/25 preflight (circuit breaker) to avoid N× timeout blowups.
 - Open an SMTP connection with sane (and O06-tuned) timeouts.
 - EHLO; opportunistic STARTTLS if offered; EHLO again afterward.
 - Run MAIL FROM / RCPT TO and capture the RCPT reply code/message.
@@ -39,6 +39,20 @@ import socket
 import sys
 import time
 from typing import Any
+
+from src.config import (
+    SMTP_MX_MAX_ADDRS,
+    SMTP_PREFER_IPV4,
+    SMTP_PREFLIGHT_CACHE_TTL_SECONDS,
+    SMTP_PREFLIGHT_ENABLED,
+    SMTP_PREFLIGHT_MAX_ADDRS,
+    SMTP_PREFLIGHT_TIMEOUT_SECONDS,
+)
+
+try:  # pragma: no cover
+    from src.verify.preflight import check_port25
+except Exception:  # pragma: no cover
+    check_port25 = None  # type: ignore
 
 # --- Optional deps / helpers -------------------------------------------------
 
@@ -291,6 +305,67 @@ def record_behavior(
         pass
 
 
+# --- Fast-fail preflight (process-local circuit breaker) ---------------------
+
+# mx_host -> (expires_monotonic, ok, error_str)
+_PREFLIGHT_CACHE: dict[str, tuple[float, bool, str | None]] = {}
+
+
+def _preflight_port25(mx_host: str) -> tuple[bool, str | None]:
+    """
+    Returns (ok, error_str). Uses a small TTL cache to avoid repeating
+    the same doomed connect attempts within a single run.
+    """
+    if not SMTP_PREFLIGHT_ENABLED or check_port25 is None:
+        return True, None
+
+    now = time.monotonic()
+    cached = _PREFLIGHT_CACHE.get(mx_host)
+    if cached is not None:
+        exp, ok, err = cached
+        if now < exp:
+            return ok, err
+
+    r = check_port25(
+        mx_host,
+        timeout_s=float(SMTP_PREFLIGHT_TIMEOUT_SECONDS),
+        max_addrs=int(SMTP_PREFLIGHT_MAX_ADDRS),
+    )
+    ok = bool(getattr(r, "ok", False))
+    err = None if ok else (getattr(r, "error", None) or "port25_unreachable")
+    ttl = max(1, int(SMTP_PREFLIGHT_CACHE_TTL_SECONDS))
+    _PREFLIGHT_CACHE[mx_host] = (now + ttl, ok, err)
+    return ok, err
+
+
+def _resolve_mx_ips(mx_host: str, *, prefer_ipv4: bool, max_addrs: int) -> list[str]:
+    """
+    Resolve MX host into a bounded list of IPs we will attempt.
+    This prevents socket.create_connection() from walking 4–8 A/AAAA entries,
+    each costing connect_timeout seconds.
+    """
+    try:
+        infos = socket.getaddrinfo(mx_host, 25, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+
+    # Prefer IPv4 first to match common consumer-network behavior
+    if prefer_ipv4:
+        infos = sorted(infos, key=lambda a: 0 if a[0] == socket.AF_INET else 1)
+
+    ips: list[str] = []
+    seen: set[str] = set()
+    for _family, _socktype, _proto, _canon, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip in seen:
+            continue
+        seen.add(ip)
+        ips.append(ip)
+        if len(ips) >= max_addrs:
+            break
+    return ips
+
+
 # --- Public API ---------------------------------------------------------------
 
 
@@ -300,8 +375,8 @@ def probe_rcpt(  # noqa: C901
     *,
     helo_domain: str,
     mail_from: str,
-    connect_timeout: float = 10.0,
-    command_timeout: float = 10.0,
+    connect_timeout: float = 20.0,
+    command_timeout: float = 20.0,
     behavior_hint: dict | None = None,
 ) -> dict:
     """
@@ -317,7 +392,6 @@ def probe_rcpt(  # noqa: C901
         _local, _domain, email_norm = _normalize_email(email)
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        # SINGLE hook invocation expected by tests — resolve from live module
         hook = sys.modules[__name__].record_behavior
         hook(
             domain="",
@@ -343,19 +417,78 @@ def probe_rcpt(  # noqa: C901
 
     c_to, cmd_to = _apply_hint_timeouts(connect_timeout, command_timeout, behavior_hint)
 
+    # Fast-fail preflight: if TCP/25 is blocked/unreachable, skip the expensive SMTP flow
+    ok25, pre_err = _preflight_port25(mx_host)
+    if not ok25:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        hook = sys.modules[__name__].record_behavior
+        hook(
+            domain=_domain,
+            mx_host=mx_host,
+            elapsed_ms=elapsed_ms,
+            category="unknown",
+            code=None,
+            error_kind="port25_unreachable",
+        )
+        return {
+            "ok": False,
+            "category": "unknown",
+            "code": None,
+            "message": "",
+            "mx_host": mx_host,
+            "helo_domain": helo_domain,
+            "elapsed_ms": elapsed_ms,
+            "error": f"port25_unreachable:{pre_err or ''}".rstrip(":"),
+        }
+
     smtp: smtplib.SMTP | None = None
     rcpt_code: int | None = None
     rcpt_msg: str = ""
     error_str: str | None = None
     category: str = "unknown"
 
+    # Bound how many IPs we attempt for this MX (prevents N× connect timeout)
+    ips = _resolve_mx_ips(
+        mx_host,
+        prefer_ipv4=bool(SMTP_PREFER_IPV4),
+        max_addrs=int(SMTP_MX_MAX_ADDRS),
+    ) or [mx_host]
+
+    last_connect_exc: Exception | None = None
+
     try:
-        smtp = smtplib.SMTP(host=mx_host, port=25, local_hostname=helo_domain, timeout=c_to)
-        try:
-            if smtp.sock is not None:
-                smtp.sock.settimeout(cmd_to)
-        except Exception:
-            pass
+        # Try up to N IPs explicitly; connect to IP avoids smtplib/socket walking all A/AAAA.
+        for ip in ips:
+            try:
+                smtp = smtplib.SMTP(
+                    host=ip,
+                    port=25,
+                    local_hostname=helo_domain,
+                    timeout=c_to,
+                )
+                try:
+                    if smtp.sock is not None:
+                        smtp.sock.settimeout(cmd_to)
+                except Exception:
+                    pass
+                last_connect_exc = None
+                break
+            except (TimeoutError, OSError, smtplib.SMTPException) as exc:
+                last_connect_exc = exc
+                try:
+                    if smtp is not None:
+                        with socket_timeout_guard(0.5):
+                            smtp.close()
+                except Exception:
+                    pass
+                smtp = None
+                continue
+
+        if smtp is None:
+            # Re-raise to be handled uniformly below.
+            if last_connect_exc is None:
+                raise TimeoutError("connect_failed")
+            raise last_connect_exc
 
         try:
             smtp.ehlo()
@@ -372,6 +505,7 @@ def probe_rcpt(  # noqa: C901
                     pass
                 smtp.ehlo()
         except (OSError, smtplib.SMTPException):
+            # STARTTLS failures are treated as non-fatal; proceed in plain.
             pass
 
         mail_code, mail_resp = smtp.mail(mail_from)
@@ -394,7 +528,11 @@ def probe_rcpt(  # noqa: C901
         category = _classify(rcpt_code)
         error_str = f"smtp_response:{rcpt_code}"
     except smtplib.SMTPServerDisconnected as exc:
-        error_str = f"disconnected:{exc}"
+        msg = str(exc) or ""
+        if "timed out" in msg.lower():
+            error_str = f"timeout:{exc}"
+        else:
+            error_str = f"disconnected:{exc}"
         category = "unknown"
         rcpt_code = None
         rcpt_msg = ""

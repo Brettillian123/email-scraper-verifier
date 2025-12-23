@@ -118,6 +118,12 @@ def _extract_tech_keywords(company_attrs: Any) -> list[str]:
 def _row_to_lead(row: dict[str, Any]) -> dict[str, Any]:
     """
     Map a raw DB/search row to the public /leads/search JSON schema.
+
+    O26 note:
+      - verify_label is passed through from the search backend when present.
+      - is_primary_for_person is a boolean for valid emails when the backend
+        has chosen a canonical primary for the person; it may be absent/None
+        when there is no valid primary.
     """
     return {
         "email": row.get("email"),
@@ -138,6 +144,9 @@ def _row_to_lead(row: dict[str, Any]) -> dict[str, Any]:
         "verified_at": row.get("verified_at"),
         "source": row.get("source"),
         "source_url": row.get("source_url"),
+        # O26 fields:
+        "verify_label": row.get("verify_label"),
+        "is_primary_for_person": row.get("is_primary_for_person"),
     }
 
 
@@ -402,6 +411,11 @@ async def leads_search(
       - sort: icp_desc (default), verified_desc
       - keyset pagination via opaque cursor
       - facets: comma-separated list of facet names, e.g. "verify_status,icp_bucket"
+
+    O26:
+      - Each result row now includes:
+          * verify_label: second-dimension label on top of verify_status
+          * is_primary_for_person: boolean for canonical primary valid emails
     """
     if not q or not q.strip():
         return _error_response(

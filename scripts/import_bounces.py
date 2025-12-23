@@ -1,14 +1,16 @@
-# scripts/import_bounces.py
 from __future__ import annotations
 
 """
 O12 – Seed mailbox & bounce/complaint monitoring.
+O26 – Bounce-based verification integration.
 
 Minimal IMAP-based importer that:
-  - Connects to a mailbox (typically a "seed" address used in campaigns),
+  - Connects to a mailbox (typically a "seed" or bounce address),
   - Scans messages for bounced/complaint notifications,
   - Extracts bounced addresses from the message content,
-  - Upserts entries into the local suppression table via src.db_suppression.
+  - Upserts entries into the local suppression table via src.db_suppression,
+  - Detects test-send bounce tokens of the form bounce+{token}@yourdomain.com
+    and applies bounce outcomes to verification_results via O26 helpers.
 
 Example usage:
 
@@ -21,7 +23,10 @@ Example usage:
         --seed-address bounce@example.com
 
 The pure function `parse_bounce_addresses` is unit-testable and can be
-covered separately in tests.
+covered separately in tests. Additional pure helpers:
+
+  - parse_test_send_tokens(raw_email)
+  - parse_bounce_status(raw_email)
 """
 
 import argparse
@@ -34,10 +39,16 @@ from email.message import Message
 
 from src.db import get_connection
 from src.db_suppression import upsert_suppression
+from src.verify.test_send import apply_bounce
 
 EMAIL_RE = re.compile(
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
 )
+
+# Test-send / bounce alias helpers.
+BOUNCE_ALIAS_PREFIX = "bounce+"
+BOUNCE_TOKEN_RE = re.compile(r"bounce\+([^@\s]+)@", re.IGNORECASE)
+STATUS_CODE_RE = re.compile(r"\b([245]\.\d\.\d)\b")
 
 
 def parse_bounce_addresses(
@@ -55,6 +66,8 @@ def parse_bounce_addresses(
       - Scan text parts for mail delivery reports and any email-looking tokens.
       - Optionally drop any addresses that appear in the `ignore` set
         (e.g., the seed mailbox itself).
+      - Drop any addresses that look like our bounce alias
+        (bounce+{token}@...), since those are not actual recipients.
 
     This is heuristic by design; it's better to slightly over-capture and let
     higher-level suppression policies decide what to do with ambiguous cases.
@@ -96,17 +109,16 @@ def parse_bounce_addresses(
         except Exception:
             continue
 
-        # Many bounce messages include sections like:
-        # "Final-Recipient: rfc822; user@example.com"
-        # or original message headers with the bad address.
-        if "Final-Recipient" in payload or "Diagnostic-Code" in payload:
-            candidates.update(_extract_emails(payload))
-        else:
-            # As a fallback, scan the whole text for email-ish tokens.
-            candidates.update(_extract_emails(payload))
+        candidates.update(_extract_emails(payload))
 
     # Filter and normalize.
     filtered = {addr.lower() for addr in candidates if addr.lower() not in ignore_lower}
+
+    # Drop our own bounce alias addresses (bounce+{token}@...), since they are
+    # not the failing recipient and should not be suppressed.
+    filtered = {
+        addr for addr in filtered if not addr.split("@", 1)[0].startswith(BOUNCE_ALIAS_PREFIX)
+    }
 
     # Return deterministic order for easier testing/debugging.
     return sorted(filtered)
@@ -115,6 +127,108 @@ def parse_bounce_addresses(
 def _extract_emails(text: str) -> set[str]:
     """Return a set of email-like strings from arbitrary text."""
     return set(EMAIL_RE.findall(text or ""))
+
+
+def parse_test_send_tokens(raw_email: str) -> set[str]:
+    """
+    Extract test-send tokens from any bounce addresses of the form:
+
+        bounce+{token}@yourdomain.com
+
+    Returns a set of token strings. These are suitable for passing to
+    src.verify.test_send.apply_bounce().
+    """
+    return {m.group(1) for m in BOUNCE_TOKEN_RE.finditer(raw_email)}
+
+
+def parse_bounce_status(
+    raw_email: str,
+) -> tuple[str | None, bool | None, str | None]:
+    """
+    Heuristically parse a DSN / bounce message to derive:
+
+        (status_code, is_hard, normalized_reason)
+
+    - status_code is a RFC 3463-style code that we find (e.g. "5.1.1",
+      "4.2.0"), or None if not found.
+
+    - is_hard is True for permanent failures, False for temporary failures,
+      or None if we cannot decide.
+
+    - normalized_reason is a short label like "user_unknown",
+      "mailbox_full", "policy_block", or None if we cannot infer one.
+
+    We deliberately err on the side of *not* classifying when the message
+    does not look like a real DSN to avoid false hard-bounce updates.
+    """
+    text_lower = raw_email.lower()
+
+    m = STATUS_CODE_RE.search(raw_email)
+    status_code = m.group(1) if m else None
+
+    is_hard: bool | None = None
+    reason: str | None = None
+
+    if status_code:
+        if status_code.startswith("5."):
+            is_hard = True
+        elif status_code.startswith("4."):
+            is_hard = False
+
+    # Heuristic reason mapping based on common DSN text.
+    if any(
+        kw in text_lower
+        for kw in (
+            "user unknown",
+            "unknown user",
+            "no such user",
+            "unknown recipient",
+            "recipient unknown",
+            "address not found",
+        )
+    ):
+        reason = "user_unknown"
+        if is_hard is None:
+            is_hard = True
+    elif any(
+        kw in text_lower
+        for kw in (
+            "mailbox full",
+            "over quota",
+            "quota exceeded",
+            "storage limit",
+            "disk quota",
+        )
+    ):
+        reason = "mailbox_full"
+        if is_hard is None:
+            is_hard = False
+    elif any(
+        kw in text_lower
+        for kw in (
+            "spam",
+            "blocked",
+            "blacklist",
+            "blacklisted",
+            "policy violation",
+            "rejected by policy",
+        )
+    ):
+        reason = "policy_block"
+        if is_hard is None:
+            is_hard = True
+
+    # If we have neither a code nor a reason, treat this as not reliably
+    # classifiable; callers should skip bounce-based verification updates.
+    if status_code is None and reason is None:
+        return (None, None, None)
+
+    # If still undecided, default to hard; DSNs that reach a bounce alias
+    # are typically real failures.
+    if is_hard is None:
+        is_hard = True
+
+    return (status_code, is_hard, reason)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -146,7 +260,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--password-env",
         dest="password_env",
         default="IMAP_PASSWORD",
-        help="Environment variable name containing the IMAP password (default: IMAP_PASSWORD).",
+        help=("Environment variable name containing the IMAP password (default: IMAP_PASSWORD)."),
     )
     parser.add_argument(
         "--folder",
@@ -200,6 +314,78 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Imported suppression entries for {processed} bounced addresses.")
 
 
+def _imap_select_folder(imap: imaplib.IMAP4_SSL, folder: str) -> None:
+    typ, _ = imap.select(folder)
+    if typ != "OK":
+        raise RuntimeError(f"Failed to select folder {folder!r}: {typ}")
+
+
+def _imap_search_all(imap: imaplib.IMAP4_SSL, folder: str) -> list[bytes]:
+    typ, data = imap.search(None, "ALL")
+    if typ != "OK":
+        raise RuntimeError(f"Failed to search folder {folder!r}: {typ}")
+    if not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+def _imap_fetch_rfc822(imap: imaplib.IMAP4_SSL, msg_id: bytes) -> bytes | None:
+    typ, msg_data = imap.fetch(msg_id, "(RFC822)")
+    if typ != "OK" or not msg_data:
+        return None
+
+    for part in msg_data:
+        if isinstance(part, tuple) and part[1]:
+            return part[1]
+    return None
+
+
+def _decode_rfc822(raw_bytes: bytes) -> str | None:
+    try:
+        return raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _apply_test_send_bounces(conn, raw_str: str) -> None:
+    tokens = parse_test_send_tokens(raw_str)
+    if not tokens:
+        return
+
+    status_code, is_hard, norm_reason = parse_bounce_status(raw_str)
+    if is_hard is None:
+        return
+
+    for token in tokens:
+        apply_bounce(
+            conn,
+            token=token,
+            status_code=status_code,
+            reason=norm_reason,
+            is_hard=is_hard,
+        )
+
+
+def _upsert_suppressions_for_addresses(conn, addresses: set[str]) -> None:
+    for addr in addresses:
+        upsert_suppression(
+            conn,
+            email=addr,
+            reason="seed_bounce",
+            source="o12_bounce_monitor",
+        )
+
+
+def _mark_seen(imap: imaplib.IMAP4_SSL, msg_id: bytes) -> None:
+    imap.store(msg_id, "+FLAGS", "\\Seen")
+
+
+def _commit_if_supported(conn) -> None:
+    commit = getattr(conn, "commit", None)
+    if callable(commit):
+        commit()
+
+
 def import_bounces(
     conn,
     *,
@@ -215,6 +401,9 @@ def import_bounces(
     Connect to the IMAP server, scan the given folder, and upsert suppressions
     for any bounced addresses that can be extracted.
 
+    Additionally, detect test-send bounce tokens (bounce+{token}@...) and
+    apply bounce outcomes to verification_results via O26 helpers.
+
     Returns the number of unique bounced addresses written to suppression.
     """
     if seed_ignore is None:
@@ -223,57 +412,31 @@ def import_bounces(
     imap = imaplib.IMAP4_SSL(host, port)
     try:
         imap.login(user, password)
-        typ, _ = imap.select(folder)
-        if typ != "OK":
-            raise RuntimeError(f"Failed to select folder {folder!r}: {typ}")
+        _imap_select_folder(imap, folder)
 
-        # We start simple: fetch all messages in the folder. If this becomes
-        # large, callers can move older messages elsewhere.
-        typ, data = imap.search(None, "ALL")
-        if typ != "OK":
-            raise RuntimeError(f"Failed to search folder {folder!r}: {typ}")
-
-        msg_ids = data[0].split()
+        msg_ids = _imap_search_all(imap, folder)
         all_addresses: set[str] = set()
 
         for msg_id in msg_ids:
-            typ, msg_data = imap.fetch(msg_id, "(RFC822)")
-            if typ != "OK" or not msg_data:
-                continue
-
-            # msg_data is a list of (bytes_header, bytes_body) tuples
-            # and/or other responses; grab the first RFC822 payload.
-            raw_bytes = None
-            for part in msg_data:
-                if isinstance(part, tuple) and part[1]:
-                    raw_bytes = part[1]
-                    break
-
+            raw_bytes = _imap_fetch_rfc822(imap, msg_id)
             if raw_bytes is None:
                 continue
 
-            try:
-                raw_str = raw_bytes.decode("utf-8", errors="ignore")
-            except Exception:
+            raw_str = _decode_rfc822(raw_bytes)
+            if raw_str is None:
                 continue
 
-            bounced = parse_bounce_addresses(raw_str, ignore=seed_ignore)
-            if not bounced:
-                continue
+            _apply_test_send_bounces(conn, raw_str)
 
-            for addr in bounced:
-                all_addresses.add(addr)
-                upsert_suppression(
-                    conn,
-                    email=addr,
-                    reason="seed_bounce",
-                    source="o12_bounce_monitor",
-                )
+            bounced = set(parse_bounce_addresses(raw_str, ignore=seed_ignore))
+            if bounced:
+                all_addresses.update(bounced)
+                _upsert_suppressions_for_addresses(conn, bounced)
 
             if mark_seen:
-                imap.store(msg_id, "+FLAGS", "\\Seen")
+                _mark_seen(imap, msg_id)
 
-        conn.commit()
+        _commit_if_supported(conn)
         return len(all_addresses)
     finally:
         try:

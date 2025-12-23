@@ -20,3 +20,5 @@ data/
 *.egg-info/
 
 .env
+
+--db

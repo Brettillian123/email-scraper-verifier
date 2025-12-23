@@ -11,12 +11,24 @@ try:
 except Exception:  # pragma: no cover
     ROLE_ALIASES: set[str] = set()
 
-# O01 canonical toolkit (keys like "first.last"); used when an explicit key is supplied.
+# Central O26 role/placeholder classifier (preferred).
+# We fall back to ROLE_ALIASES if this is not available (e.g., older tests).
+try:
+    from src.emails.classify import is_role_or_placeholder_email
+except Exception:  # pragma: no cover
+
+    def is_role_or_placeholder_email(addr: str) -> bool:  # type: ignore[no-redef]
+        return False
+
+
+# O01/O26 canonical toolkit (keys like "first.last"); used when an explicit key is supplied
+# or when generating the full candidate set in priority order.
 from src.generate.patterns import (
     PATTERNS as CANON_PATTERNS,  # dict[str, LPFn]
 )
 from src.generate.patterns import (
     apply_pattern,  # (first, last, key) -> local
+    generate_candidate_emails_for_person,  # (first, last, domain, company_pattern) -> list[str]
 )
 
 # ---------------------------------------------------------------------------
@@ -37,6 +49,36 @@ PATTERNS: tuple[str, ...] = (
     "{last}{f}",
     "{l}{first}",
 )
+
+
+def _is_role_or_placeholder(addr: str, *, local_hint: str | None = None) -> bool:
+    """
+    Internal helper used by permutation generation to decide whether a candidate
+    local-part/email should be treated as a generic/role/placeholder address.
+
+    Resolution:
+      1) Prefer the central classifier in src.emails.classify (captures info@,
+         support@, hello@, example@, noreply@, info+foo@, etc.).
+      2) Fall back to legacy ROLE_ALIASES checks on the local-part.
+
+    This ensures we never generate or keep obviously non-personal addresses
+    as permutations for a specific person.
+    """
+    # 1) Central classifier (uses full addr, including '+' patterns and prefixes)
+    try:
+        if is_role_or_placeholder_email(addr):
+            return True
+    except Exception:
+        # If classifier is missing or misconfigured, we fall back to aliases only.
+        pass
+
+    # 2) Legacy alias-based check on local-part
+    local = local_hint
+    if not local:
+        local = addr.split("@", 1)[0]
+    local = local.lower()
+
+    return local in ROLE_ALIASES
 
 
 # ------------------------------
@@ -81,6 +123,9 @@ def generate_permutations(
     only_pattern: str | None = None,
     # (optional; unused here but accepted to avoid breaking callers that pass it)
     examples: Iterable[tuple[str, str, str]] | None = None,  # noqa: ARG001
+    # Optional company-level pattern (canonical key) to *prefer* when generating
+    # the full candidate set. Ignored when only_pattern is supplied.
+    company_pattern: str | None = None,
 ) -> set[str]:
     """
     Make email candidates for first/last@domain.
@@ -90,9 +135,14 @@ def generate_permutations(
          using apply_pattern().
       2) Else if only_pattern is a legacy brace-template string, render with the
          legacy normalization context.
-      3) Else fall back to the legacy R12 PATTERNS list.
+      3) Else:
+           - Generate canonical candidates using the O26 priority list
+             (via generate_candidate_emails_for_person), optionally preferring
+             company_pattern first.
+           - Add any remaining legacy R12 PATTERNS templates as fallback.
 
-    Role/distribution aliases are always skipped when known.
+    Role/distribution aliases and other placeholder addresses are always skipped
+    when known, using the central classifier plus ROLE_ALIASES.
     """
     if not (first or last) or not domain:
         return set()
@@ -100,10 +150,10 @@ def generate_permutations(
     dom = domain.lower().strip()
     out: set[str] = set()
 
-    # 1) Canonical key path (O01)
+    # 1) Canonical key path (O01/O26 "only this pattern")
     if only_pattern and only_pattern in CANON_PATTERNS:
         local = apply_pattern(first, last, only_pattern)
-        if local and local not in ROLE_ALIASES:
+        if local and not _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
             out.add(f"{local}@{dom}")
         return out
 
@@ -117,17 +167,35 @@ def generate_permutations(
             local = only_pattern.format(**ctx)
         except Exception:
             local = ""
-        if local and local not in ROLE_ALIASES:
+        if local and not _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
             out.add(f"{local}@{dom}")
         return out
 
-    # 3) Legacy full-set fallback
+    # 3) Canonical multi-pattern generator (O26) + legacy full-set fallback
+
+    # 3a) Canonical candidates in O26 priority order. This covers:
+    #       flast, first.last, first, firstl, firstlast, f.last, last,
+    #       first_last, first-last, lastfirst
+    #     and will prefer company_pattern first if provided.
+    for email in generate_candidate_emails_for_person(
+        first_name=first,
+        last_name=last,
+        domain=dom,
+        company_pattern=company_pattern,
+    ):
+        local = email.split("@", 1)[0]
+        if not local or _is_role_or_placeholder(email, local_hint=local):
+            continue
+        out.add(email)
+
+    # 3b) Legacy R12 templates as fallback (adds any shapes not covered above,
+    #     such as `{last}.{first}`, `{last}{f}`, `{l}{first}`).
     for pattern in PATTERNS:
         try:
             local = pattern.format(**ctx)
         except Exception:
             continue
-        if not local or local in ROLE_ALIASES:
+        if not local or _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
             continue
         out.add(f"{local}@{dom}")
 

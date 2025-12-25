@@ -14,6 +14,15 @@ import src.verify.fallback as fb_mod
 # -----------------------------
 
 
+def _bypass_tcp25_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch TCP25 preflight to always return success."""
+
+    def _fake_preflight(mx_host, *, timeout_s=1.5, redis=None, ttl_s=300):
+        return {"ok": True, "mx_host": mx_host, "cached": False, "error": None}
+
+    monkeypatch.setattr(tasks, "_smtp_tcp25_preflight_mx", _fake_preflight)
+
+
 def test_verify_with_fallback_disabled_skips_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     When THIRD_PARTY_VERIFY_ENABLED is False, verify_with_fallback should
@@ -184,6 +193,8 @@ def _patch_task_env_for_o07(
 
     # R17 catch-all enqueue is best-effort; skip in unit tests.
     monkeypatch.setattr(tasks, "_maybe_enqueue_catchall", lambda d: None, raising=False)
+
+    _bypass_tcp25_preflight(monkeypatch)
 
 
 def test_task_probe_email_calls_fallback_for_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:

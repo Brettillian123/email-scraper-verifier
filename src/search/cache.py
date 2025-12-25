@@ -12,6 +12,17 @@ from src.search.indexing import LeadSearchParams
 # Default TTL: 15 minutes. Can be overridden via env.
 DEFAULT_TTL_SECONDS = int(os.getenv("LEAD_SEARCH_CACHE_TTL_SECONDS", "900"))
 
+# Optional hard switch to disable caching entirely (useful in tests / local runs).
+LEAD_SEARCH_CACHE_ENABLED = os.getenv("LEAD_SEARCH_CACHE_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+# Cache key version. Bump when changing key construction to avoid stale collisions.
+CACHE_KEY_VERSION = "v2"
+
 
 def _normalize_sequence(value: Any) -> list[str] | None:
     """
@@ -34,9 +45,46 @@ def _normalize_sequence(value: Any) -> list[str] | None:
     return sorted(str(item) for item in items if item is not None)
 
 
-def _build_cache_key(params: LeadSearchParams) -> str:
+def _hash_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _get_cache_namespace(backend: SearchBackend) -> str:
     """
-    Build a deterministic cache key from the LeadSearchParams.
+    Return a namespace string that scopes cache entries to the active backend / DB.
+
+    This prevents cross-test and cross-database collisions for identical query params.
+
+    Resolution order:
+      1) Explicit env override: LEAD_SEARCH_CACHE_NAMESPACE
+      2) backend.cache_namespace() if present
+      3) Fallback: class identity + instance id
+
+    NOTE:
+      We intentionally do NOT attempt to synthesize an in-memory SQLite namespace
+      using id(conn) here, because Python may reuse ids within a long-running
+      process, causing rare but real cross-test cache collisions. For SQLite
+      backends, implement backend.cache_namespace() (see SqliteFtsBackend).
+    """
+    env_ns = os.getenv("LEAD_SEARCH_CACHE_NAMESPACE")
+    if env_ns:
+        return env_ns.strip()
+
+    cache_ns_fn = getattr(backend, "cache_namespace", None)
+    if callable(cache_ns_fn):
+        try:
+            ns = cache_ns_fn()
+        except Exception:
+            ns = None
+        if isinstance(ns, str) and ns.strip():
+            return ns.strip()
+
+    return f"{backend.__class__.__module__}.{backend.__class__.__name__}:{id(backend)}"
+
+
+def _build_cache_key(backend: SearchBackend, params: LeadSearchParams) -> str:
+    """
+    Build a deterministic cache key from the LeadSearchParams and backend namespace.
 
     Only inputs that affect the first page of results are included. Cursor
     fields are *not* part of the cache key; pages with any cursor_* set are
@@ -45,6 +93,12 @@ def _build_cache_key(params: LeadSearchParams) -> str:
     R23 note:
       - The requested facets set is included in the key so that different
         facet combinations do not collide.
+
+    IMPORTANT:
+      - The key is namespaced by backend/database identity to prevent
+        cross-database collisions (e.g., pytest temp DB vs in-memory DB).
+      - The key is versioned to invalidate any pre-fix Redis entries that
+        used older formats (e.g., leads_search:<digest>).
     """
     key_payload = {
         "q": params.query,
@@ -62,10 +116,13 @@ def _build_cache_key(params: LeadSearchParams) -> str:
         "facets": _normalize_sequence(params.facets),
     }
 
-    # Stable JSON encoding -> SHA-256 -> hex digest.
+    namespace = _get_cache_namespace(backend)
+    namespace_digest = _hash_hex(namespace)[:16]
+
     raw = json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
-    return f"leads_search:{digest}"
+
+    return f"leads_search:{CACHE_KEY_VERSION}:{namespace_digest}:{digest}"
 
 
 def _get_redis_client() -> Any | None:
@@ -107,7 +164,8 @@ def search_with_cache(backend: SearchBackend, params: LeadSearchParams) -> Searc
 
       - Only cache the *first* page of results:
           * cursor_icp, cursor_verified_at, cursor_person_id must all be None.
-      - Cache key is derived from the query + filters + sort + limit + facets.
+      - Cache key is derived from the query + filters + sort + limit + facets,
+        AND is namespaced by backend/database identity.
       - TTL is DEFAULT_TTL_SECONDS (15 minutes) by default.
       - If Redis is unavailable or any error occurs, falls back to direct
         backend.search() without failing the request.
@@ -132,12 +190,15 @@ def search_with_cache(backend: SearchBackend, params: LeadSearchParams) -> Searc
     ):
         return backend.search(params)
 
+    if not LEAD_SEARCH_CACHE_ENABLED or DEFAULT_TTL_SECONDS <= 0:
+        return backend.search(params)
+
     redis_client = _get_redis_client()
-    if redis_client is None or DEFAULT_TTL_SECONDS <= 0:
+    if redis_client is None:
         # No cache configured; just hit the backend.
         return backend.search(params)
 
-    key = _build_cache_key(params)
+    key = _build_cache_key(backend, params)
 
     # Attempt cache read
     try:

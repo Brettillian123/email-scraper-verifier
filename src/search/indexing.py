@@ -1,4 +1,3 @@
-# src/search/indexing.py
 from __future__ import annotations
 
 import sqlite3
@@ -133,17 +132,46 @@ def _rows_to_dicts(cursor: sqlite3.Cursor, rows: Sequence[Sequence[Any]]) -> lis
     return [dict(zip(cols, row, strict=False)) for row in rows]
 
 
+def _normalize_fts_query(raw: str) -> str:
+    """
+    Turn a user query string into a safe FTS5 MATCH expression.
+
+    - If it looks like advanced FTS syntax (boolean ops / column:term), pass
+      it through as-is.
+    - Otherwise, treat it as a literal phrase by wrapping in double quotes.
+      This avoids syntax errors for inputs like domains/emails
+      (e.g. "crestwellpartners.com", "user@example.com").
+    """
+    q = (raw or "").strip()
+    if not q:
+        return q
+
+    upper = q.upper()
+    # Heuristic: if user is clearly using FTS operators or column scoping,
+    # respect it and do not wrap.
+    if any(op in upper for op in (" AND ", " OR ", " NEAR ")):
+        return q
+    if ":" in q:
+        return q
+
+    # Literal phrase mode: strip embedded double quotes to keep syntax valid.
+    q = q.replace('"', " ")
+    return f'"{q}"'
+
+
 def _normalize_query_and_sort(params: LeadSearchParams) -> str:
     """
     Validate query and normalize sort, raising ValueError on invalid input.
     """
-    if not params.query or not params.query.strip():
-        raise ValueError("LeadSearchParams.query must be a non-empty string")
+    q = (params.query or "").strip()
+    if not q:
+        raise ValueError("query must be a non-empty string")
 
-    sort = params.sort or "icp_desc"
+    sort = (params.sort or "icp_desc").strip()
     if sort not in {"icp_desc", "verified_desc"}:
         msg = f"Unsupported sort value for search_people_leads: {sort!r}"
         raise ValueError(msg)
+
     return sort
 
 
@@ -236,7 +264,7 @@ def _build_base_sql(
           ON ve.person_id = p.id
         JOIN companies AS c
           ON c.id = p.company_id
-        WHERE people_fts MATCH :query
+        WHERE 1=1
     """
 
 
@@ -313,9 +341,7 @@ def _apply_industry_filter(
         key = f"ind_{idx}"
         placeholders.append(f":{key}")
         sql_params[key] = industry
-    conditions.append(
-        f"JSON_EXTRACT(c.attrs, '$.industry') IN ({', '.join(placeholders)})",
-    )
+    conditions.append(f"JSON_EXTRACT(c.attrs, '$.industry') IN ({', '.join(placeholders)})")
 
 
 def _apply_size_filter(
@@ -332,9 +358,7 @@ def _apply_size_filter(
         key = f"size_{idx}"
         placeholders.append(f":{key}")
         sql_params[key] = size
-    conditions.append(
-        f"JSON_EXTRACT(c.attrs, '$.size_bucket') IN ({', '.join(placeholders)})",
-    )
+    conditions.append(f"JSON_EXTRACT(c.attrs, '$.size_bucket') IN ({', '.join(placeholders)})")
 
 
 def _apply_tech_filter(
@@ -391,9 +415,7 @@ def _apply_recency_filter(
 
     cutoff_str = _compute_recency_cutoff(params.recency_days)
     sql_params["recency_cutoff"] = cutoff_str
-    conditions.append(
-        "ve.verified_at IS NOT NULL AND ve.verified_at >= :recency_cutoff",
-    )
+    conditions.append("ve.verified_at IS NOT NULL AND ve.verified_at >= :recency_cutoff")
 
 
 def _apply_keyset_pagination(
@@ -447,18 +469,15 @@ def _build_order_by(sort: str) -> str:
         """
 
 
-def search_people_leads(conn: sqlite3.Connection, params: LeadSearchParams) -> list[dict[str, Any]]:
+def search_people_leads(
+    conn: sqlite3.Connection | None,
+    params: LeadSearchParams,
+) -> list[dict[str, Any]]:
     """
     Perform a full-text search over people_fts + joins to people, companies, v_emails_latest.
 
-    This is the main helper R22's /leads/search will call on SQLite. It:
-
-      * Uses FTS5 (people_fts) to match the text query.
-      * Joins back to people, companies, v_emails_latest for metadata and filters.
-      * Applies filters for verify_status, icp_min, roles, seniority, industry,
-        size, tech, source, and recency_days when provided.
-      * Applies sort + keyset pagination based on params.sort and cursor_*.
-      * Returns a list of plain dicts suitable for JSON serialization.
+    Accepts an explicit sqlite3.Connection. If conn is None, this function will open
+    a connection using src.db.get_conn() and close it before returning.
 
     Returned dict keys (subject to the underlying schema) include at least:
       - email
@@ -483,42 +502,64 @@ def search_people_leads(conn: sqlite3.Connection, params: LeadSearchParams) -> l
       - person_id
       - rank            (FTS bm25 score; lower is "more relevant")
     """
-    sort = _normalize_query_and_sort(params)
+    owns_conn = False
+    if conn is None:
+        from src.db import get_conn
 
-    has_company_attrs, industry_expr, size_expr, attrs_expr = _detect_company_schema(conn)
-    has_ve_source, source_expr, source_url_expr = _detect_ve_schema(conn)
+        conn = get_conn()
+        owns_conn = True
 
-    base_sql = _build_base_sql(industry_expr, size_expr, attrs_expr, source_expr, source_url_expr)
+    try:
+        sort = _normalize_query_and_sort(params)
 
-    sql_params: dict[str, Any] = {
-        "query": params.query,
-        "limit": params.limit,
-    }
-    conditions: list[str] = []
+        has_company_attrs, industry_expr, size_expr, attrs_expr = _detect_company_schema(conn)
+        has_ve_source, source_expr, source_url_expr = _detect_ve_schema(conn)
 
-    _apply_icp_filter(params, conditions, sql_params)
-    _apply_verify_status_filter(params, conditions, sql_params)
-    _apply_roles_filter(params, conditions, sql_params)
-    _apply_seniority_filter(params, conditions, sql_params)
-    _apply_industry_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_size_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_tech_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_source_filter(params, has_ve_source, conditions, sql_params)
-    _apply_recency_filter(params, conditions, sql_params)
-    _apply_keyset_pagination(sort, params, conditions, sql_params)
+        base_sql = _build_base_sql(
+            industry_expr,
+            size_expr,
+            attrs_expr,
+            source_expr,
+            source_url_expr,
+        )
 
-    if conditions:
-        base_sql += " AND " + " AND ".join(conditions)
+        match_query = _normalize_fts_query(params.query or "")
 
-    order_by = _build_order_by(sort)
-    base_sql += f"""
-        {order_by}
-        LIMIT :limit
-    """
+        sql_params: dict[str, Any] = {
+            "query": match_query,
+            "limit": params.limit,
+        }
+        conditions: list[str] = []
 
-    cur = conn.execute(base_sql, sql_params)
-    rows = cur.fetchall()
-    return _rows_to_dicts(cur, rows)
+        # Always apply FTS match; query non-empty is enforced in _normalize_query_and_sort.
+        conditions.append("people_fts MATCH :query")
+
+        _apply_icp_filter(params, conditions, sql_params)
+        _apply_verify_status_filter(params, conditions, sql_params)
+        _apply_roles_filter(params, conditions, sql_params)
+        _apply_seniority_filter(params, conditions, sql_params)
+        _apply_industry_filter(params, has_company_attrs, conditions, sql_params)
+        _apply_size_filter(params, has_company_attrs, conditions, sql_params)
+        _apply_tech_filter(params, has_company_attrs, conditions, sql_params)
+        _apply_source_filter(params, has_ve_source, conditions, sql_params)
+        _apply_recency_filter(params, conditions, sql_params)
+        _apply_keyset_pagination(sort, params, conditions, sql_params)
+
+        if conditions:
+            base_sql += " AND " + " AND ".join(conditions)
+
+        order_by = _build_order_by(sort)
+        base_sql += f"""
+            {order_by}
+            LIMIT :limit
+        """
+
+        cur = conn.execute(base_sql, sql_params)
+        rows = cur.fetchall()
+        return _rows_to_dicts(cur, rows)
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
 
 
 def _build_join_facet_base_sql(
@@ -548,7 +589,7 @@ def _build_join_facet_base_sql(
 
     if params.query and params.query.strip():
         conditions.append("people_fts MATCH :query")
-        sql_params["query"] = params.query
+        sql_params["query"] = _normalize_fts_query(params.query)
 
     _apply_icp_filter(params, conditions, sql_params)
     _apply_verify_status_filter(params, conditions, sql_params)
@@ -718,9 +759,7 @@ def _build_mv_base_sql(params: LeadSearchParams) -> tuple[str, dict[str, Any]]:
     if params.recency_days is not None:
         cutoff_str = _compute_recency_cutoff(params.recency_days)
         sql_params["recency_cutoff"] = cutoff_str
-        conditions.append(
-            "d.verified_at IS NOT NULL AND d.verified_at >= :recency_cutoff",
-        )
+        conditions.append("d.verified_at IS NOT NULL AND d.verified_at >= :recency_cutoff")
 
     if conditions:
         base_sql += " AND " + " AND ".join(conditions)
@@ -821,7 +860,7 @@ def compute_facets(conn: sqlite3.Connection, params: LeadSearchParams) -> FacetC
                 SELECT name
                 FROM sqlite_master
                 WHERE type = 'table' AND name = 'lead_search_docs'
-                """
+                """,
             )
             use_mv = cur.fetchone() is not None
         except sqlite3.Error:
@@ -899,7 +938,7 @@ def fuzzy_company_lookup(
               ON c.id = companies_fts.rowid
             WHERE companies_fts MATCH :match
             """,
-            {"match": query},
+            {"match": _normalize_fts_query(query)},
         )
         rows = cur.fetchall()
         for row in _rows_to_dicts(cur, rows):
@@ -909,8 +948,8 @@ def fuzzy_company_lookup(
         pass
 
     # 2) Fallback / augmentation: if we have too few candidates, add all companies.
-    MIN_CANDIDATES = 3
-    if len(candidates_by_id) < MIN_CANDIDATES:
+    min_candidates = 3
+    if len(candidates_by_id) < min_candidates:
         cur = conn.execute(
             """
             SELECT
@@ -918,7 +957,7 @@ def fuzzy_company_lookup(
               c.name AS name,
               COALESCE(c.official_domain, c.domain) AS domain
             FROM companies AS c
-            """
+            """,
         )
         rows = cur.fetchall()
         for row in _rows_to_dicts(cur, rows):

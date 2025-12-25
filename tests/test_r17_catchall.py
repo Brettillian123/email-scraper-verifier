@@ -16,7 +16,9 @@ from src.queueing import tasks as qtasks
 
 
 @pytest.fixture
-def memory_db(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Connection, Callable[..., None]]:
+def memory_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[sqlite3.Connection, Callable[..., None]]:
     """
     In-memory domain_resolutions table wired into src.verify.catchall.get_connection().
     Minimal schema that matches what catchall.py expects.
@@ -27,9 +29,13 @@ def memory_db(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Connection, Call
         """
         CREATE TABLE domain_resolutions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER,
+            company_name TEXT,
+            chosen_domain TEXT,
             domain TEXT,
             lowest_mx TEXT,
             resolved_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             catch_all_status TEXT,
             catch_all_checked_at TEXT,
             catch_all_localpart TEXT,
@@ -41,8 +47,11 @@ def memory_db(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Connection, Call
 
     def seed(domain: str, lowest_mx: str | None = "mx.test.local") -> None:
         conn.execute(
-            "INSERT INTO domain_resolutions (domain, lowest_mx, resolved_at) VALUES (?,?,?)",
-            (domain, lowest_mx, "2025-01-01T00:00:00Z"),
+            """
+            INSERT INTO domain_resolutions (domain, chosen_domain, lowest_mx, resolved_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (domain, domain, lowest_mx, "2025-01-01T00:00:00Z"),
         )
         conn.commit()
 
@@ -136,7 +145,11 @@ def test_catchall_probe_550_yields_not_catch_all(
     assert res.rcpt_code == 550
 
     row = conn.execute(
-        "SELECT catch_all_status, catch_all_smtp_code FROM domain_resolutions WHERE domain = ?",
+        """
+        SELECT catch_all_status, catch_all_smtp_code
+          FROM domain_resolutions
+         WHERE domain = ?
+        """,
         (domain,),
     ).fetchone()
     assert row is not None
@@ -163,7 +176,11 @@ def test_catchall_probe_450_yields_tempfail(memory_db, monkeypatch: pytest.Monke
     assert res.error is not None
 
     row = conn.execute(
-        "SELECT catch_all_status, catch_all_smtp_code FROM domain_resolutions WHERE domain = ?",
+        """
+        SELECT catch_all_status, catch_all_smtp_code
+          FROM domain_resolutions
+         WHERE domain = ?
+        """,
         (domain,),
     ).fetchone()
     assert row is not None
@@ -213,6 +230,7 @@ def test_catchall_no_mx_yields_no_mx_and_skips_smtp(
     called = {"probe": False}
 
     def fake_probe(*args, **kwargs):
+        _ = (args, kwargs)
         called["probe"] = True
         return 250, b"OK", 1.0, None
 
@@ -227,7 +245,11 @@ def test_catchall_no_mx_yields_no_mx_and_skips_smtp(
     assert res.rcpt_code is None
 
     row = conn.execute(
-        "SELECT catch_all_status, catch_all_smtp_code FROM domain_resolutions WHERE domain = ?",
+        """
+        SELECT catch_all_status, catch_all_smtp_code
+          FROM domain_resolutions
+         WHERE domain = ?
+        """,
         (domain,),
     ).fetchone()
     assert row is not None
@@ -309,7 +331,6 @@ def test_catchall_force_bypasses_cache(memory_db, monkeypatch: pytest.MonkeyPatc
 
     def fake_probe(mx: str, dom: str, localpart: str):
         probe_calls["count"] += 1
-        # Different code each time for clarity
         code = 550 if probe_calls["count"] == 1 else 250
         return code, b"mock", 5.0, None
 
@@ -344,10 +365,11 @@ def test_catchall_force_bypasses_cache(memory_db, monkeypatch: pytest.MonkeyPatc
 
 
 def test_task_check_catchall_success_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Ensure the R17 task returns the expected dict shape and passes through
-    fields from CatchallResult.
-    """
+    # Patch the TCP25 preflight to succeed
+    def fake_preflight(mx_host, *, timeout_s=1.5, redis=None, ttl_s=300):
+        return {"ok": True, "mx_host": mx_host, "cached": False, "error": None}
+
+    monkeypatch.setattr(qtasks, "_smtp_tcp25_preflight_mx", fake_preflight)
 
     def fake_check(domain: str, *, force: bool = False):
         assert domain == "example.com"

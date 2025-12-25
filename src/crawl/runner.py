@@ -24,6 +24,10 @@ class Page:
     url: str
     html: bytes  # store bytes; decode later when parsing
     fetched_at: float
+    # Optional: logical owner of this page in the companies table.
+    # For legacy crawls (R10) this will be None; company-aware callers
+    # (via crawl_domain_for_company) will set it.
+    company_id: int | None = None
 
 
 # Schemes we never enqueue (R10: skip mailto/offsite/JS/etc.)
@@ -154,4 +158,19 @@ def crawl_domain(domain: str) -> list[Page]:
             if looks_relevant(cand, hints):
                 q.append((cand, depth + 1))
 
+    return pages
+
+
+def crawl_domain_for_company(domain: str, company_id: int) -> list[Page]:
+    """
+    Convenience helper: crawl a domain and tag each Page with a company_id.
+
+    This does not touch the database; it simply runs the standard R10 crawl
+    and annotates the resulting Page objects. Callers can then pass the pages
+    to src.db_pages.save_pages(..., default_company_id=company_id) or rely
+    on save_pages() to read the Page.company_id attribute directly.
+    """
+    pages = crawl_domain(domain)
+    for p in pages:
+        p.company_id = company_id
     return pages

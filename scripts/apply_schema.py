@@ -2,6 +2,7 @@
 # scripts/apply_schema.py
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sqlite3
@@ -16,6 +17,12 @@ SCHEMA_FILE = ROOT / "db" / "schema.sql"
 # Columns that must NEVER be uniquely indexed (multi-brand rule)
 _OFFICIAL_COLS = ("official_domain", "domain_official")
 
+# Optional O26 migration import (handled gracefully if missing)
+try:
+    from migrate_o26_test_send_bounce import migrate as migrate_o26
+except ImportError:  # pragma: no cover - O26 not present in some environments
+    migrate_o26 = None  # type: ignore[assignment]
+
 
 def _is_windows_drive(p: str) -> bool:
     # e.g., "C:/path" or "D:\\path"
@@ -24,8 +31,10 @@ def _is_windows_drive(p: str) -> bool:
 
 def resolve_sqlite_path() -> Path:
     """
+    Resolve the SQLite database path.
+
     Accepts:
-      - no env var  -> defaults to <repo>/dev.db
+      - no env var  -> defaults to <repo>/data/dev.db if data/ exists, else <repo>/dev.db
       - DATABASE_URL like sqlite:///relative/dev.db
       - DATABASE_URL like sqlite:////absolute/posix/dev.db
       - DATABASE_URL like sqlite:///C:/Users/You/email-scraper/dev.db (Windows)
@@ -172,7 +181,8 @@ def _drop_unique_official_if_present(conn: sqlite3.Connection) -> None:
 def _object_exists(conn: sqlite3.Connection, name: str) -> bool:
     return (
         conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view' OR type='index') AND name=?;",
+            "SELECT 1 FROM sqlite_master "
+            "WHERE (type='table' OR type='view' OR type='index') AND name=?;",
             (name,),
         ).fetchone()
         is not None
@@ -270,8 +280,12 @@ def ensure_v_emails_latest(conn: sqlite3.Connection) -> None:
     )
 
 
-def main() -> None:
-    db_path = resolve_sqlite_path()
+def main(db_arg: str | None = None) -> None:
+    if db_arg:
+        db_path = Path(db_arg).resolve()
+    else:
+        db_path = resolve_sqlite_path()
+
     print(f"→ Using SQLite at: {db_path}")
 
     with connect(db_path) as conn:
@@ -284,6 +298,14 @@ def main() -> None:
             conn
         )  # emails(email) only; multi-brand forbids uniqueness on official-domain
         ensure_v_emails_latest(conn)
+
+        # NEW: ensure O26 schema (verification_results + domain_resolutions)
+        if migrate_o26 is not None:
+            print("→ Ensuring O26 schema (test-send/bounce + domain delivery flags)...")
+            migrate_o26(conn)
+        else:
+            print("⚠ O26 migration script not found; skipping O26 schema ensure.")
+
         conn.commit()
 
         verify_integrity(conn)
@@ -303,4 +325,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--db",
+        dest="db_path",
+        help="Path to SQLite DB (overrides DATABASE_URL / default dev.db)",
+    )
+    args = parser.parse_args()
+    main(args.db_path)

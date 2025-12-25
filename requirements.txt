@@ -16,6 +16,9 @@ lxml>=4.9,<6.0
 # === Reliability/utilities ===
 tenacity>=8.2,<9.0
 
+# === AI people extraction (O27) ===
+openai>=1.52.0
+
 # === Internationalization (O09) ===
 Unidecode>=1.3
 
@@ -36,3 +39,5 @@ tldextract==3.6.0
 fastapi
 uvicorn[standard]
 jinja2
+
+boto3

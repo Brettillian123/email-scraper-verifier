@@ -10,6 +10,7 @@ import pytest
 
 from src.search.backend import SqliteFtsBackend
 from src.search.indexing import LeadSearchParams, search_people_leads
+from src.verify.labels import VerifyLabel
 
 # ---------------------------------------------------------------------------
 # In-memory DB fixture for search tests
@@ -450,3 +451,105 @@ def test_icp_desc_keyset_pagination(memory_db: SimpleNamespace) -> None:
 
     # Scores are sorted descending overall.
     assert all_scores == sorted(all_scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# O26 — verify_label + primary/alternate enrichment tests
+# ---------------------------------------------------------------------------
+
+
+def test_backend_adds_verify_label_for_single_valid(memory_db: SimpleNamespace) -> None:
+    """
+    For a person with a single valid email, the backend should annotate the
+    row with a primary-native verify_label and is_primary_for_person=True.
+    """
+    db = memory_db
+
+    db.seed_lead(
+        full_name="Solo Lead",
+        title="Sales Exec",
+        icp_score=80,
+        email="solo@example.com",
+        verify_status="valid",
+    )
+
+    backend = SqliteFtsBackend(db.conn)
+    params = LeadSearchParams(
+        query="sales",
+        sort="icp_desc",
+        limit=10,
+    )
+    rows = backend.search_leads(params)
+
+    assert len(rows) == 1
+    row = rows[0]
+
+    assert row["email"] == "solo@example.com"
+    assert row["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
+    assert row["is_primary_for_person"] is True
+
+
+def test_backend_primary_and_alternate_labels_for_multiple_valids(
+    memory_db: SimpleNamespace,
+) -> None:
+    """
+    When a person has multiple valid emails, the backend should choose a single
+    primary using heuristics (name-like vs role-like localpart) and label the
+    others as alternates.
+    """
+    db = memory_db
+
+    # First email: human-looking pattern, e.g. brett.anderson@...
+    person_id = db.seed_lead(
+        full_name="Brett Anderson",
+        title="Sales Exec",
+        icp_score=80,
+        email="brett.anderson@example.com",
+        verify_status="valid",
+        source="generated",
+    )
+
+    # Second email: role-like address for the same person.
+    db.conn.execute(
+        """
+        INSERT INTO v_emails_latest (
+          person_id,
+          email,
+          source,
+          source_url,
+          verify_status,
+          verified_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            person_id,
+            "info@example.com",
+            "generated",
+            "https://example.test/source2",
+            "valid",
+            "2025-01-02 00:00:00",
+        ),
+    )
+
+    backend = SqliteFtsBackend(db.conn)
+    params = LeadSearchParams(
+        query="sales",
+        sort="icp_desc",
+        limit=10,
+    )
+    rows = backend.search_leads(params)
+
+    # We expect two leads for the same person (one primary, one alternate).
+    emails = {row["email"] for row in rows}
+    assert emails == {"brett.anderson@example.com", "info@example.com"}
+
+    by_email = {row["email"]: row for row in rows}
+    primary = by_email["brett.anderson@example.com"]
+    alternate = by_email["info@example.com"]
+
+    assert primary["is_primary_for_person"] is True
+    assert alternate["is_primary_for_person"] is False
+
+    assert primary["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
+    assert alternate["verify_label"] == VerifyLabel.VALID_NATIVE_ALTERNATE

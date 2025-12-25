@@ -1,7 +1,7 @@
-# src/cli/__init__.py
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import sys
 from collections.abc import Sequence
@@ -16,6 +16,19 @@ def _print_header(title: str, out: TextIO) -> None:
 
 def _print_kv(label: str, value: Any, out: TextIO) -> None:
     out.write(f"{label}: {value}\n")
+
+
+def _json_default(obj: Any) -> Any:
+    """
+    JSON serializer for objects not serializable by default json code.
+
+    Currently:
+      - datetime/date -> ISO8601 string
+      - everything else -> str(obj)
+    """
+    if isinstance(obj, (dt.datetime, dt.date)):
+        return obj.isoformat()
+    return str(obj)
 
 
 def _print_admin_status_human(
@@ -207,7 +220,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "summary": summary,
             "analytics": analytics,
         }
-        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        json.dump(
+            payload,
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        )
         sys.stdout.write("\n")
     else:
         _print_admin_status_human(summary, analytics, sys.stdout)

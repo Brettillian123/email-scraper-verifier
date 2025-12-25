@@ -1,3 +1,4 @@
+-- db/schema.sql
 -- companies (writer updates official_ domain is nullable)
 CREATE TABLE IF NOT EXISTS companies (
   id INTEGER PRIMARY KEY,

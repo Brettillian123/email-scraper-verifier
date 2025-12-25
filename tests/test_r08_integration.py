@@ -1,21 +1,53 @@
-import sqlite3
+# tests/test_r08_integration.py
+"""
+R08 Integration Test - Domain Resolution
 
-from src.queueing.tasks import resolve_company_domain
+Tests that resolve_company_domain correctly:
+1. Writes company data to the companies table
+2. Creates an audit trail in domain_resolutions
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+# Get repo root for schema path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_PATH = REPO_ROOT / "db" / "schema.sql"
 
 
 def test_resolver_writes_company_and_audit(tmp_path, monkeypatch):
-    # Create an isolated DB and load your schema into it
+    """Test that domain resolution writes to companies and domain_resolutions tables."""
+    import src.db as db_mod
+    import src.queueing.tasks as tasks_mod
+    from src.queueing.tasks import resolve_company_domain
+
+    # Create an isolated DB and load schema into it
     db_path = tmp_path / "t.db"
+
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
+        schema_sql = f.read()
+
     con = sqlite3.connect(db_path)
-    with open("db/schema.sql", encoding="utf-8") as f:
-        con.executescript(f.read())
+    con.executescript(schema_sql)
     con.close()
 
-    # Point the app code at our temp DB (used by tasks._conn())
+    # CRITICAL: Patch at multiple levels to override conftest.py fixtures
+    def _test_conn():
+        return sqlite3.connect(str(db_path))
+
+    # Patch the tasks module's _conn helper
+    monkeypatch.setattr(tasks_mod, "_conn", _test_conn)
+
+    # Also patch the main db module's get_conn (conftest may patch this)
+    monkeypatch.setattr(db_mod, "get_conn", _test_conn)
+
+    # Also set the env var for any code that reads it directly
     monkeypatch.setenv("DATABASE_PATH", str(db_path))
 
     # Seed a company row (minimal insert; other fields default NULL)
-    with sqlite3.connect(db_path) as con:
+    with sqlite3.connect(str(db_path)) as con:
         cur = con.execute("INSERT INTO companies(name) VALUES (?)", ("Bücher GmbH",))
         company_id = cur.lastrowid
 
@@ -31,7 +63,7 @@ def test_resolver_writes_company_and_audit(tmp_path, monkeypatch):
     assert res["confidence"] >= 80
 
     # Verify company row was updated with the official domain & confidence
-    with sqlite3.connect(db_path) as con:
+    with sqlite3.connect(str(db_path)) as con:
         row = con.execute(
             "SELECT official_domain, official_domain_confidence FROM companies WHERE id = ?",
             (company_id,),

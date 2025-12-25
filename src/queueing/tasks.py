@@ -406,7 +406,7 @@ def verify_email_task(  # noqa: C901
 
     except TemporarySMTPError as e:
         # Throttling / soft failure; do not re-raise by default.
-        status, reason = "unknown_timeout", (str(e) or "temp_error")
+        status, reason = "unknown", (str(e) or "temp_error")
         latency_ms = int((time.perf_counter() - start) * 1000)
         log.warning(
             "temporary failure handled",
@@ -1250,7 +1250,7 @@ def _maybe_escalate_to_test_send(
     bounce-based test-send path and, if so, enqueue the test-send job.
 
     Escalation rules:
-      - Only when verify_status == "unknown_timeout".
+      - Only when verify_status == "unknown".
       - Only when the MX is classified as probe-hostile by behavior hints.
       - Only for tempfail/timeout/blocked RCPT-style outcomes.
       - Only when no test-send has been requested yet (new row ->
@@ -1352,7 +1352,7 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
     if not tcp25_ok and not bool(force):
         payload: dict[str, Any] = {
             "ok": False,
-            "category": "unknown_timeout",
+            "category": "unknown",
             "code": None,
             "mx_host": mx_host,
             "domain": dom,

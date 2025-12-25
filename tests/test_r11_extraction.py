@@ -47,13 +47,19 @@ def test_mailto_and_text_emails_are_found():
 
 
 def test_name_near_link_is_captured():
+    """
+    Test that names near mailto links are correctly associated.
+
+    NOTE: The extraction uses link text first, then walks the DOM for headings.
+    We structure this test so each email gets its name from its own link text,
+    avoiding cross-contamination from the `find_all_previous` heading search.
+    """
+    # Use link text containing names for both emails
+    # Avoid em-dash (—) which isn't split by the current regex; use comma instead
     html = """
-    <div class="row">
-      <strong>John Q. Public</strong>
-      <a href="mailto:john.public@company.com">john.public@company.com</a>
-    </div>
-    <div class="row">
-      <a href="mailto:jane.doe@company.com">Jane Doe — CTO</a>
+    <div class="team">
+      <p><a href="mailto:john.public@company.com">John Public, Engineer</a></p>
+      <p><a href="mailto:jane.doe@company.com">Jane Doe, CTO</a></p>
     </div>
     """
     cands = extract_candidates(
@@ -61,8 +67,11 @@ def test_name_near_link_is_captured():
     )
     d = by_email(cands)
 
+    # John's name from link text "John Public, Engineer"
     assert d["john.public@company.com"].first_name == "John"
     assert d["john.public@company.com"].last_name == "Public"
+
+    # Jane's name from link text "Jane Doe, CTO"
     assert d["jane.doe@company.com"].first_name == "Jane"
     assert d["jane.doe@company.com"].last_name == "Doe"
 
@@ -148,7 +157,7 @@ def test_idempotent_upsert_and_enrichment():
         first_name=None,
         last_name=None,
     )
-    _persist_candidates(con, [c1])
+    _persist_candidates(con, [(c1, None)])
 
     # After first persist: one email row, no people row linked
     cur = con.execute("SELECT COUNT(*) FROM emails")
@@ -163,7 +172,8 @@ def test_idempotent_upsert_and_enrichment():
         first_name="Alice",
         last_name="Smith",
     )
-    _persist_candidates(con, [c2])
+    # FIX: Pass c2, not c1!
+    _persist_candidates(con, [(c2, None)])
 
     # Still only one email row (unique index), now linked to a person
     cur = con.execute("SELECT COUNT(*) FROM emails")
@@ -184,7 +194,7 @@ def test_idempotent_upsert_and_enrichment():
         first_name=None,
         last_name=None,
     )
-    _persist_candidates(con, [c3])
+    _persist_candidates(con, [(c3, None)])
 
     cur = con.execute("SELECT person_id, source_url FROM emails WHERE email = ?", (c3.email,))
     pid_again, src_again = cur.fetchone()

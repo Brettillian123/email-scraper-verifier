@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Generator
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,22 +19,23 @@ from src.verify.labels import VerifyLabel
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def api_memory_db() -> SimpleNamespace:
+@pytest.fixture(scope="function")
+def api_test_env(monkeypatch) -> Generator[SimpleNamespace, None, None]:
     """
-    Lightweight in-memory SQLite DB for /leads/search API tests.
+    Combined fixture that creates in-memory DB, patches all DB access,
+    and returns TestClient + seed helper.
 
-    Schema mirrors the subset used by search_people_leads():
-
-      - companies
-      - people
-      - v_emails_latest
-      - people_fts (FTS5)
-
-    Exposes seed_lead() to create a company + person + v_emails_latest row and
-    wire up the FTS entry.
+    Uses FastAPI's dependency_overrides to ensure our backend is used.
     """
-    # NOTE: allow this connection to be used from FastAPI's TestClient thread
+    import src.api.app as app_mod
+    import src.db as db_mod
+    import src.search.backend as backend_mod
+    import src.search.indexing as indexing_mod
+
+    # CRITICAL: Clear any stale backend from previous tests first.
+    app.state.search_backend = None
+
+    # Create fresh in-memory database
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
 
@@ -78,6 +80,47 @@ def api_memory_db() -> SimpleNamespace:
         );
         """,
     )
+    conn.commit()
+
+    # Create backend with our connection
+    backend = SqliteFtsBackend(conn)
+
+    # Named functions to avoid lambda closure issues
+    def _get_conn():
+        return conn
+
+    # Patch db.get_conn AND db.get_connection at BOTH definition and all import sites
+    monkeypatch.setattr(db_mod, "get_conn", _get_conn)
+    if hasattr(db_mod, "get_connection"):
+        monkeypatch.setattr(db_mod, "get_connection", lambda path=None: conn)
+
+    # Patch anywhere get_conn might have been imported
+    for mod in (backend_mod, indexing_mod, app_mod):
+        if hasattr(mod, "get_conn"):
+            monkeypatch.setattr(mod, "get_conn", _get_conn)
+
+    # Patch backend getters everywhere
+    def _return_backend(*args, **kwargs):
+        _ = (args, kwargs)
+        return backend
+
+    for mod in (backend_mod, indexing_mod, app_mod):
+        for attr in (
+            "get_backend",
+            "get_search_backend",
+            "_get_default_backend",
+            "_get_search_backend",
+        ):
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, _return_backend)
+
+    # CRITICAL: Patch _get_search_backend in app module specifically.
+    monkeypatch.setattr(app_mod, "_get_search_backend", _return_backend)
+
+    # Set app.state as backup
+    if hasattr(app.state, "_state"):
+        app.state._state.clear()
+    app.state.search_backend = backend
 
     def seed_lead(
         *,
@@ -95,11 +138,6 @@ def api_memory_db() -> SimpleNamespace:
         source: str = "generated",
         source_url: str = "https://example.test/source",
     ) -> int:
-        """
-        Insert a single lead (company + person + v_emails_latest + FTS).
-
-        Returns the new person_id.
-        """
         if company_attrs is None:
             company_attrs = {}
 
@@ -118,17 +156,9 @@ def api_memory_db() -> SimpleNamespace:
         cur = conn.execute(
             """
             INSERT INTO people (
-              company_id,
-              first_name,
-              last_name,
-              full_name,
-              title,
-              title_norm,
-              role_family,
-              seniority,
-              icp_score
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              company_id, first_name, last_name, full_name, title, title_norm,
+              role_family, seniority, icp_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 company_id,
@@ -144,7 +174,6 @@ def api_memory_db() -> SimpleNamespace:
         )
         person_id = cur.lastrowid
 
-        # FTS row: rowid must match people.id for the join in search_people_leads.
         conn.execute(
             """
             INSERT INTO people_fts (rowid, full_name, title, company_name)
@@ -156,41 +185,36 @@ def api_memory_db() -> SimpleNamespace:
         conn.execute(
             """
             INSERT INTO v_emails_latest (
-              person_id,
-              email,
-              source,
-              source_url,
-              verify_status,
-              verified_at
+                person_id, email, source, source_url, verify_status, verified_at
             )
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                person_id,
-                email,
-                source,
-                source_url,
-                verify_status,
-                verified_at,
-            ),
+            (person_id, email, source, source_url, verify_status, verified_at),
         )
-
+        conn.commit()
         return person_id
 
-    return SimpleNamespace(conn=conn, seed_lead=seed_lead)
+    # Create client AFTER all patches are applied
+    client = TestClient(app)
+
+    yield SimpleNamespace(client=client, conn=conn, seed_lead=seed_lead)
+
+    # Cleanup - reset app state
+    app.state.search_backend = None
+    conn.close()
 
 
-@pytest.fixture
-def api_client(api_memory_db: SimpleNamespace) -> TestClient:
-    """
-    FastAPI TestClient backed by an in-memory SqliteFtsBackend.
+# Legacy fixtures for backward compatibility with existing tests
+@pytest.fixture(scope="function")
+def api_memory_db(api_test_env) -> SimpleNamespace:
+    """Backward-compatible fixture returning conn and seed_lead."""
+    return SimpleNamespace(conn=api_test_env.conn, seed_lead=api_test_env.seed_lead)
 
-    We inject the backend via app.state.search_backend so that the HTTP layer
-    uses our test DB instead of opening a real file on disk.
-    """
-    backend = SqliteFtsBackend(api_memory_db.conn)
-    app.state.search_backend = backend
-    return TestClient(app)
+
+@pytest.fixture(scope="function")
+def api_client(api_test_env) -> TestClient:
+    """Backward-compatible fixture returning TestClient."""
+    return api_test_env.client
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +394,6 @@ def test_industry_size_tech_filters_api(
     assert emails == {"saas@example.com"}
     assert industries == {"B2B SaaS"}
     assert sizes == {"51-200"}
-    # At least one of the results should mention "salesforce" in its tech list.
     assert any("salesforce" in tech for tech in tech_lists)
 
 
@@ -433,9 +456,7 @@ def test_pagination_with_cursor_icp_desc(
     all_emails = [r["email"] for r in results1 + results2]
     all_scores = [r["icp_score"] for r in results1 + results2]
 
-    # No duplicates across pages
     assert len(all_emails) == len(set(all_emails)) == 4
-    # Scores are sorted descending overall
     assert all_scores == sorted(all_scores, reverse=True)
 
 
@@ -514,37 +535,125 @@ def test_api_returns_verify_label_for_single_valid_lead(
     assert row["is_primary_for_person"] is True
 
 
-def test_api_primary_and_alternate_labels_for_multiple_valids(
-    api_client: TestClient,
-    api_memory_db: SimpleNamespace,
-) -> None:
+def test_api_primary_and_alternate_labels_for_multiple_valids(monkeypatch) -> None:
     """
     When a person has multiple valid emails, /leads/search should expose a
     single primary and mark the others as alternates via verify_label and
     is_primary_for_person.
-    """
-    db = api_memory_db
 
-    # First email: human-looking pattern, e.g. brett.anderson@...
-    person_id = db.seed_lead(
-        full_name="Brett Anderson",
-        title="Sales Exec",
-        icp_score=80,
-        email="brett.anderson@example.com",
-        verify_status="valid",
-        source="generated",
+    This test disables cache and patches the backend getter to ensure complete
+    isolation from other tests.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setenv("LEAD_SEARCH_CACHE_ENABLED", "0")
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(
+        """
+        CREATE TABLE companies (
+          id INTEGER PRIMARY KEY,
+          name TEXT,
+          domain TEXT,
+          official_domain TEXT,
+          attrs TEXT
+        );
+
+        CREATE TABLE people (
+          id INTEGER PRIMARY KEY,
+          company_id INTEGER NOT NULL,
+          first_name TEXT,
+          last_name TEXT,
+          full_name TEXT,
+          title TEXT,
+          title_norm TEXT,
+          role_family TEXT,
+          seniority TEXT,
+          icp_score INTEGER,
+          FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE v_emails_latest (
+          person_id INTEGER NOT NULL,
+          email TEXT NOT NULL,
+          source TEXT,
+          source_url TEXT,
+          verify_status TEXT,
+          verified_at TEXT,
+          FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE people_fts USING fts5(
+          full_name,
+          title,
+          company_name
+        );
+        """,
+    )
+    conn.commit()
+
+    backend = SqliteFtsBackend(conn)
+
+    cur = conn.execute(
+        """
+        INSERT INTO companies (name, domain, official_domain, attrs)
+        VALUES (?, ?, ?, ?)
+        """,
+        ("Acme Corp", "acme.test", "acme.test", "{}"),
+    )
+    company_id = cur.lastrowid
+
+    cur = conn.execute(
+        """
+        INSERT INTO people (
+          company_id, first_name, last_name, full_name, title, title_norm,
+          role_family, seniority, icp_score
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            company_id,
+            "Brett",
+            "Anderson",
+            "Brett Anderson",
+            "Sales Exec",
+            "Sales Exec",
+            "sales",
+            "vp",
+            80,
+        ),
+    )
+    person_id = cur.lastrowid
+
+    conn.execute(
+        """
+        INSERT INTO people_fts (rowid, full_name, title, company_name)
+        VALUES (?, ?, ?, ?)
+        """,
+        (person_id, "Brett Anderson", "Sales Exec", "Acme Corp"),
     )
 
-    # Second email: role-like address for the same person.
-    db.conn.execute(
+    conn.execute(
         """
         INSERT INTO v_emails_latest (
-          person_id,
-          email,
-          source,
-          source_url,
-          verify_status,
-          verified_at
+            person_id, email, source, source_url, verify_status, verified_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            person_id,
+            "brett.anderson@example.com",
+            "generated",
+            "https://example.test/source",
+            "valid",
+            "2025-01-01 00:00:00",
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO v_emails_latest (
+            person_id, email, source, source_url, verify_status, verified_at
         )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
@@ -557,29 +666,37 @@ def test_api_primary_and_alternate_labels_for_multiple_valids(
             "2025-01-02 00:00:00",
         ),
     )
+    conn.commit()
 
-    resp = api_client.get(
-        "/leads/search",
-        params={
-            "q": "sales",
-            "sort": "icp_desc",
-            "limit": "10",
-        },
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    results = body["results"]
+    app.state.search_backend = None
 
-    # We expect two results for the same person (one primary, one alternate).
-    emails = {r["email"] for r in results}
-    assert emails == {"brett.anderson@example.com", "info@example.com"}
+    with patch("src.api.app._get_search_backend", return_value=backend):
+        with patch("src.search.cache.LEAD_SEARCH_CACHE_ENABLED", False):
+            client = TestClient(app)
 
-    by_email = {r["email"]: r for r in results}
-    primary = by_email["brett.anderson@example.com"]
-    alternate = by_email["info@example.com"]
+            resp = client.get(
+                "/leads/search",
+                params={
+                    "q": "sales",
+                    "sort": "icp_desc",
+                    "limit": "10",
+                },
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            results = body["results"]
 
-    assert primary["is_primary_for_person"] is True
-    assert alternate["is_primary_for_person"] is False
+            emails = {r["email"] for r in results}
+            assert emails == {"brett.anderson@example.com", "info@example.com"}
 
-    assert primary["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
-    assert alternate["verify_label"] == VerifyLabel.VALID_NATIVE_ALTERNATE
+            by_email = {r["email"]: r for r in results}
+            primary = by_email["brett.anderson@example.com"]
+            alternate = by_email["info@example.com"]
+
+            assert primary["is_primary_for_person"] is True
+            assert alternate["is_primary_for_person"] is False
+
+            assert primary["verify_label"] == VerifyLabel.VALID_NATIVE_PRIMARY
+            assert alternate["verify_label"] == VerifyLabel.VALID_NATIVE_ALTERNATE
+
+    conn.close()

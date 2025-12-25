@@ -1,5 +1,7 @@
+# src/search/backend.py
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
@@ -130,6 +132,35 @@ class SqliteFtsBackend:
         diagnostics). Prefer using the search_* methods in normal code.
         """
         return self._conn
+
+    def cache_namespace(self) -> str:
+        """
+        Stable namespace for caching /leads/search results.
+
+        The cache layer must scope keys by active database identity to prevent
+        cross-database collisions (e.g., pytest temp DB vs in-memory DB).
+
+        For SQLite:
+          - file-backed DBs: sqlite:file:<normalized absolute path>
+          - in-memory DBs:  sqlite:mem:<id(conn)>
+        """
+        try:
+            row = self._conn.execute("PRAGMA database_list").fetchone()
+        except Exception:
+            row = None
+
+        file_path = ""
+        if row and len(row) >= 3 and isinstance(row[2], str):
+            file_path = row[2].strip()
+
+        if file_path:
+            try:
+                norm = os.path.normcase(os.path.abspath(file_path))
+            except Exception:
+                norm = file_path
+            return f"sqlite:file:{norm}"
+
+        return f"sqlite:mem:{id(self._conn)}"
 
     def _is_first_page(self, params: LeadSearchParams) -> bool:
         """

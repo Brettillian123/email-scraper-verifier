@@ -163,60 +163,15 @@ def _normalize_query_and_sort(params: LeadSearchParams) -> str:
     """
     Validate query and normalize sort, raising ValueError on invalid input.
     """
-    sort = _normalize_query_and_sort(params)
+    q = (params.query or "").strip()
+    if not q:
+        raise ValueError("query must be a non-empty string")
 
-    has_company_attrs, industry_expr, size_expr, attrs_expr = _detect_company_schema(conn)
-    has_ve_source, source_expr, source_url_expr = _detect_ve_schema(conn)
-
-    base_sql = _build_base_sql(industry_expr, size_expr, attrs_expr, source_expr, source_url_expr)
-
-    sql_params: dict[str, Any] = {
-        "query": params.query,
-        "limit": params.limit,
-    }
-    conditions: list[str] = []
-
-    _apply_icp_filter(params, conditions, sql_params)
-    _apply_verify_status_filter(params, conditions, sql_params)
-    _apply_roles_filter(params, conditions, sql_params)
-    _apply_seniority_filter(params, conditions, sql_params)
-    _apply_industry_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_size_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_tech_filter(params, has_company_attrs, conditions, sql_params)
-    _apply_source_filter(params, has_ve_source, conditions, sql_params)
-    _apply_recency_filter(params, conditions, sql_params)
-    _apply_keyset_pagination(sort, params, conditions, sql_params)
-
-    if conditions:
-        base_sql += " AND " + " AND ".join(conditions)
-
-    order_by = _build_order_by(sort)
-    base_sql += f"""
-        {order_by}
-        LIMIT :limit
-    """
-
-    cur = conn.execute(base_sql, sql_params)
-    rows = cur.fetchall()
-    return _rows_to_dicts(cur, rows)
-
-
-def _build_join_facet_base_sql(
-    conn: sqlite3.Connection,
-    params: LeadSearchParams,
-) -> tuple[str, dict[str, Any], _FacetSchemaInfo]:
-    """
-    Build the FROM/JOIN/WHERE clause used for facet counts when we are not
-    using the materialized view. This mirrors the filters used by
-    search_people_leads, but without keyset pagination or ordering.
-    """
-    has_company_attrs, industry_expr, size_expr, _attrs_expr = _detect_company_schema(conn)
-    has_ve_source, _source_expr, _source_url_expr = _detect_ve_schema(conn)
-
-    sort = params.sort or "icp_desc"
+    sort = (params.sort or "icp_desc").strip()
     if sort not in {"icp_desc", "verified_desc"}:
         msg = f"Unsupported sort value for search_people_leads: {sort!r}"
         raise ValueError(msg)
+
     return sort
 
 
@@ -311,8 +266,6 @@ def _build_base_sql(
           ON c.id = p.company_id
         WHERE 1=1
     """
-    sql_params: dict[str, Any] = {}
-    conditions: list[str] = []
 
 
 def _apply_icp_filter(
@@ -563,7 +516,11 @@ def search_people_leads(
         has_ve_source, source_expr, source_url_expr = _detect_ve_schema(conn)
 
         base_sql = _build_base_sql(
-            industry_expr, size_expr, attrs_expr, source_expr, source_url_expr
+            industry_expr,
+            size_expr,
+            attrs_expr,
+            source_expr,
+            source_url_expr,
         )
 
         match_query = _normalize_fts_query(params.query or "")
@@ -573,6 +530,9 @@ def search_people_leads(
             "limit": params.limit,
         }
         conditions: list[str] = []
+
+        # Always apply FTS match; query non-empty is enforced in _normalize_query_and_sort.
+        conditions.append("people_fts MATCH :query")
 
         _apply_icp_filter(params, conditions, sql_params)
         _apply_verify_status_filter(params, conditions, sql_params)

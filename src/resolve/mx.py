@@ -10,14 +10,22 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 DEFAULT_DB_PATH = "data/dev.db"
 DEFAULT_TTL_SECONDS = 86400  # 24h
 
+# DNS resolver tuning (dnspython):
+# - timeout: per-nameserver try (seconds)
+# - lifetime: total time across nameservers/retries (seconds)
+DNS_RESOLVER_TIMEOUT_SECONDS = float(os.getenv("DNS_RESOLVER_TIMEOUT_SECONDS", "2.0"))
+DNS_RESOLVER_LIFETIME_SECONDS = float(os.getenv("DNS_RESOLVER_LIFETIME_SECONDS", "8.0"))
+
 # Exposed for tests to patch
 _DNSPY_AVAILABLE = False
 try:  # pragma: no cover
+    import dns.exception  # type: ignore
     import dns.resolver  # type: ignore
 
     _DNSPY_AVAILABLE = True
@@ -77,8 +85,8 @@ def _mx_lookup_with_dnspython(domain: str) -> list[tuple[int, str]]:
     """
     assert _DNSPY_AVAILABLE, "dnspython not available"
     resolver = dns.resolver.Resolver()  # type: ignore[name-defined]
-    resolver.lifetime = 2.0
-    resolver.timeout = 2.0
+    resolver.timeout = DNS_RESOLVER_TIMEOUT_SECONDS
+    resolver.lifetime = DNS_RESOLVER_LIFETIME_SECONDS
 
     answers = resolver.resolve(domain, "MX")
     pairs: list[tuple[int, str]] = []
@@ -139,9 +147,8 @@ def _ensure_table(con: sqlite3.Connection) -> None:
 
 def _table_info(con: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
     cur = con.execute(f"PRAGMA table_info({table})")
-    # The connection may already have row_factory set; rely on that.
     rows = cur.fetchall()
-    return rows  # columns: cid, name, type, notnull, dflt_value, pk
+    return rows
 
 
 def _select_row(con: sqlite3.Connection, company_id: int, domain: str) -> sqlite3.Row | None:
@@ -212,7 +219,6 @@ def _default_for_type(sql_type: str) -> Any:
         return 0
     if "BLOB" in t:
         return b""
-    # TEXT or unknown → empty string
     return ""
 
 
@@ -227,14 +233,6 @@ def _build_insert_payload(
     ttl: int,
     failure: str | None,
 ) -> tuple[list[str], list[Any]]:
-    """
-    Build a column/value list that satisfies any extra NOT NULL columns that the
-    live table may have (e.g., company_name NOT NULL). We fill:
-      - known R15 columns we manage
-      - any extra NOT NULL columns without defaults, using sensible fallbacks
-        (TEXT → "", INT/REAL → 0, BLOB → b"") and a special case:
-        company_name → companies.name (fallback "").
-    """
     info = _table_info(con, "domain_resolutions")
     have = {r["name"] for r in info}
 
@@ -252,7 +250,6 @@ def _build_insert_payload(
     cols: list[str] = []
     vals: list[Any] = []
 
-    # 1) Include standard columns if present in the live table
     for k in (
         "company_id",
         "domain",
@@ -267,7 +264,6 @@ def _build_insert_payload(
             cols.append(k)
             vals.append(base_values[k])
 
-    # 2) Satisfy any extra NOT NULL columns with no default
     for r in info:
         name = r["name"]
         if name in cols:
@@ -296,10 +292,6 @@ def _upsert_row(
     ttl: int,
     failure: str | None,
 ) -> int:
-    """
-    Idempotent upsert by (company_id, domain).
-    Returns row_id.
-    """
     row = _select_row(con, company_id, domain)
 
     if row:
@@ -327,7 +319,6 @@ def _upsert_row(
         con.commit()
         return int(row["id"])
 
-    # INSERT path — build a payload that satisfies extra NOT NULL columns
     cols, vals = _build_insert_payload(
         con,
         company_id,
@@ -391,18 +382,18 @@ def resolve_mx(
     """
     Resolve MX for a domain with caching in domain_resolutions.
 
-    Behavior:
-      - Try cache if not forced, not failed, and within TTL.
-      - Resolve MX via dnspython (if available), sorted by (pref ASC, host ASC).
-      - **Null MX** (single record with host ".") → failure="null_mx" and *no* A/AAAA fallback.
-      - On MX failure (non-null), try A/AAAA fallback: treat domain as MX with pref 0 if present.
-      - On full failure, record failure string and empty hosts.
-      - Idempotent write/update by (company_id, domain).
-      - INSERT path fills any unexpected NOT NULL columns (e.g., company_name).
+    Critical rule:
+      - A/AAAA fallback (using the bare domain as MX) ONLY happens when DNS
+        definitively reports no MX (NoAnswer/NXDOMAIN).
+      - If MX lookup times out/errs, do NOT fallback to A/AAAA. That prevents
+        probing CDNs/Cloudflare on :25 and misclassifying as unknown_timeout.
     """
     canon = norm_domain(domain)
     if not canon:
         raise ValueError("empty domain")
+
+    # Ensure DB parent dir exists (sqlite can't create directories)
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -410,7 +401,6 @@ def resolve_mx(
 
     now_epoch = _utc_now_epoch()
 
-    # Cache check
     row = _select_row(con, company_id, canon)
     if row and _should_use_cache(row, now_epoch, force):
         try:
@@ -434,7 +424,6 @@ def resolve_mx(
             cached=True,
         )
 
-    # Fresh resolution path (or refresh)
     failure: str | None = None
     hosts_out: list[str] = []
     prefmap_out: dict[str, int] = {}
@@ -442,18 +431,24 @@ def resolve_mx(
 
     try:
         pairs: list[tuple[int, str]] = []
+        no_mx_definitive = False
+
         if _DNSPY_AVAILABLE:
             try:
                 pairs = _mx_lookup_with_dnspython(canon)
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):  # type: ignore[name-defined]
+                pairs = []
+                no_mx_definitive = True
+            except (dns.exception.Timeout, dns.resolver.Timeout):  # type: ignore[name-defined]
+                pairs = []
+                failure = "mx_lookup_timeout"
             except Exception as e:
                 pairs = []
                 failure = f"mx_lookup_failed:{type(e).__name__}"
         else:
             failure = "mx_lookup_unavailable"
 
-        # ---- Null MX handling (RFC 7505) ----
-        # If the MX RRset consists solely of a single record whose exchange is "."
-        # → do not fallback to A/AAAA; treat as "no mail accepted".
+        # Null MX handling (RFC 7505)
         if len(pairs) == 1 and (pairs[0][1] in (".", "")):
             hosts_out = []
             prefmap_out = {}
@@ -463,18 +458,24 @@ def resolve_mx(
             hosts_out, prefmap_out, lowest = _serialize_result(pairs)
             failure = None
         else:
-            # No MX records → A/AAAA fallback (RFC 5321), unless null_mx (already handled).
-            if _a_or_aaaa_exists(canon):
-                hosts_out = [canon]
-                prefmap_out = {canon: 0}
-                lowest = canon
-                failure = None
+            # Only do RFC A/AAAA fallback if DNS definitively reports no MX.
+            if no_mx_definitive:
+                if _a_or_aaaa_exists(canon):
+                    hosts_out = [canon]
+                    prefmap_out = {canon: 0}
+                    lowest = canon
+                    failure = None
+                else:
+                    hosts_out = []
+                    prefmap_out = {}
+                    lowest = None
+                    failure = "no_mx_and_no_a"
             else:
+                # MX lookup failed/unknown -> do NOT guess by probing A/AAAA.
                 hosts_out = []
                 prefmap_out = {}
                 lowest = None
-                if not failure:
-                    failure = "no_mx_and_no_a"
+                failure = failure or "mx_lookup_failed_unknown"
 
     except Exception as e:
         hosts_out = []
@@ -482,7 +483,6 @@ def resolve_mx(
         lowest = None
         failure = f"unexpected:{type(e).__name__}:{e}"
 
-    # Persist and return
     row_id = _upsert_row(
         con,
         company_id,
@@ -548,6 +548,7 @@ def record_mx_probe(
     if not mx_host:
         return
     db = db_path or _db_path_from_env()
+    Path(db).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db) as con:
         _ensure_behavior_schema(con)
         con.execute(
@@ -562,7 +563,7 @@ def record_mx_probe(
             VALUES(?,?,?,?,?)
             """,
             (
-                mx_host,
+                None if mx_host is None else mx_host,
                 None if code is None else int(code),
                 category,
                 error_kind,
@@ -575,7 +576,6 @@ def _percentile(vals: list[int], p: float) -> int:
     if not vals:
         return 0
     try:
-        # statistics.quantiles requires n>=1; we handle small n via sorted index
         vals = sorted(vals)
         k = max(0, min(len(vals) - 1, int(round((p / 100.0) * (len(vals) - 1)))))
         return int(vals[k])
@@ -632,10 +632,6 @@ def get_mx_behavior_hint(
 def _update_latest_resolution_behavior(
     domain: str, behavior: dict | None, *, db_path: str | None = None
 ) -> None:
-    """
-    Write a JSON summary into the most-recent domain_resolutions row for this
-    domain, ordered by resolved_at (ties broken by id).
-    """
     if not behavior:
         return
     db = db_path or _db_path_from_env()
@@ -663,13 +659,7 @@ def _update_latest_resolution_behavior(
                     (payload, int(row[0])),
                 )
         except Exception:
-            # best-effort; do not raise
             pass
-
-
-# -----------------------------
-# R16-visible behavior hook
-# -----------------------------
 
 
 def record_behavior(
@@ -681,13 +671,7 @@ def record_behavior(
     code: int | None,
     error_kind: str | None,
 ) -> None:
-    """
-    O06/R16 hook: tests monkeypatch this symbol and assert it is called exactly
-    once per probe. Default implementation records a datapoint and refreshes
-    the summarized behavior hint on the latest domain_resolutions row.
-    """
     try:
-        # 1) Append a raw probe datapoint
         record_mx_probe(
             mx_host=mx_host,
             code=code,
@@ -696,17 +680,10 @@ def record_behavior(
             category=category,
             db_path=_db_path_from_env(),
         )
-        # 2) Recompute hint for this MX and store it back on the latest resolution row
         hint = get_mx_behavior_hint(mx_host, db_path=_db_path_from_env())
         _update_latest_resolution_behavior(domain, hint, db_path=_db_path_from_env())
     except Exception:
-        # Never let stats logic break verifier flow
         pass
-
-
-# -----------------------------
-# Convenience for R16
-# -----------------------------
 
 
 @dataclass
@@ -718,40 +695,14 @@ class MXInfo:
 def get_or_resolve_mx(domain: str, *, force: bool = False, db_path: str | None = None) -> MXInfo:
     """
     Lightweight helper used by R16 to get lowest_mx plus a behavior hint.
-    Falls back to bare DNS if your R15 resolver isn't available.
-    Also writes the summarized hint into domain_resolutions.mx_behavior (best-effort).
     """
     d = (domain or "").strip().lower()
-    from importlib import import_module
-
-    lowest = None
+    res = resolve_mx(company_id=0, domain=d, force=force, db_path=(db_path or _db_path_from_env()))
+    lowest = getattr(res, "lowest_mx", None)
+    hint = get_mx_behavior_hint(lowest, db_path=db_path or _db_path_from_env()) if lowest else None
     try:
-        # Prefer your R15 resolver if present
-        mod = import_module("src.resolve.mx")
-        if hasattr(mod, "resolve_mx"):
-            res = mod.resolve_mx(
-                company_id=0, domain=d, force=force, db_path=(db_path or _db_path_from_env())
-            )
-            lowest = getattr(res, "lowest_mx", None) or d
-        else:
-            raise ImportError
-    except Exception:
-        # Bare DNS fallback
-        try:
-            import dns.resolver as _dr
-
-            answers = _dr.resolve(d, "MX")
-            pairs = sorted(
-                [(r.exchange.to_text(omit_final_dot=True), r.preference) for r in answers],
-                key=lambda x: x[1],
-            )
-            lowest = pairs[0][0]
-        except Exception:
-            lowest = d
-
-    hint = get_mx_behavior_hint(lowest or d, db_path=db_path or _db_path_from_env())
-    try:
-        _update_latest_resolution_behavior(d, hint, db_path=db_path or _db_path_from_env())
+        if lowest and hint:
+            _update_latest_resolution_behavior(d, hint, db_path=db_path or _db_path_from_env())
     except Exception:
         pass
     return MXInfo(lowest_mx=lowest, mx_behavior=hint)

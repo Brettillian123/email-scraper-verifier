@@ -4,24 +4,14 @@ from __future__ import annotations
 r"""
 R16/R18 CLI — SMTP RCPT TO probe + R18 status debug
 
-Usage examples (PowerShell):
-  # Minimal (resolve MX via R15 cache/resolver)
-  #   $PyExe .\scripts\probe_smtp.py --email "someone@gmail.com"
-  #
-  # Force re-resolve MX even if cached:
-  #   $PyExe .\scripts\probe_smtp.py --email "user@example.com" --force-resolve
-  #
-  # Specify an MX host explicitly (skips resolver):
-  #   $PyExe .\scripts\probe_smtp.py --email "user@example.com" --mx-host "aspmx.l.google.com"
+Key behavior:
+  - Resolve MX via src.resolve.mx.get_or_resolve_mx() / resolve_mx()
+  - Probe RCPT TO via src.verify.smtp.probe_rcpt
+  - Best-effort print latest verification_results row
 
-Behavior:
-  - Uses src.resolve.mx.get_or_resolve_mx() when available, falling back to resolve_mx().
-  - Reads identity/timeouts from src.config (SMTP_HELO_DOMAIN, SMTP_MAIL_FROM, etc.).
-  - Performs a direct RCPT probe via src.verify.smtp.probe_rcpt.
-  - Then (best-effort) looks up the latest verification_results row for this email
-    and prints the R18 canonical fields:
-        verify_status, verify_reason, verified_mx, verified_at
-    along with catch-all and fallback status if available.
+Safety:
+  - If MX resolution fails (lowest_mx is None), we refuse to probe the bare domain.
+    Bare-domain A/AAAA often points to a CDN/Cloudflare and will always time out on :25.
 """
 
 import argparse
@@ -45,6 +35,7 @@ def _get_or_resolve_mx(domain: str, *, force: bool, db_path: str | None) -> Any:
     Returns an object with attributes:
       - lowest_mx: str | None
       - behavior or mx_behavior: dict | None
+      - failure: str | None (if present)
     """
     try:  # pragma: no cover
         from src.resolve.mx import get_or_resolve_mx as _gomx  # type: ignore
@@ -53,16 +44,12 @@ def _get_or_resolve_mx(domain: str, *, force: bool, db_path: str | None) -> Any:
     except Exception:
         pass
 
-    # Fallback: call resolve_mx(company_id=0, ...) and adapt to a simple namespace
     try:  # pragma: no cover
         from src.resolve.mx import resolve_mx as _resolve_mx  # type: ignore
 
-        res = _resolve_mx(company_id=0, domain=domain, force=force, db_path=db_path)
-        # resolve_mx returns MXResult without behavior; that's fine (we pass None)
-        return res
+        return _resolve_mx(company_id=0, domain=domain, force=force, db_path=db_path)
     except Exception:
-        # Last resort: no resolver available; just return a stub that points at the domain
-        return SimpleNamespace(lowest_mx=domain, behavior=None, mx_behavior=None)
+        return SimpleNamespace(lowest_mx=None, behavior=None, mx_behavior=None, failure="mx_resolver_unavailable")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -70,34 +57,13 @@ def _parse_args() -> argparse.Namespace:
         prog="probe_smtp.py",
         description="R16/R18: Probe an email via RCPT TO and show R18 verify_status from the DB when available.",
     )
-    p.add_argument(
-        "--email",
-        required=True,
-        help="Target email address to probe (e.g., someone@example.com).",
-    )
-    p.add_argument(
-        "--mx-host",
-        default=None,
-        help="Optional MX host (e.g., aspmx.l.google.com). If omitted, resolve via R15.",
-    )
-    p.add_argument(
-        "--force-resolve",
-        action="store_true",
-        help="Force R15 to refresh the cached MX before probing.",
-    )
+    p.add_argument("--email", required=True, help="Target email address to probe (e.g., someone@example.com).")
+    p.add_argument("--mx-host", default=None, help="Optional MX host (e.g., aspmx.l.google.com). If omitted, resolve via R15.")
+    p.add_argument("--force-resolve", action="store_true", help="Force R15 to refresh the cached MX before probing.")
     return p.parse_args()
 
 
 def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str, Any] | None:
-    """
-    Best-effort helper: load the latest verification_results row for this email.
-
-    Returns a small dict with:
-      - verify_status, verify_reason, verified_mx, verified_at
-      - fallback_status
-      - catch_all_status
-    or None if nothing is found / schema not present.
-    """
     email_norm = (email or "").strip().lower()
     dom = (domain or "").strip().lower()
     if not email_norm:
@@ -110,16 +76,11 @@ def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str
         return None
 
     try:
-        # Map email -> email_id (from emails table)
-        row = con.execute(
-            "SELECT id FROM emails WHERE email = ?",
-            (email_norm,),
-        ).fetchone()
+        row = con.execute("SELECT id FROM emails WHERE email = ?", (email_norm,)).fetchone()
         if not row:
             return None
         email_id = int(row["id"])
 
-        # Latest verification_results row for this email_id
         vrow = con.execute(
             """
             SELECT
@@ -138,7 +99,6 @@ def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str
         if not vrow:
             return None
 
-        # Domain-level catch-all verdict (R17), if present
         drow = con.execute(
             """
             SELECT catch_all_status
@@ -149,9 +109,7 @@ def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str
             """,
             (dom, dom),
         ).fetchone()
-        catch_all_status = (
-            drow["catch_all_status"] if drow and "catch_all_status" in drow.keys() else None
-        )
+        catch_all_status = drow["catch_all_status"] if drow and "catch_all_status" in drow.keys() else None
 
         return {
             "verify_status": vrow["verify_status"],
@@ -162,7 +120,6 @@ def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str
             "catch_all_status": catch_all_status,
         }
     except Exception:
-        # Treat any DB/schema issues as "no verification info yet"
         return None
     finally:
         try:
@@ -174,26 +131,33 @@ def _load_latest_verification(db_path: str, email: str, domain: str) -> dict[str
 def main() -> None:
     args = _parse_args()
 
-    # Derive domain from the email (simple split; upstream validation happens in probe_rcpt)
     try:
         domain = args.email.split("@", 1)[1].strip().lower()
     except Exception as err:
         print("Error: --email must contain a single '@' with a domain part.")
         raise SystemExit(2) from err
 
-    # Use DB path convention from other scripts (R15/R18 expect this)
     db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
 
-    # Resolve MX host unless explicitly provided
     if args.mx_host:
         mx_host = args.mx_host.strip()
         behavior_hint = None
     else:
         mx_info = _get_or_resolve_mx(domain, force=bool(args.force_resolve), db_path=db_path)
-        mx_host = getattr(mx_info, "lowest_mx", None) or domain
+        mx_host = getattr(mx_info, "lowest_mx", None)
         behavior_hint = getattr(mx_info, "behavior", None) or getattr(mx_info, "mx_behavior", None)
+        mx_failure = getattr(mx_info, "failure", None)
 
-    # Execute the probe using config-driven identity & timeouts
+        if not mx_host:
+            print(f"Email:          {args.email}")
+            print(f"Domain:         {domain}")
+            print("MX host:        (unresolved)")
+            if mx_failure:
+                print(f"MX failure:     {mx_failure}")
+            print()
+            print("Refusing to probe bare domain on port 25. Pass --mx-host explicitly or fix MX resolution.")
+            raise SystemExit(2)
+
     result = probe_rcpt(
         args.email,
         mx_host,
@@ -204,9 +168,6 @@ def main() -> None:
         behavior_hint=behavior_hint,
     )
 
-    # -------------------------
-    # Pretty-print RCPT outcome
-    # -------------------------
     category = result.get("category")
     code = result.get("code")
     err = result.get("error")
@@ -224,11 +185,7 @@ def main() -> None:
         print(f"RCPT error:     {err}")
     print(f"Elapsed:        {int(result.get('elapsed_ms') or 0)} ms")
 
-    # -------------------------
-    # R18: Show canonical status from DB (if available)
-    # -------------------------
     vr = _load_latest_verification(db_path, args.email, domain)
-
     if vr is None:
         print()
         print("R18: no verification_results row found for this email in DB.")

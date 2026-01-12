@@ -22,3 +22,6 @@ data/
 .env
 
 --db
+
+# Local scratch/backups
+local_backups/

@@ -46,6 +46,10 @@ from src.config import (
 from src.resolve.mx import get_or_resolve_mx
 from src.verify import smtp as smtp_mod
 
+def _ph(con):
+    """Return placeholder style: '%s' for PostgreSQL, '?' for SQLite."""
+    return '%s' if 'psycopg2' in type(con).__module__ else '?'
+
 CatchallStatus = Literal[
     "catch_all",
     "not_catch_all",
@@ -109,36 +113,31 @@ def _is_fresh(checked_at: str | None) -> bool:
     return delta.total_seconds() < CATCHALL_TTL_SECONDS
 
 
-def get_connection() -> sqlite3.Connection:
+def get_connection():
     """
-    R17 helper: return a SQLite connection.
-    Tests monkeypatch this to point at an in-memory DB.
-
-    Default: uses DATABASE_PATH or data/dev.db.
+    R17 helper: return a database connection (SQLite or PostgreSQL).
     """
-    db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
-    return sqlite3.connect(db_path)
-
+    from src.db import get_conn
+    return get_conn()
 
 def _load_cached_state(
-    con: sqlite3.Connection,
+    con,
     domain: str,
 ) -> dict | None:
     """
-    Load the latest catch_all_* state for a domain from domain_resolutions.
-
-    Returns a dict with:
-        {
+    Check domain_resolutions for a row containing catch_all_* columns.
+    Returns dict with keys:
           "id",
           "catch_all_status",
           "catch_all_checked_at",
           "catch_all_localpart",
           "catch_all_smtp_code",
-        }
     or None if no row exists yet.
     """
-    cur = con.execute(
-        """
+    ph = _ph(con)
+    cur = con.cursor()
+    cur.execute(
+        f"""
         SELECT
             id,
             catch_all_status,
@@ -146,8 +145,8 @@ def _load_cached_state(
             catch_all_localpart,
             catch_all_smtp_code
         FROM domain_resolutions
-        WHERE domain = ?
-           OR (domain IS NULL AND chosen_domain = ?)
+        WHERE domain = {ph}
+           OR (domain IS NULL AND chosen_domain = {ph})
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
@@ -164,9 +163,8 @@ def _load_cached_state(
         "catch_all_smtp_code": row[4],
     }
 
-
 def _update_cached_state(
-    con: sqlite3.Connection,
+    con,
     domain: str,
     *,
     status: CatchallStatus,
@@ -178,12 +176,14 @@ def _update_cached_state(
     Update catch_all_* columns on the most recent domain_resolutions row
     for this domain. If no row exists, we silently skip.
     """
-    cur = con.execute(
-        """
+    ph = _ph(con)
+    cur = con.cursor()
+    cur.execute(
+        f"""
         SELECT id
         FROM domain_resolutions
-        WHERE domain = ?
-           OR (domain IS NULL AND chosen_domain = ?)
+        WHERE domain = {ph}
+           OR (domain IS NULL AND chosen_domain = {ph})
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
@@ -192,19 +192,19 @@ def _update_cached_state(
     row = cur.fetchone()
     if not row:
         return
-
     row_id = int(row[0])
     checked_at = _utc_iso()
-    con.execute(
-        """
+    cur = con.cursor()
+    cur.execute(
+        f"""
         UPDATE domain_resolutions
-        SET catch_all_status      = ?,
-            catch_all_checked_at  = ?,
-            catch_all_localpart   = ?,
-            catch_all_smtp_code   = ?,
-            catch_all_smtp_msg    = ?,
-            domain                = COALESCE(domain, ?)
-        WHERE id = ?
+        SET catch_all_status      = {ph},
+            catch_all_checked_at  = {ph},
+            catch_all_localpart   = {ph},
+            catch_all_smtp_code   = {ph},
+            catch_all_smtp_msg    = {ph},
+            domain                = COALESCE(domain, {ph})
+        WHERE id = {ph}
         """,
         (
             status,
@@ -217,7 +217,6 @@ def _update_cached_state(
         ),
     )
     con.commit()
-
 
 def _classify_from_probe(code: int | None, error: str | None) -> CatchallStatus:
     """

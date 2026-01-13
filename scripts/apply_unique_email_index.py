@@ -12,7 +12,7 @@ This script is Postgres-only in the target state. It:
 Usage:
   python scripts/apply_unique_email_index.py
   python scripts/apply_unique_email_index.py --auto-fix-duplicates
-  python scripts/apply_unique_email_index.py --db postgresql://user:pass@host:5432/db
+  python scripts/apply_unique_email_index.py --db postgresql://host:5432/db
 """
 
 from __future__ import annotations

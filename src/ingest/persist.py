@@ -22,7 +22,7 @@ New in R16:
 DATABASE SUPPORT:
 - Supports both SQLite and PostgreSQL via DATABASE_URL environment variable
 - SQLite: DATABASE_URL=sqlite:///path/to/db.sqlite
-- PostgreSQL: DATABASE_URL=postgresql://user:pass@host:port/dbname
+- PostgreSQL: DATABASE_URL=postgresql://host:port/dbname
 """
 
 from __future__ import annotations

@@ -6,12 +6,11 @@ on:
     branches: [main]
 
 env:
-  # PostgreSQL test database configuration
-  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/email_scraper_test
-  DB_URL: postgresql://postgres:postgres@localhost:5432/email_scraper_test
+  # Test DB/Redis URLs for CI jobs. Credentials are supplied via the service env below.
+  DATABASE_URL: postgresql://localhost:5432/email_scraper_test
+  DB_URL: postgresql://localhost:5432/email_scraper_test
   REDIS_URL: redis://localhost:6379/0
   RQ_REDIS_URL: redis://localhost:6379/0
-
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
@@ -22,7 +21,7 @@ jobs:
         image: postgres:15-alpine
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASS: postgres
           POSTGRES_DB: email_scraper_test
         ports:
           - 5432:5432

@@ -12,7 +12,7 @@ Test Database Setup:
   - For local dev, use a local Postgres instance or Docker
 
 Example:
-  DATABASE_URL=postgresql://postgres:postgres@localhost:5432/email_scraper_test pytest
+  DATABASE_URL=postgresql://localhost:5432/email_scraper_test pytest
 """
 
 from __future__ import annotations

@@ -130,7 +130,7 @@ def _consume_sql_char(
     return i + 1
 
 
-def _split_sql_statements(sql_text: str) -> list[str]:
+def _split_sql_statements(sql_text: str) -> list[str]:  # noqa: C901
     """
     Robust-ish SQL splitter:
       - Splits on semicolons not inside:
@@ -345,7 +345,7 @@ def _print_summary(conn) -> None:
     print(f"· schema_migrations       exists: {mig_exists}")
 
 
-def main(argv: Iterable[str] | None = None) -> None:
+def main(argv: Iterable[str] | str | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Apply Postgres schema + SQL migrations (Postgres-only)."
     )
@@ -366,7 +366,16 @@ def main(argv: Iterable[str] | None = None) -> None:
         default=str(DEFAULT_MIGRATIONS_DIR),
         help="Path to db/migrations directory (defaults to repo db/migrations).",
     )
-    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    # Defensive: if someone calls main(db_url_string), treat it as --db <url>
+    if isinstance(argv, str):
+        argv_list: list[str] | None = ["--db", argv]
+    elif argv is None:
+        argv_list = None
+    else:
+        argv_list = list(argv)
+
+    args = parser.parse_args(argv_list)
 
     if args.db_url:
         if not _is_postgres_url(args.db_url):
@@ -412,7 +421,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         _print_summary(conn)
 
     print(f"✔ Schema applied; migrations applied this run: {applied_now}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

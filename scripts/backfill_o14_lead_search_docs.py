@@ -3,35 +3,39 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
+import os
+from contextlib import closing
 from datetime import datetime
 from typing import Any
 
-from src.db import get_connection  # type: ignore[import]
+from src.db import get_conn  # type: ignore[import]
 
 
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
-        (name,),
-    )
-    row = cur.fetchone()
-    return row is not None
+def _relation_exists(conn, name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (name,))
+        row = cur.fetchone()
+    return bool(row and row[0] is not None)
 
 
-def _has_company_attrs(conn: sqlite3.Connection) -> bool:
+def _has_company_attrs(conn) -> bool:
     """
     Detect whether companies.attrs exists.
 
     O14 can still work without attrs (industry/size_bucket will just be NULL),
     but we prefer to populate those fields when available.
     """
-    try:
-        cur = conn.execute("PRAGMA table_info(companies)")
-    except sqlite3.Error:
-        return False
-    cols = [row[1] for row in cur.fetchall()]
-    return "attrs" in cols
+    q = """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'companies'
+          AND column_name = 'attrs'
+        LIMIT 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(q)
+        return cur.fetchone() is not None
 
 
 def _parse_company_attrs(raw: Any) -> tuple[str | None, str | None]:
@@ -60,7 +64,6 @@ def _parse_company_attrs(raw: Any) -> tuple[str | None, str | None]:
 
     industry = data.get("industry")
     size_bucket = data.get("size_bucket")
-
     return (str(industry) if industry else None, str(size_bucket) if size_bucket else None)
 
 
@@ -92,20 +95,20 @@ def _icp_bucket(score: Any) -> str | None:
     return "0-39"
 
 
-def backfill_lead_search_docs(conn: sqlite3.Connection) -> None:
+def backfill_lead_search_docs(conn, tenant_id: str | None) -> None:
     """
     Full refresh of the O14 lead_search_docs materialized table.
 
     Strategy:
-      - Delete all existing rows.
+      - Delete all existing rows (or tenant-scoped rows if tenant_id provided).
       - Rebuild from people + companies + v_emails_latest join.
       - One row per person_id (primary "lead doc").
     """
-    if not _table_exists(conn, "lead_search_docs"):
+    if not _relation_exists(conn, "lead_search_docs"):
         print("[O14] Table lead_search_docs does not exist; nothing to backfill.")
         return
 
-    if not _table_exists(conn, "v_emails_latest"):
+    if not _relation_exists(conn, "v_emails_latest"):
         raise RuntimeError(
             "[O14] v_emails_latest view is missing; run schema/migrations before backfill."
         )
@@ -113,12 +116,14 @@ def backfill_lead_search_docs(conn: sqlite3.Connection) -> None:
     has_attrs = _has_company_attrs(conn)
     print(f"[O14] companies.attrs present: {has_attrs}")
 
-    conn.row_factory = sqlite3.Row
-
     # Start fresh for a full, deterministic refresh.
     print("[O14] Clearing existing rows from lead_search_docs ...")
-    conn.execute("DELETE FROM lead_search_docs")
-    conn.commit()
+    with conn:
+        with conn.cursor() as cur:
+            if tenant_id:
+                cur.execute("DELETE FROM lead_search_docs WHERE tenant_id = %s", (tenant_id,))
+            else:
+                cur.execute("DELETE FROM lead_search_docs")
 
     # Build base query; we always join people + v_emails_latest + companies.
     # If companies.attrs exists we select it for Python-side parsing; otherwise
@@ -128,6 +133,7 @@ def backfill_lead_search_docs(conn: sqlite3.Connection) -> None:
     query = f"""
         SELECT
           p.id AS person_id,
+          p.tenant_id AS tenant_id,
           vel.email AS email,
           vel.verify_status AS verify_status,
           p.icp_score AS icp_score,
@@ -137,21 +143,31 @@ def backfill_lead_search_docs(conn: sqlite3.Connection) -> None:
         FROM people AS p
         JOIN v_emails_latest AS vel
           ON vel.person_id = p.id
+         AND vel.tenant_id = p.tenant_id
         JOIN companies AS c
           ON c.id = p.company_id
+         AND c.tenant_id = p.tenant_id
     """
 
+    params: list[Any] = []
+    if tenant_id:
+        query += " WHERE p.tenant_id = %s"
+        params.append(tenant_id)
+
     print("[O14] Selecting source rows for materialization ...")
-    cur = conn.execute(query)
-    rows = cur.fetchall()
+    with conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+
     total = len(rows)
     print(f"[O14] Found {total} source rows for lead_search_docs.")
 
     now_str = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
 
     insert_sql = """
-        INSERT OR REPLACE INTO lead_search_docs (
+        INSERT INTO lead_search_docs (
           person_id,
+          tenant_id,
           email,
           verify_status,
           icp_score,
@@ -163,63 +179,85 @@ def backfill_lead_search_docs(conn: sqlite3.Connection) -> None:
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (person_id) DO UPDATE SET
+          tenant_id           = EXCLUDED.tenant_id,
+          email               = EXCLUDED.email,
+          verify_status       = EXCLUDED.verify_status,
+          icp_score           = EXCLUDED.icp_score,
+          role_family         = EXCLUDED.role_family,
+          seniority           = EXCLUDED.seniority,
+          company_size_bucket = EXCLUDED.company_size_bucket,
+          company_industry    = EXCLUDED.company_industry,
+          icp_bucket          = EXCLUDED.icp_bucket,
+          created_at          = EXCLUDED.created_at,
+          updated_at          = EXCLUDED.updated_at
     """
 
     inserted = 0
-    for row in rows:
-        person_id = row["person_id"]
-        email = row["email"]
-        verify_status = row["verify_status"]
-        icp_score = row["icp_score"]
-        role_family = row["role_family"]
-        seniority = row["seniority"]
-        company_attrs = row["company_attrs"]
+    with conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                # (person_id, tenant_id, email, verify_status, icp_score, role_family, seniority, company_attrs)
+                person_id = row[0]
+                row_tenant_id = row[1]
+                email = row[2]
+                verify_status = row[3]
+                icp_score = row[4]
+                role_family = row[5]
+                seniority = row[6]
+                company_attrs = row[7]
 
-        industry, size_bucket = _parse_company_attrs(company_attrs) if has_attrs else (None, None)
-        bucket = _icp_bucket(icp_score)
+                industry, size_bucket = (
+                    _parse_company_attrs(company_attrs) if has_attrs else (None, None)
+                )
+                bucket = _icp_bucket(icp_score)
 
-        conn.execute(
-            insert_sql,
-            (
-                person_id,
-                email,
-                verify_status,
-                int(icp_score) if icp_score is not None else None,
-                role_family,
-                seniority,
-                size_bucket,
-                industry,
-                bucket,
-                now_str,
-                now_str,
-            ),
-        )
-        inserted += 1
+                cur.execute(
+                    insert_sql,
+                    (
+                        person_id,
+                        row_tenant_id,
+                        email,
+                        verify_status,
+                        int(icp_score) if icp_score is not None else None,
+                        role_family,
+                        seniority,
+                        size_bucket,
+                        industry,
+                        bucket,
+                        now_str,
+                        now_str,
+                    ),
+                )
+                inserted += 1
 
-    conn.commit()
     print(f"[O14] Backfill complete. Inserted/updated {inserted} rows into lead_search_docs.")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="O14: Backfill lead_search_docs materialized view table."
     )
     parser.add_argument(
-        "--db",
-        "--db-path",
-        dest="db_path",
-        default="data/dev.db",
-        help="Path to SQLite database file (default: data/dev.db)",
+        "--tenant-id",
+        dest="tenant_id",
+        default=None,
+        help="Optional tenant_id to scope the backfill to one tenant. Default: all tenants.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dsn",
+        dest="dsn",
+        default=None,
+        help="Optional Postgres DSN/URL override. If provided, sets DATABASE_URL for this run.",
+    )
+    args = parser.parse_args(argv)
 
-    print(f"[O14] Using SQLite at: {args.db_path}")
-    conn = get_connection(args.db_path)
-    try:
-        backfill_lead_search_docs(conn)
-    finally:
-        conn.close()
+    if args.dsn:
+        os.environ["DATABASE_URL"] = args.dsn
+
+    with closing(get_conn()) as conn:
+        backfill_lead_search_docs(conn, tenant_id=args.tenant_id)
 
 
 if __name__ == "__main__":

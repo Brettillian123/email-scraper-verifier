@@ -1,123 +1,908 @@
 # src/db.py
+from __future__ import annotations
+
 import os
-import sqlite3
+import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-# -------------------- basics --------------------
+try:  # Required for Postgres. Kept as optional to avoid hard import errors in tooling.
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+except Exception:  # pragma: no cover
+    psycopg2 = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Configuration / env
+# ---------------------------------------------------------------------------
+
+# SQLite is no longer a production backend. The only supported system of record is Postgres.
+# SQLite support is available only as an explicit dev escape hatch for legacy workflows.
+DEFAULT_SQLITE_PATH = "data/dev.db"
+DEFAULT_TENANT_ID = "dev"
+
+ALLOW_SQLITE_DEV = (os.getenv("ALLOW_SQLITE_DEV") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _database_url() -> str:
+    """
+    Prefer DATABASE_URL, but keep DB_URL as backward compatible fallback.
+
+    Target state: Postgres is the only system of record. If neither is set, this
+    function raises (to prevent accidental SQLite usage in production).
+
+    For legacy/dev-only SQLite runs, you may set ALLOW_SQLITE_DEV=1 and supply a
+    sqlite:///... URL or a local .db path via DATABASE_URL / DB_URL / DATABASE_PATH.
+    """
+    url = (os.getenv("DATABASE_URL") or "").strip() or (os.getenv("DB_URL") or "").strip()
+    if not url:
+        # Historical: some scripts used DATABASE_PATH (SQLite-only).
+        # Preserve as dev escape hatch only.
+        url = (os.getenv("DATABASE_PATH") or "").strip()
+
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL (or DB_URL) is required and must be a Postgres connection string "
+            "(postgresql://...)."
+        )
+
+    if _is_postgres_url(url):
+        return url
+
+    # Optional legacy escape hatch
+    if ALLOW_SQLITE_DEV:
+        return url
+
+    raise RuntimeError(
+        "This project is Postgres-only. DATABASE_URL/DB_URL must start with postgresql:// "
+        "(or postgres://). "
+        "If you intentionally need legacy SQLite for local dev, set ALLOW_SQLITE_DEV=1 explicitly."
+    )
+
+
+def _is_postgres_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return u.startswith("postgres://") or u.startswith("postgresql://")
+
+
+def _is_sqlite_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return u.startswith("sqlite:///")
+
+
+def _sqlite_path_from_url(url: str) -> str:
+    u = (url or "").strip()
+    if _is_sqlite_url(u):
+        return u[len("sqlite:///") :]
+    return u
 
 
 def _db_path() -> str:
-    # Prefer DATABASE_URL if set; otherwise fall back to DATABASE_PATH; otherwise dev.db
-    url = os.environ.get("DATABASE_URL")
-    if url:
-        if not url.startswith("sqlite:///"):
-            raise RuntimeError(f"Only sqlite supported in dev; got {url}")
-        return url.removeprefix("sqlite:///")
-    path = os.environ.get("DATABASE_PATH")
-    if path:
-        return path
-    return "dev.db"
-
-
-def get_conn() -> sqlite3.Connection:
     """
-    Convenience connection helper (used by queue/CLI tasks).
-    Ensures foreign keys are enforced.
+    SQLite dev-only path helper.
+
+    The project is Postgres-first. This helper exists only for legacy components
+    that have not yet been migrated (e.g., any remaining SQLite-only search/FTS).
+
+    It is disabled unless ALLOW_SQLITE_DEV=1.
     """
-    con = sqlite3.connect(_db_path())
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
+    if not ALLOW_SQLITE_DEV:
+        raise RuntimeError(
+            "_db_path() is disabled (Postgres-only). Set ALLOW_SQLITE_DEV=1 only for legacy "
+            "local-dev workflows."
+        )
+
+    url = _database_url()
+    if _is_postgres_url(url):
+        raise RuntimeError("_db_path() is SQLite-only; DATABASE_URL/DB_URL points at Postgres.")
+    return _sqlite_path_from_url(url) or DEFAULT_SQLITE_PATH
 
 
-def get_connection(db_path: str | None = None) -> sqlite3.Connection:
-    """
-    Shared SQLite connection helper for libraries and scripts.
+def _now_iso_z(dt: datetime | None = None) -> str:
+    d = dt or datetime.now(UTC)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    else:
+        d = d.astimezone(UTC)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    - If db_path is None, uses _db_path() (DATABASE_URL/DATABASE_PATH/dev.db).
-    - Ensures foreign key enforcement.
-    - Sets row_factory to sqlite3.Row for dict-like/dot-style access.
+
+# ---------------------------------------------------------------------------
+# SQL compatibility helpers (SQLite -> Postgres)
+# ---------------------------------------------------------------------------
+
+
+def _qmark_to_percent(sql: str) -> str:
     """
-    if db_path is None:
-        db_path = _db_path()
-    con = sqlite3.connect(db_path)
+    Convert SQLite qmark placeholders (?) to psycopg2 (%s).
+
+    Best-effort: skips ? inside single-quoted string literals.
+    """
+    out: list[str] = []
+    in_str = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'":
+            out.append(ch)
+            # Handle escaped '' inside a string
+            if in_str and i + 1 < len(sql) and sql[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            in_str = not in_str
+            i += 1
+            continue
+        if ch == "?" and not in_str:
+            out.append("%s")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_RX_INSERT_OR_IGNORE = re.compile(r"^\s*insert\s+or\s+ignore\s+into\s+", re.IGNORECASE)
+_RX_PRAGMA_TABLE_INFO = re.compile(
+    r"^\s*pragma\s+table_info\s*\(\s*([^)]+?)\s*\)\s*;?\s*$", re.IGNORECASE
+)
+_RX_PRAGMA_FK_LIST = re.compile(
+    r"^\s*pragma\s+foreign_key_list\s*\(\s*([^)]+?)\s*\)\s*;?\s*$", re.IGNORECASE
+)
+_RX_PRAGMA_FK_ENFORCE = re.compile(r"^\s*pragma\s+foreign_keys\s*(=|$)", re.IGNORECASE)
+_RX_SQLITE_MASTER = re.compile(r"\bsqlite_master\b", re.IGNORECASE)
+_RX_INSTR = re.compile(r"\binstr\s*\(", re.IGNORECASE)
+
+
+def _normalize_ident(raw: str) -> str:
+    """
+    Normalize a table identifier possibly containing quotes or schema prefixes.
+    """
+    s = (raw or "").strip().strip(";").strip()
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+        s = s[1:-1]
+    if "." in s:
+        s = s.split(".")[-1]
+        s = s.strip('"').strip("'")
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Compat cursor/connection wrappers
+# ---------------------------------------------------------------------------
+
+
+class CompatCursor:
+    """
+    Cursor wrapper:
+      - On Postgres: converts SQLite `?` placeholders to `%s`
+      - Translates a few SQLite idioms used throughout the codebase
+      - Emulates selected SQLite introspection queries:
+          * PRAGMA table_info(...)
+          * PRAGMA foreign_key_list(...)
+          * sqlite_master existence checks
+    """
+
+    def __init__(self, parent: CompatConnection, cursor: Any, is_pg: bool):
+        self._parent = parent
+        self._cursor = cursor
+        self._is_pg = is_pg
+
+        self.lastrowid: int | None = None
+        self.rowcount: int = -1
+
+        # Emulation buffers (for PRAGMA/sqlite_master)
+        self._emulated_rows: list[tuple[Any, ...]] | None = None
+        self._emulated_idx: int = 0
+
+        # Prefetched rows buffer (used when we auto-append RETURNING id)
+        self._prefetch: list[Any] | None = None
+        self._prefetch_idx: int = 0
+
+    @property
+    def description(self):
+        if self._emulated_rows is not None:
+            return None
+        return getattr(self._cursor, "description", None)
+
+    def _set_emulated(self, rows: list[tuple[Any, ...]]) -> None:
+        self._emulated_rows = rows
+        self._emulated_idx = 0
+
+    def _fetchone_emulated(self) -> tuple[Any, ...] | None:
+        if self._emulated_rows is None:
+            return None
+        if self._emulated_idx >= len(self._emulated_rows):
+            return None
+        row = self._emulated_rows[self._emulated_idx]
+        self._emulated_idx += 1
+        return row
+
+    def _fetchall_emulated(self) -> list[tuple[Any, ...]]:
+        if self._emulated_rows is None:
+            return []
+        if self._emulated_idx <= 0:
+            return list(self._emulated_rows)
+        return list(self._emulated_rows[self._emulated_idx :])
+
+    def _maybe_pragma_emulation(self, sql: str, params: Sequence[Any]) -> bool:
+        if not self._is_pg:
+            return False
+
+        s = sql.strip()
+
+        # PRAGMA foreign_keys=ON -> no-op on Postgres
+        if _RX_PRAGMA_FK_ENFORCE.match(s):
+            self._set_emulated([])
+            return True
+
+        m = _RX_PRAGMA_TABLE_INFO.match(s)
+        if m:
+            table = _normalize_ident(m.group(1))
+            rows = self._parent._pg_pragma_table_info(table)
+            self._set_emulated(rows)
+            return True
+
+        m = _RX_PRAGMA_FK_LIST.match(s)
+        if m:
+            table = _normalize_ident(m.group(1))
+            rows = self._parent._pg_pragma_foreign_key_list(table)
+            self._set_emulated(rows)
+            return True
+
+        # sqlite_master existence checks (tasks/demo code uses this frequently)
+        if _RX_SQLITE_MASTER.search(s):
+            rows = self._parent._pg_emulate_sqlite_master_query(s, params)
+            self._set_emulated(rows)
+            return True
+
+        return False
+
+    def _translate_sql(self, sql: str) -> str:
+        s = sql
+
+        # datetime('now') -> NOW()
+        s = s.replace("datetime('now')", "NOW()").replace('datetime("now")', "NOW()")
+
+        # Common: datetime('now','utc') (best-effort)
+        s = s.replace("datetime('now','utc')", "NOW()").replace("datetime('now', 'utc')", "NOW()")
+
+        # instr(a,b) -> strpos(a,b)
+        s = _RX_INSTR.sub("strpos(", s)
+
+        # INSERT OR IGNORE -> INSERT ... ON CONFLICT DO NOTHING
+        if _RX_INSERT_OR_IGNORE.match(s) and "on conflict" not in s.lower():
+            s = _RX_INSERT_OR_IGNORE.sub("INSERT INTO ", s)
+            s = s.rstrip().rstrip(";")
+            s = f"{s} ON CONFLICT DO NOTHING"
+
+        # Placeholders
+        s = _qmark_to_percent(s)
+
+        return s
+
+    def _maybe_append_returning_id(self, sql: str) -> str:
+        """
+        For Postgres only: if query looks like an INSERT into a table with an `id`
+        column and doesn't already RETURNING, append `RETURNING id` so callers can
+        read lastrowid.
+        """
+        s = sql.strip()
+        if not self._is_pg:
+            return sql
+        if "returning" in s.lower():
+            return sql
+        if not re.match(r"^\s*insert\b", s, re.IGNORECASE):
+            return sql
+
+        # Try to detect target table name: INSERT INTO table_name ...
+        m = re.match(r"^\s*insert\s+into\s+([a-zA-Z0-9_\"\.]+)\s*", s, re.IGNORECASE)
+        if not m:
+            return sql
+        raw = m.group(1)
+        table = _normalize_ident(raw)
+        if not table:
+            return sql
+
+        try:
+            if not self._parent._pg_table_has_column(table, "id"):
+                return sql
+        except Exception:
+            return sql
+
+        # Don't append if it's a multi-row insert with SELECT ... (still OK), but keep simple.
+        return s.rstrip().rstrip(";") + " RETURNING id"
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None):
+        params = params or ()
+        self.lastrowid = None
+        self.rowcount = -1
+        self._emulated_rows = None
+        self._emulated_idx = 0
+        self._prefetch = None
+        self._prefetch_idx = 0
+
+        if self._maybe_pragma_emulation(sql, params):
+            self.rowcount = 0
+            return self
+
+        q = sql
+        if self._is_pg:
+            q = self._translate_sql(q)
+            q = self._maybe_append_returning_id(q)
+
+        self._cursor.execute(q, params)
+
+        try:
+            self.rowcount = int(getattr(self._cursor, "rowcount", -1))
+        except Exception:
+            self.rowcount = -1
+
+        # For RETURNING id (auto-appended or caller-provided), capture it for lastrowid.
+        #
+        # Important: do not coerce rows to tuples here. When using DictCursor, callers may rely on
+        # row['col'] access. We only derive lastrowid from the first column when possible.
+        try:
+            if self._is_pg and "returning" in q.lower():
+                rows = self._cursor.fetchall() or []
+                self._prefetch = list(rows)
+                self._prefetch_idx = 0
+
+                if rows:
+                    try:
+                        self.lastrowid = int(rows[0][0])  # type: ignore[index]
+                    except Exception:
+                        try:
+                            self.lastrowid = int(
+                                getattr(rows[0], "get", lambda *_: None)("id")  # type: ignore[misc]
+                            )
+                        except Exception:
+                            self.lastrowid = None
+        except Exception:
+            # Best-effort only; leave lastrowid unset if anything goes wrong.
+            self.lastrowid = None
+        return self
+
+    def fetchone(self):
+        if self._emulated_rows is not None:
+            return self._fetchone_emulated()
+
+        if self._prefetch is not None:
+            if self._prefetch_idx >= len(self._prefetch):
+                return None
+            row = self._prefetch[self._prefetch_idx]
+            self._prefetch_idx += 1
+            return row
+
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        if self._emulated_rows is not None:
+            return self._fetchall_emulated()
+
+        if self._prefetch is not None:
+            if self._prefetch_idx <= 0:
+                return list(self._prefetch)
+            return list(self._prefetch[self._prefetch_idx :])
+
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        while True:
+            row = self.fetchone()
+            if row is None:
+                break
+            yield row
+
+    def close(self):
+        try:
+            return self._cursor.close()
+        except Exception:
+            return None
+
+
+class CompatConnection:
+    """
+    Connection wrapper:
+      - Provides .execute() convenience like sqlite3.Connection
+      - Returns CompatCursor on .cursor()
+      - Supports context manager commit/rollback
+      - On Postgres: adds helpers to emulate a few SQLite introspection operations
+    """
+
+    def __init__(self, conn: Any, is_pg: bool):
+        self._conn = conn
+        self._is_pg = is_pg
+
+    @property
+    def is_postgres(self) -> bool:
+        return bool(self._is_pg)
+
+    def cursor(self) -> CompatCursor:
+        cur = self._conn.cursor()
+        return CompatCursor(self, cur, self._is_pg)
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> CompatCursor:
+        cur = self.cursor()
+        cur.execute(sql, params or ())
+        return cur
+
+    def commit(self) -> None:
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            try:
+                self.commit()
+            except Exception:
+                pass
+        else:
+            try:
+                self.rollback()
+            except Exception:
+                pass
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    # ---------------- Postgres introspection emulation ----------------
+
+    def _pg_table_has_column(self, table: str, col: str) -> bool:
+        t = _normalize_ident(table)
+        c = (col or "").strip()
+        if not t or not c:
+            return False
+        q = """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name=%s
+              AND column_name=%s
+            LIMIT 1
+        """
+        cur = self._conn.cursor()
+        cur.execute(q, (t, c))
+        return cur.fetchone() is not None
+
+    def _pg_pragma_table_info(self, table: str) -> list[tuple[Any, ...]]:
+        """
+        Emulate SQLite: PRAGMA table_info(table)
+        Shape in SQLite:
+          (cid, name, type, notnull, dflt_value, pk)
+        """
+        t = _normalize_ident(table)
+        if not t:
+            return []
+
+        q = """
+            SELECT
+              ordinal_position - 1 AS cid,
+              c.column_name AS name,
+              data_type AS type,
+              CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+              column_default AS dflt_value,
+              CASE WHEN tc.constraint_type IS NOT NULL THEN 1 ELSE 0 END AS pk
+            FROM information_schema.columns c
+            LEFT JOIN (
+              SELECT
+                kcu.table_name,
+                kcu.column_name,
+                tc.constraint_type
+              FROM information_schema.table_constraints tc
+              JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+               AND tc.table_schema = kcu.table_schema
+              WHERE tc.table_schema='public' AND tc.constraint_type='PRIMARY KEY'
+            ) tc
+              ON tc.table_name = c.table_name AND tc.column_name = c.column_name
+            WHERE c.table_schema='public' AND c.table_name=%s
+            ORDER BY ordinal_position
+        """
+        cur = self._conn.cursor()
+        cur.execute(q, (t,))
+        rows = cur.fetchall() or []
+        out: list[tuple[Any, ...]] = []
+        for cid, name, ctype, notnull, dflt_value, pk in rows:
+            out.append((cid, name, ctype, notnull, dflt_value, pk))
+        return out
+
+    def _pg_pragma_foreign_key_list(self, table: str) -> list[tuple[Any, ...]]:
+        """
+        Emulate SQLite: PRAGMA foreign_key_list(table)
+
+        SQLite shape:
+          (id, seq, table, from, to, on_update, on_delete, match)
+        """
+        t = _normalize_ident(table)
+        if not t:
+            return []
+
+        def _act(code: str) -> str:
+            # Postgres: a=NO ACTION, r=RESTRICT, c=CASCADE, n=SET NULL, d=SET DEFAULT
+            return {
+                "a": "NO ACTION",
+                "r": "RESTRICT",
+                "c": "CASCADE",
+                "n": "SET NULL",
+                "d": "SET DEFAULT",
+            }.get(code, "NO ACTION")
+
+        out: list[tuple[Any, ...]] = []
+        try:
+            q = """
+                SELECT
+                  con.oid AS id,
+                  ck.ordinality - 1 AS seq,
+                  con.confrelid::regclass::text AS ref_table,
+                  a.attname AS from_col,
+                  af.attname AS to_col,
+                  con.confupdtype AS upd,
+                  con.confdeltype AS del
+                FROM pg_constraint con
+                JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ordinality) ON true
+                JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ordinality)
+                  ON fk.ordinality = ck.ordinality
+                JOIN pg_attribute a
+                  ON a.attrelid = con.conrelid AND a.attnum = ck.attnum AND NOT a.attisdropped
+                JOIN pg_attribute af
+                  ON af.attrelid = con.confrelid AND af.attnum = fk.attnum AND NOT af.attisdropped
+                WHERE con.contype = 'f'
+                  AND con.conrelid = %s::regclass
+                ORDER BY con.oid, ck.ordinality
+            """
+            cur = self._conn.cursor()
+            cur.execute(q, (t,))
+            rows = cur.fetchall() or []
+            for oid, seq, ref_table, from_col, to_col, up, de in rows:
+                out.append(
+                    (
+                        int(oid),
+                        int(seq),
+                        str(ref_table),
+                        str(from_col),
+                        str(to_col),
+                        _act(str(up)),
+                        _act(str(de)),
+                        "NONE",
+                    )
+                )
+        except Exception:
+            return []
+
+        return out
+
+    def _pg_emulate_sqlite_master_query(
+        self, sql: str, params: Sequence[Any]
+    ) -> list[tuple[Any, ...]]:
+        """
+        Emulate simple `sqlite_master` checks used in tasks/scripts.
+
+        Supported shapes (best-effort):
+          - SELECT name FROM sqlite_master WHERE type='table' AND name = ?
+          - SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?
+          - type IN ('table','view') variants
+          - name='literal' variants (no param)
+        """
+        s = sql.strip()
+        select_one = bool(re.match(r"^\s*select\s+1\b", s, re.IGNORECASE))
+
+        name: str | None = None
+        if params:
+            try:
+                name = str(params[0]) if params[0] is not None else None
+            except Exception:
+                name = None
+
+        if name is None:
+            m = re.search(r"\bname\s*=\s*'([^']+)'\s*", s, re.IGNORECASE)
+            if m:
+                name = m.group(1)
+
+        if not name:
+            return []
+
+        want_views = bool(
+            re.search(r"type\s+in\s*\(\s*'table'\s*,\s*'view'\s*\)", s, re.IGNORECASE)
+        )
+        want_views = want_views or bool(re.search(r"type\s*=\s*'view'", s, re.IGNORECASE))
+
+        exists = False
+        try:
+            if want_views:
+                q = """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name=%s
+                    UNION ALL
+                    SELECT 1
+                    FROM information_schema.views
+                    WHERE table_schema='public' AND table_name=%s
+                    LIMIT 1
+                """
+                cur = self._conn.cursor()
+                cur.execute(q, (name, name))
+                exists = cur.fetchone() is not None
+            else:
+                q = """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name=%s
+                    LIMIT 1
+                """
+                cur = self._conn.cursor()
+                cur.execute(q, (name,))
+                exists = cur.fetchone() is not None
+        except Exception:
+            exists = False
+
+        if not exists:
+            return []
+
+        if select_one:
+            return [(1,)]
+        return [(name,)]
+
+
+# ---------------------------------------------------------------------------
+# Connection selection
+# ---------------------------------------------------------------------------
+
+
+def get_conn() -> CompatConnection:
+    """
+    Primary DB access point.
+
+    Target state:
+      - Postgres is the only supported system of record.
+      - All code paths (API, workers, scripts) must go through this function so the
+        compatibility layer can smooth over any remaining SQLite-isms during the
+        migration window (qmark placeholders, INSERT OR IGNORE, a few PRAGMAs).
+
+    Dev escape hatch:
+      - If ALLOW_SQLITE_DEV=1 is set, SQLite can be used for legacy local workflows.
+        This is not supported for production.
+    """
+    url = _database_url()
+
+    if _is_postgres_url(url):
+        if psycopg2 is None:  # pragma: no cover
+            raise RuntimeError(
+                "DATABASE_URL/DB_URL points at Postgres but psycopg2 is not installed. "
+                "Install psycopg2-binary (or psycopg2) to enable Postgres."
+            )
+
+        conn = psycopg2.connect(  # type: ignore[call-arg]
+            url,
+            cursor_factory=psycopg2.extras.DictCursor,
+        )
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+
+        # Best-effort: enforce UTC session timezone to reduce surprises
+        try:
+            cur = conn.cursor()
+            cur.execute("SET TIME ZONE 'UTC'")
+        except Exception:
+            pass
+
+        return CompatConnection(conn, is_pg=True)
+
+    if not ALLOW_SQLITE_DEV:
+        raise RuntimeError(
+            "Postgres is required. Set DATABASE_URL/DB_URL to a postgresql:// connection string. "
+            "If you intentionally need legacy SQLite for local dev only, set ALLOW_SQLITE_DEV=1."
+        )
+
+    # Legacy SQLite dev-only fallback (not supported for production).
+    import sqlite3  # local import by design
+
+    path = _sqlite_path_from_url(url) or DEFAULT_SQLITE_PATH
+    con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
+    return CompatConnection(con, is_pg=False)
+
+
+def get_connection(db_path: str | None = None) -> Any:
+    """
+    Legacy SQLite-only connection helper (dev-only).
+
+    Prefer get_conn() everywhere. This helper remains only to keep older
+    scripts/modules importable while the last SQLite-only components are retired.
+
+    Disabled unless ALLOW_SQLITE_DEV=1.
+    """
+    if not ALLOW_SQLITE_DEV:
+        raise RuntimeError(
+            "get_connection() is disabled (Postgres-only). Use get_conn(). "
+            "Set ALLOW_SQLITE_DEV=1 only for legacy local-dev workflows."
+        )
+
+    import sqlite3  # local import by design
+
+    if db_path is None:
+        url = _database_url()
+        if _is_postgres_url(url):
+            raise RuntimeError(
+                "get_connection() is SQLite-only; DATABASE_URL/DB_URL points at Postgres."
+            )
+        path = _sqlite_path_from_url(url) or DEFAULT_SQLITE_PATH
+    else:
+        if _is_postgres_url(db_path):
+            raise RuntimeError("get_connection() is SQLite-only; a Postgres URL was provided.")
+        path = _sqlite_path_from_url(db_path)
+
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
     return con
 
 
-def _table_columns(cur, table: str) -> dict[str, dict]:
+# ---------------------------------------------------------------------------
+# Introspection helpers
+# ---------------------------------------------------------------------------
+
+
+def _table_columns(conn: Any, table: str) -> dict[str, dict[str, Any]]:
     """
-    Returns {col_name: {name,type,notnull,default,pk}} for table.
+    Returns a dict mapping column_name -> metadata via PRAGMA table_info(table).
+
+    On Postgres, this is emulated by CompatCursor/CompatConnection.
     """
-    meta = {}
-    for _cid, name, ctype, notnull, dflt_value, pk in cur.execute(f"PRAGMA table_info({table})"):
-        meta[name] = {
-            "name": name,
-            "type": (ctype or "").upper(),
-            "notnull": bool(notnull),
+    meta: dict[str, dict[str, Any]] = {}
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        rows = cur.fetchall() or []
+    except Exception:
+        return meta
+
+    for row in rows:
+        try:
+            cid, name, ctype, notnull, dflt_value, pk = row[:6]
+        except Exception:
+            continue
+        if not name:
+            continue
+        meta[str(name)] = {
+            "name": str(name),
+            "type": (str(ctype) if ctype is not None else "").upper(),
+            "notnull": bool(int(notnull) if notnull is not None else 0),
             "default": dflt_value,
-            "pk": bool(pk),
+            "pk": bool(int(pk) if pk is not None else 0),
         }
     return meta
 
 
-def _fk_map(cur, table: str) -> dict[str, tuple[str, str]]:
+def _fk_map(conn: Any, table: str) -> dict[str, tuple[str, str]]:
     """
-    Maps local_col -> (ref_table, ref_col) for FKs in table.
+    Maps local_col -> (ref_table, ref_col) for foreign keys in table.
+
+    Works for:
+      - SQLite via PRAGMA foreign_key_list
+      - Postgres via CompatCursor PRAGMA emulation
     """
-    m = {}
-    for _id, _seq, ref_table, from_col, to_col, *_ in cur.execute(
-        f"PRAGMA foreign_key_list({table})"
-    ):
-        m[from_col] = (ref_table, to_col)
+    m: dict[str, tuple[str, str]] = {}
+    try:
+        cur = conn.execute(f"PRAGMA foreign_key_list({table})")
+        rows = cur.fetchall() or []
+    except Exception:
+        return m
+
+    for row in rows:
+        try:
+            _id, _seq, ref_table, from_col, to_col = row[:5]
+        except Exception:
+            continue
+        if from_col and ref_table and to_col:
+            m[str(from_col)] = (str(ref_table), str(to_col))
     return m
 
 
-def _emails_pk_col(cur) -> str | None:
-    """
-    Return the primary key column name for the emails table, or None if none found.
-    """
-    cols = _table_columns(cur, "emails")
-    for name, meta in cols.items():
-        if meta.get("pk"):
-            return name
-    # Common fallback
-    if "id" in cols:
-        return "id"
+# ---------------------------------------------------------------------------
+# Tenant resolution helpers
+# ---------------------------------------------------------------------------
+
+
+def _env_tenant_id() -> str:
+    return (os.getenv("TENANT_ID") or "").strip() or DEFAULT_TENANT_ID
+
+
+def _infer_tenant_from_row(conn: Any, table: str, row_id: int) -> str | None:
+    cols = _table_columns(conn, table)
+    if "tenant_id" not in cols:
+        return None
+    try:
+        cur = conn.execute(f"SELECT tenant_id FROM {table} WHERE id = ? LIMIT 1", (int(row_id),))
+        row = cur.fetchone()
+        if row and row[0]:
+            return str(row[0])
+    except Exception:
+        return None
     return None
 
 
-def _select_email_id(cur, email: str) -> int | None:
+def _resolve_tenant_id(
+    conn: Any,
+    *,
+    tenant_id: str | None = None,
+    company_id: int | None = None,
+    person_id: int | None = None,
+    email: str | None = None,
+) -> str:
     """
-    Look up the primary key of an email row by its address.
-    Returns None if the table has no PK or the row does not exist.
+    Resolve tenant_id using:
+      1) explicit tenant_id parameter
+      2) tenant inferred from existing rows (companies/people/emails) when possible
+      3) TENANT_ID env var
+      4) DEFAULT_TENANT_ID ('dev')
     """
-    pk = _emails_pk_col(cur)
-    if not pk:
-        return None
-    row = cur.execute(f"SELECT {pk} FROM emails WHERE email = ? LIMIT 1", (email,)).fetchone()
-    return int(row[0]) if row else None
+    if tenant_id and str(tenant_id).strip():
+        return str(tenant_id).strip()
+
+    if company_id:
+        t = _infer_tenant_from_row(conn, "companies", int(company_id))
+        if t:
+            return t
+    if person_id:
+        t = _infer_tenant_from_row(conn, "people", int(person_id))
+        if t:
+            return t
+
+    if email:
+        cols = _table_columns(conn, "emails")
+        if "tenant_id" in cols:
+            try:
+                cur = conn.execute(
+                    "SELECT tenant_id FROM emails WHERE email = ? LIMIT 1",
+                    ((email or "").strip().lower(),),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except Exception:
+                pass
+
+    return _env_tenant_id()
 
 
-def _ts_iso8601_z(value: datetime | str | None) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=UTC)
-        else:
-            value = value.astimezone(UTC)
-        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+# ---------------------------------------------------------------------------
+# Minimal entity ensure helpers (schema-aware)
+# ---------------------------------------------------------------------------
 
 
 def _derive_name_from_email(email: str) -> tuple[str, str, str]:
-    """
-    'john.smith@example.com' -> ('John Smith', 'John', 'Smith')
-    """
-    local = email.split("@", 1)[0]
-    parts = [p for p in local.replace(".", " ").replace("_", " ").replace("-", " ").split() if p]
+    local = (email or "").split("@", 1)[0]
+    parts = [p for p in re.split(r"[._\-\s]+", local) if p]
     if not parts:
         return ("Unknown", "Unknown", "")
     first = parts[0].capitalize()
@@ -126,274 +911,228 @@ def _derive_name_from_email(email: str) -> tuple[str, str, str]:
     return (full, first, last)
 
 
-# ---------------- ensure company/person ----------------
+def _ensure_company(conn: Any, tenant_id: str, domain: str) -> int:
+    domain_norm = (domain or "").strip().lower()
+    if not domain_norm:
+        raise ValueError("_ensure_company: domain required")
 
+    cols = _table_columns(conn, "companies")
+    where = "domain = ?"
+    params: list[Any] = [domain_norm]
+    if "tenant_id" in cols:
+        where = "tenant_id = ? AND domain = ?"
+        params = [tenant_id, domain_norm]
 
-def _ensure_company(cur, domain: str) -> int:
-    row = cur.execute("SELECT id FROM companies WHERE domain = ?", (domain,)).fetchone()
-    if row:
-        return row[0]
-    cur.execute("INSERT INTO companies(name, domain) VALUES(?, ?)", (domain, domain))
-    return cur.lastrowid
-
-
-def _ensure_person(cur, *, email: str, company_id: int | None) -> int | None:
-    """
-    Create or find a person that emails.person_id points to.
-    - Detects referenced table/PK via PRAGMA.
-    - If person table has 'email', upsert/find by that.
-    - Inserts a minimal row satisfying NOT NULLs if needed.
-    Returns the person's PK or None if emails.person_id isn't present/linked.
-    """
-    emails_cols = _table_columns(cur, "emails")
-    if "person_id" not in emails_cols:
-        return None
-
-    fks = _fk_map(cur, "emails")
-    if "person_id" not in fks:
-        return None
-
-    person_table, person_pk_col = fks["person_id"]
-    pcols = _table_columns(cur, person_table)
-
-    # Try to find by email if the person table has that column
-    email_col = "email" if "email" in pcols else None
-    if email_col:
-        row = cur.execute(
-            f"SELECT {person_pk_col} FROM {person_table} WHERE {email_col} = ?",
-            (email,),
+    try:
+        row = conn.execute(
+            f"SELECT id FROM companies WHERE {where} LIMIT 1", tuple(params)
         ).fetchone()
-        if row:
-            return row[0]
-
-    # Insert minimal person row
-    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    full, first, last = _derive_name_from_email(email)
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        pass
 
     insert_cols: list[str] = []
-    insert_vals: list[object] = []
+    insert_vals: list[Any] = []
 
-    def add(col: str, val: object) -> None:
-        insert_cols.append(col)
-        insert_vals.append(val)
+    def add(c: str, v: Any) -> None:
+        if c in cols:
+            insert_cols.append(c)
+            insert_vals.append(v)
 
-    # Prefer semantic fields if present
-    if email_col:
-        add(email_col, email)
-    if "company_id" in pcols:
-        add("company_id", company_id)
-    if "name" in pcols:
-        add("name", full)
-    if "full_name" in pcols and "name" not in pcols:
-        add("full_name", full)
-    if "first_name" in pcols:
-        add("first_name", first)
-    if "last_name" in pcols:
-        add("last_name", last)
-    if "created_at" in pcols:
-        add("created_at", now)
-    if "updated_at" in pcols:
-        add("updated_at", now)
+    add("tenant_id", tenant_id)
+    add("name", domain_norm)
+    add("domain", domain_norm)
+    add("user_supplied_domain", domain_norm)
 
-    # Satisfy NOT NULL columns without defaults
-    already = set(insert_cols)
-    for c in pcols.values():
-        if c["pk"] or not c["notnull"] or c["default"] is not None or c["name"] in already:
-            continue
-        ctype = c["type"]
-        if "INT" in ctype:
-            add(c["name"], 0)
-        elif any(k in ctype for k in ("REAL", "FLOA", "DOUB")):
-            add(c["name"], 0.0)
-        else:
-            add(c["name"], "")
+    if not insert_cols:
+        insert_cols = ["name", "domain"]
+        insert_vals = [domain_norm, domain_norm]
 
+    ph = ", ".join(["?"] * len(insert_cols))
     cols_sql = ", ".join(insert_cols)
-    ph = ", ".join("?" for _ in insert_vals)
-    cur.execute(f"INSERT INTO {person_table} ({cols_sql}) VALUES ({ph})", insert_vals)
-    return cur.lastrowid
 
-
-# ---------------- main upserts ----------------
-
-
-def upsert_verification_result(
-    *,
-    email: str,
-    verify_status: str,
-    reason: str | None = None,
-    mx_host: str | None = None,
-    verified_at: datetime | str | None = None,
-    company_id: int | None = None,
-    person_id: int | None = None,
-    source_url: str | None = None,
-    icp_score: int | None = None,
-    **_ignored: Any,
-) -> None:
-    """
-    Idempotent write keyed by emails.email.
-    Ensures company & person, then UPSERTs email.
-    Always updates: verify_status, reason, mx_host, verified_at.
-    Optionally updates: person_id, source_url, icp_score if those columns exist.
-    """
-    db = _db_path()
-    domain = email.split("@")[-1].lower().strip()
-    ts = _ts_iso8601_z(verified_at)
-
-    with sqlite3.connect(db) as con:
-        con.execute("PRAGMA foreign_keys=ON")
-        cur = con.cursor()
-
-        # Ensure company
-        comp_id = company_id or _ensure_company(cur, domain)
-
-        # Ensure/validate person if the FK exists
-        emails_cols = _table_columns(cur, "emails")
-        if "person_id" in emails_cols:
-            if person_id is None:
-                person_id = _ensure_person(cur, email=email, company_id=comp_id)
-            else:
-                # validate caller-supplied person_id
-                fks = _fk_map(cur, "emails")
-                if "person_id" in fks:
-                    ptable, ppk = fks["person_id"]
-                    exists = cur.execute(
-                        f"SELECT 1 FROM {ptable} WHERE {ppk} = ? LIMIT 1",
-                        (person_id,),
-                    ).fetchone()
-                    if not exists:
-                        person_id = _ensure_person(cur, email=email, company_id=comp_id)
-
-        # Idempotency guard
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email)")
-
-        # Build INSERT dynamically to match available columns
-        cols = _table_columns(cur, "emails")
-        insert_cols = ["email", "company_id", "verify_status", "reason", "mx_host", "verified_at"]
-        insert_vals: list[Any] = [email, comp_id, verify_status, reason, mx_host, ts]
-
-        if "person_id" in cols:
-            insert_cols.append("person_id")
-            insert_vals.append(person_id)
-        if "source_url" in cols:
-            insert_cols.append("source_url")
-            insert_vals.append(source_url)
-        if "icp_score" in cols:
-            insert_cols.append("icp_score")
-            insert_vals.append(icp_score)
-
-        placeholders = ", ".join("?" for _ in insert_cols)
-        insert_cols_sql = ", ".join(insert_cols)
-
-        update_parts = [
-            "company_id    = COALESCE(excluded.company_id, emails.company_id)",
-            "verify_status = excluded.verify_status",
-            "reason        = excluded.reason",
-            "mx_host       = excluded.mx_host",
-            "verified_at   = excluded.verified_at",
-        ]
-        if "person_id" in cols:
-            update_parts.append("person_id = COALESCE(excluded.person_id, emails.person_id)")
-        if "source_url" in cols:
-            update_parts.append("source_url = COALESCE(excluded.source_url, emails.source_url)")
-        if "icp_score" in cols:
-            update_parts.append("icp_score = COALESCE(excluded.icp_score, emails.icp_score)")
-
-        update_sql = ", ".join(update_parts)
-
-        sql = f"""
-            INSERT INTO emails ({insert_cols_sql})
-            VALUES ({placeholders})
-            ON CONFLICT(email) DO UPDATE SET
-              {update_sql}
-        """
-        cur.execute(sql, insert_vals)
-        con.commit()
-
-
-# ---------------- R16: verify/probe enqueue helper ----------------
-
-
-def enqueue_probe_email(
-    email_id: int, email: str, domain: str | None, *, force: bool = False
-) -> None:
-    """
-    Best-effort enqueue for the R16 SMTP RCPT probe task (task_probe_email).
-
-    Tries the ingest enqueue shim first (which tests observe), then falls back to
-    real RQ enqueue on the 'verify' queue. Never raises.
-    """
     try:
-        # Normalize/derive domain lazily to avoid importing at module import time.
+        cur = conn.execute(f"INSERT INTO companies ({cols_sql}) VALUES ({ph})", tuple(insert_vals))
         try:
-            from src.ingest.normalize import norm_domain  # type: ignore
+            if getattr(cur, "lastrowid", None) is not None:
+                return int(cur.lastrowid)  # type: ignore[attr-defined]
         except Exception:
-            norm_domain = None  # type: ignore
-
-        canon_dom = domain
-        if norm_domain:
-            try:
-                canon_dom = norm_domain(domain) if domain else None  # type: ignore[arg-type]
-            except Exception:
-                canon_dom = domain
-
-        if not canon_dom:
-            try:
-                dom_raw = email.split("@", 1)[1]
-                canon_dom = norm_domain(dom_raw) if norm_domain else dom_raw  # type: ignore[arg-type]
-            except Exception:
-                return  # cannot derive a domain; skip
-
-        # 1) Preferred path: ingest enqueue shim
+            pass
+    except Exception:
+        # If Postgres raised an integrity error, the transaction needs rollback
+        # before the next query.
         try:
-            from src.ingest import enqueue as ingest_enqueue  # type: ignore
-
-            ingest_enqueue(
-                "task_probe_email",
-                {
-                    "email_id": int(email_id),
-                    "email": str(email),
-                    "domain": str(canon_dom),
-                    "force": bool(force),
-                },
-            )
-            # Do not early return; also try real RQ enqueue in runtime environments.
+            conn.rollback()
         except Exception:
             pass
 
-        # 2) Fallback: direct RQ enqueue
-        try:
-            from rq import Queue  # type: ignore
-
-            from src.queueing.redis_conn import get_redis  # type: ignore
-            from src.queueing.tasks import task_probe_email  # type: ignore
-        except Exception:
-            return  # RQ/Redis not available in this environment
-
-        try:
-            q = Queue("verify", connection=get_redis())
-            q.enqueue(
-                task_probe_email,
-                email_id=email_id,
-                email=email,
-                domain=canon_dom,
-                force=force,
-                job_timeout=20,
-                retry=None,
-            )
-        except Exception:
-            # Best-effort: swallow any queue errors
-            return
+    try:
+        row = conn.execute(
+            f"SELECT id FROM companies WHERE {where} LIMIT 1", tuple(params)
+        ).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
     except Exception:
-        # Never propagate from enqueue helper
+        pass
+
+    raise RuntimeError("Failed to ensure companies row")
+
+
+def _ensure_person(conn: Any, tenant_id: str, *, email: str, company_id: int) -> int | None:
+    emails_cols = _table_columns(conn, "emails")
+    if "person_id" not in emails_cols:
+        return None
+
+    fk = _fk_map(conn, "emails").get("person_id")
+    if fk:
+        person_table, person_pk = fk
+    else:
+        person_table, person_pk = ("people", "id")
+
+    pcols = _table_columns(conn, person_table)
+    if not pcols:
+        return None
+
+    full, first, last = _derive_name_from_email(email)
+    where_parts: list[str] = []
+    params: list[Any] = []
+    if "tenant_id" in pcols:
+        where_parts.append("tenant_id = ?")
+        params.append(tenant_id)
+    if "company_id" in pcols:
+        where_parts.append("company_id = ?")
+        params.append(int(company_id))
+    if "full_name" in pcols:
+        where_parts.append("full_name = ?")
+        params.append(full)
+
+    if where_parts:
+        try:
+            row = conn.execute(
+                f"SELECT {person_pk} FROM {person_table} WHERE "
+                + " AND ".join(where_parts)
+                + " LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        except Exception:
+            pass
+
+    insert_cols: list[str] = []
+    insert_vals: list[Any] = []
+
+    def add(c: str, v: Any) -> None:
+        if c in pcols:
+            insert_cols.append(c)
+            insert_vals.append(v)
+
+    add("tenant_id", tenant_id)
+    add("company_id", int(company_id))
+    add("full_name", full)
+    add("first_name", first)
+    add("last_name", last)
+    add("email", email)
+    add("created_at", _now_iso_z())
+    add("updated_at", _now_iso_z())
+
+    if not insert_cols:
+        return None
+
+    ph = ", ".join(["?"] * len(insert_cols))
+    cols_sql = ", ".join(insert_cols)
+
+    try:
+        cur = conn.execute(
+            f"INSERT INTO {person_table} ({cols_sql}) VALUES ({ph})", tuple(insert_vals)
+        )
+        try:
+            if getattr(cur, "lastrowid", None) is not None:
+                return int(cur.lastrowid)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    if where_parts:
+        try:
+            row = conn.execute(
+                f"SELECT {person_pk} FROM {person_table} WHERE "
+                + " AND ".join(where_parts)
+                + " LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        except Exception:
+            pass
+
+    return None
+
+
+def _select_email_id(conn: Any, tenant_id: str, email: str) -> int | None:
+    cols = _table_columns(conn, "emails")
+    if not cols:
+        return None
+
+    where = "email = ?"
+    params: list[Any] = [(email or "").strip().lower()]
+    if "tenant_id" in cols:
+        where = "tenant_id = ? AND email = ?"
+        params = [tenant_id, (email or "").strip().lower()]
+
+    try:
+        row = conn.execute(f"SELECT id FROM emails WHERE {where} LIMIT 1", tuple(params)).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Optional: Redis enqueue helper (kept here to avoid circular imports)
+# ---------------------------------------------------------------------------
+
+
+def enqueue_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> None:
+    """
+    Enqueue an SMTP probe task by importing queueing lazily.
+
+    This keeps db.py usable in scripts that don't have Redis installed/configured.
+    """
+    try:
+        from rq import Queue  # local import
+
+        from src.queueing.redis import get_redis  # local import
+        from src.queueing.tasks import task_probe_email  # local import
+
+        queue_name = (os.getenv("SMTP_QUEUE_NAME") or "").strip() or "smtp"
+        q = Queue(queue_name, connection=get_redis())
+        q.enqueue(
+            task_probe_email,
+            email_id=int(email_id),
+            email=str(email),
+            domain=str(domain),
+            force=bool(force),
+            job_timeout=20,
+            retry=None,
+        )
+    except Exception:
         return
 
 
-# ---------------- R12: generated emails upsert ----------------
+# ---------------------------------------------------------------------------
+# Core write paths (tenant-aware + schema-aware)
+# ---------------------------------------------------------------------------
 
 
 def upsert_generated_email(
-    con: sqlite3.Connection,
+    conn: Any,
     person_id: int | None,
     email: str,
     domain: str,
@@ -401,177 +1140,340 @@ def upsert_generated_email(
     *,
     enqueue_probe: bool = False,
     force_probe: bool = False,
+    tenant_id: str | None = None,
 ) -> int | None:
     """
-    Insert a 'generated' email candidate for later verification.
+    Insert a generated email candidate into `emails` (idempotent).
 
-    - Idempotent on emails.email (no-op on conflict).
-    - Ensures companies row exists for the domain.
-    - If emails.person_id exists and person_id is None, attempts to _ensure_person.
-    - Populates optional columns when present:
-        source='generated', source_note, domain, created_at, verify_status=NULL.
-    - Returns the email row's primary key (if the emails table has a PK), else None.
-
-    R16 addition:
-    - If enqueue_probe=True, best-effort enqueues task_probe_email(email_id,email,domain).
-      This does NOT commit the outer transaction; callers should commit after batching.
+    Uses INSERT OR IGNORE for SQLite portability; translated to ON CONFLICT DO NOTHING on Postgres.
     """
-    con.execute("PRAGMA foreign_keys=ON")
-    cur = con.cursor()
+    email_norm = (email or "").strip().lower()
+    dom_norm = (domain or "").strip().lower()
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("upsert_generated_email expects a full email address with '@'")
 
-    email = (email or "").lower().strip()
-    domain = (domain or "").lower().strip()
-    if not email or "@" not in email:
-        raise ValueError("upsert_generated_email: expected full email address with '@'")
+    t = _resolve_tenant_id(conn, tenant_id=tenant_id, person_id=person_id, email=email_norm)
 
-    # Ensure company record
-    company_id = _ensure_company(cur, domain)
+    company_id: int | None = None
+    try:
+        pcols = _table_columns(conn, "people")
+        if person_id and pcols and "company_id" in pcols:
+            row = conn.execute(
+                "SELECT company_id FROM people WHERE id = ? LIMIT 1", (int(person_id),)
+            ).fetchone()
+            if row and row[0] is not None:
+                company_id = int(row[0])
+    except Exception:
+        company_id = None
 
-    # Ensure/validate person if FK present
-    emails_cols = _table_columns(cur, "emails")
-    if "person_id" in emails_cols:
-        if person_id is None:
-            person_id = _ensure_person(cur, email=email, company_id=company_id)
-        else:
-            fks = _fk_map(cur, "emails")
-            if "person_id" in fks:
-                ptable, ppk = fks["person_id"]
-                exists = cur.execute(
-                    f"SELECT 1 FROM {ptable} WHERE {ppk} = ? LIMIT 1", (person_id,)
-                ).fetchone()
-                if not exists:
-                    person_id = _ensure_person(cur, email=email, company_id=company_id)
+    if company_id is None:
+        company_id = _ensure_company(conn, t, dom_norm)
 
-    # Idempotency guard on emails.email
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email)")
+    person_final: int | None = person_id
+    try:
+        emails_cols = _table_columns(conn, "emails")
+        if "person_id" in emails_cols:
+            if person_final is None:
+                person_final = _ensure_person(conn, t, email=email_norm, company_id=int(company_id))
+            else:
+                fk = _fk_map(conn, "emails").get("person_id")
+                if fk:
+                    ptable, ppk = fk
+                    r = conn.execute(
+                        f"SELECT 1 FROM {ptable} WHERE {ppk} = ? LIMIT 1", (int(person_final),)
+                    ).fetchone()
+                    if not r:
+                        person_final = _ensure_person(
+                            conn, t, email=email_norm, company_id=int(company_id)
+                        )
+    except Exception:
+        pass
 
-    # Build INSERT dynamically based on available columns
-    cols_meta = _table_columns(cur, "emails")
+    emails_cols = _table_columns(conn, "emails")
+    insert_cols: list[str] = []
+    insert_vals: list[Any] = []
 
-    insert_cols: list[str] = ["email", "company_id"]
-    insert_vals: list[Any] = [email, company_id]
+    def add(c: str, v: Any) -> None:
+        if c in emails_cols:
+            insert_cols.append(c)
+            insert_vals.append(v)
 
-    def maybe(col: str, val: Any) -> None:
-        if col in cols_meta:
-            insert_cols.append(col)
-            insert_vals.append(val)
+    add("tenant_id", t)
+    add("person_id", person_final)
+    add("company_id", int(company_id))
+    add("email", email_norm)
+    add("source_url", None)
+    add("is_published", 0)
+    add("icp_score", None)
+    add("created_at", _now_iso_z())
+    add("updated_at", _now_iso_z())
 
-    maybe("person_id", person_id)
-    maybe("domain", domain)  # some schemas include a denormalized domain column
-    maybe("source", "generated")
-    maybe("source_note", source_note)
-    maybe("verify_status", None)
-    # Prefer explicit created_at if present; otherwise rely on DEFAULTs
-    if "created_at" in cols_meta:
-        insert_cols.append("created_at")
-        insert_vals.append(_ts_iso8601_z(None))
+    add("domain", dom_norm)
+    add("source_note", source_note)
+    add("source", "generated")
 
-    placeholders = ", ".join("?" for _ in insert_cols)
-    insert_cols_sql = ", ".join(insert_cols)
+    if not insert_cols:
+        insert_cols = ["email"]
+        insert_vals = [email_norm]
 
-    sql = f"""
-        INSERT INTO emails ({insert_cols_sql})
-        VALUES ({placeholders})
-        ON CONFLICT(email) DO NOTHING
-    """
-    cur.execute(sql, insert_vals)
+    ph = ", ".join(["?"] * len(insert_cols))
+    cols_sql = ", ".join(insert_cols)
 
-    # Determine/lookup the email_id regardless of conflict outcome
-    email_id = _select_email_id(cur, email)
+    conn.execute(f"INSERT OR IGNORE INTO emails ({cols_sql}) VALUES ({ph})", tuple(insert_vals))
+    email_id = _select_email_id(conn, t, email_norm)
 
-    # Best-effort enqueue of R16 probe if requested
-    if enqueue_probe and email_id is not None:
-        try:
-            enqueue_probe_email(email_id, email, domain, force=force_probe)
-        except Exception:
-            # Never break the caller's transaction for enqueue issues
-            pass
+    if email_id is not None and enqueue_probe:
+        enqueue_probe_email(int(email_id), email_norm, dom_norm, force=bool(force_probe))
 
-    # No commit here; caller (batch/queue) decides when to commit.
     return email_id
 
 
-# ---------------- R08: DB integration helpers ----------------
-
-
-def set_user_hint_and_enqueue(
-    conn: sqlite3.Connection, company_id: int, user_hint: str | None
+def upsert_verification_result(
+    email_id: int | None,
+    email: str,
+    domain: str,
+    verify_status: str | None,
+    reason: str | None,
+    mx_host: str | None = None,
+    verified_at: datetime | str | None = None,
+    *,
+    tenant_id: str | None = None,
+    company_id: int | None = None,
+    person_id: int | None = None,
 ) -> None:
     """
-    Store a user-supplied domain hint on the company.
-    (Enqueueing is handled by the caller/task layer if needed.)
+    Persist verification result in a schema-aware way.
+
+    Prefers writing to `verification_results` if present; otherwise updates legacy `emails` columns.
     """
-    with conn:
-        conn.execute(
-            "UPDATE companies SET user_supplied_domain = ? WHERE id = ?",
-            (user_hint, company_id),
+    with get_conn() as conn:
+        email_norm = (email or "").strip().lower()
+        dom_norm = (domain or "").strip().lower()
+        if not email_norm or "@" not in email_norm:
+            raise ValueError("upsert_verification_result expects a full email address with '@'")
+
+        t = _resolve_tenant_id(
+            conn, tenant_id=tenant_id, company_id=company_id, person_id=person_id, email=email_norm
         )
+
+        # Ensure email row exists if email_id not provided
+        if email_id is None:
+            emails_cols = _table_columns(conn, "emails")
+            if emails_cols:
+                insert_cols: list[str] = []
+                insert_vals: list[Any] = []
+
+                def add_e(c: str, v: Any) -> None:
+                    if c in emails_cols:
+                        insert_cols.append(c)
+                        insert_vals.append(v)
+
+                comp_id = company_id
+                if comp_id is None:
+                    try:
+                        comp_id = _ensure_company(conn, t, dom_norm)
+                    except Exception:
+                        comp_id = None
+
+                person_final = person_id
+                try:
+                    if "person_id" in emails_cols and person_final is None and comp_id is not None:
+                        person_final = _ensure_person(
+                            conn, t, email=email_norm, company_id=int(comp_id)
+                        )
+                except Exception:
+                    pass
+
+                add_e("tenant_id", t)
+                add_e("company_id", int(comp_id) if comp_id is not None else None)
+                add_e("person_id", person_final)
+                add_e("email", email_norm)
+                add_e("created_at", _now_iso_z())
+                add_e("updated_at", _now_iso_z())
+
+                # If emails.company_id exists and is NOT NULL, avoid inserting an invalid row.
+                if "company_id" in emails_cols and comp_id is None:
+                    pass
+                else:
+                    ph = ", ".join(["?"] * len(insert_cols))
+                    cols_sql = ", ".join(insert_cols)
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO emails ({cols_sql}) VALUES ({ph})",
+                        tuple(insert_vals),
+                    )
+
+            email_id = _select_email_id(conn, t, email_norm)
+
+        ver_cols = _table_columns(conn, "verification_results")
+        if ver_cols and email_id is not None:
+            checked_at = _now_iso_z()
+            v_at = None
+            if isinstance(verified_at, datetime):
+                v_at = _now_iso_z(verified_at)
+            elif isinstance(verified_at, str) and verified_at.strip():
+                v_at = verified_at.strip()
+
+            insert_cols: list[str] = []
+            insert_vals: list[Any] = []
+
+            def add_v(c: str, v: Any) -> None:
+                if c in ver_cols:
+                    insert_cols.append(c)
+                    insert_vals.append(v)
+
+            add_v("tenant_id", t)
+            add_v("email_id", int(email_id))
+            add_v("mx_host", (mx_host or "").strip().lower() or None)
+            add_v("status", (verify_status or "").strip().lower() or None)
+            add_v("reason", reason)
+            add_v("checked_at", checked_at)
+
+            add_v("verify_status", (verify_status or "").strip().lower() or None)
+            add_v("verify_reason", reason)
+            add_v("verified_mx", (mx_host or "").strip().lower() or None)
+            add_v("verified_at", v_at)
+
+            if insert_cols:
+                ph = ", ".join(["?"] * len(insert_cols))
+                cols_sql = ", ".join(insert_cols)
+                conn.execute(
+                    f"INSERT INTO verification_results ({cols_sql}) VALUES ({ph})",
+                    tuple(insert_vals),
+                )
+            return
+
+        # Legacy fallback: update emails columns if they exist (older schemas)
+        emails_cols = _table_columns(conn, "emails")
+        if emails_cols:
+            updates: list[str] = []
+            vals: list[Any] = []
+
+            def set_if(c: str, expr: str, v: Any) -> None:
+                if c in emails_cols:
+                    updates.append(f"{c} = {expr}")
+                    vals.append(v)
+
+            set_if("verify_status", "?", (verify_status or "").strip().lower() or None)
+            set_if("reason", "?", reason)
+            set_if("mx_host", "?", (mx_host or "").strip().lower() or None)
+
+            if "verified_at" in emails_cols:
+                if isinstance(verified_at, datetime):
+                    set_if("verified_at", "?", _now_iso_z(verified_at))
+                elif isinstance(verified_at, str) and verified_at.strip():
+                    set_if("verified_at", "?", verified_at.strip())
+                else:
+                    set_if("verified_at", "?", _now_iso_z())
+
+            if not updates:
+                return
+
+            if email_id is not None:
+                if "tenant_id" in emails_cols:
+                    vals.extend([t, int(email_id)])
+                    conn.execute(
+                        f"UPDATE emails SET {', '.join(updates)} WHERE tenant_id = ? AND id = ?",
+                        tuple(vals),
+                    )
+                else:
+                    vals.append(int(email_id))
+                    conn.execute(
+                        f"UPDATE emails SET {', '.join(updates)} WHERE id = ?",
+                        tuple(vals),
+                    )
+                return
+
+            # Update by email string if we couldn't resolve id
+            if "tenant_id" in emails_cols:
+                vals.extend([t, email_norm])
+                conn.execute(
+                    f"UPDATE emails SET {', '.join(updates)} WHERE tenant_id = ? AND email = ?",
+                    tuple(vals),
+                )
+            else:
+                vals.append(email_norm)
+                conn.execute(f"UPDATE emails SET {', '.join(updates)} WHERE email = ?", tuple(vals))
 
 
 def write_domain_resolution(
-    conn: sqlite3.Connection,
     company_id: int,
-    company_name: str,
-    decision: Any,
+    company_name: str | None,
     user_hint: str | None,
+    chosen_domain: str | None,
+    method: str | None,
+    confidence: float | None,
+    reason: str | None,
+    resolver_version: str | None = None,
+    *,
+    tenant_id: str | None = None,
 ) -> None:
     """
-    Persist a resolver Decision and, if a domain was chosen, update the company's official domain.
-    Expects `decision` to have: chosen (str|None), method (str), confidence (int), reason (str).
+    Record a domain resolution choice (R10/R11 style) if the table exists.
+    Also mirrors onto companies.{official_domain,...} if those columns exist.
     """
-    # Prefer a version on the decision if present; otherwise default to R08's current label.
-    resolver_version = (
-        getattr(decision, "resolver_version", None) or getattr(decision, "version", None) or "r08.3"
-    )
-    chosen = getattr(decision, "chosen", None)
-    method = getattr(decision, "method", None)
-    confidence = int(getattr(decision, "confidence", 0) or 0)
-    reason = getattr(decision, "reason", None)
+    with get_conn() as conn:
+        chosen = (chosen_domain or "").strip().lower() or None
+        t = _resolve_tenant_id(conn, tenant_id=tenant_id, company_id=int(company_id))
 
-    with conn:
-        # Audit trail of the resolution attempt
-        conn.execute(
-            """
-            INSERT INTO domain_resolutions (
-                company_id,
-                company_name,
-                user_hint,
-                chosen_domain,
-                method,
-                confidence,
-                reason,
-                resolver_version
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                company_id,
-                company_name,
-                user_hint,
-                chosen,
-                method,
-                confidence,
-                reason,
-                resolver_version,
-            ),
-        )
+        dr_cols = _table_columns(conn, "domain_resolutions")
+        if dr_cols:
+            insert_cols: list[str] = []
+            insert_vals: list[Any] = []
 
-        # If we have a decision, update the canonical fields on companies
-        # using our existing column names.
+            def add(c: str, v: Any) -> None:
+                if c in dr_cols:
+                    insert_cols.append(c)
+                    insert_vals.append(v)
+
+            add("tenant_id", t)
+            add("company_id", int(company_id))
+            add("company_name", company_name)
+            add("user_hint", user_hint)
+            add("chosen_domain", chosen)
+            add("method", method or "unknown")
+            add("confidence", confidence)
+            add("reason", reason)
+            add("resolver_version", resolver_version)
+
+            if insert_cols:
+                ph = ", ".join(["?"] * len(insert_cols))
+                cols_sql = ", ".join(insert_cols)
+                conn.execute(
+                    f"INSERT INTO domain_resolutions ({cols_sql}) VALUES ({ph})", tuple(insert_vals)
+                )
+
         if chosen:
-            now = _ts_iso8601_z(None)
-            # Our schema uses official_domain*, not domain_official*.
-            # Also keep provenance of how we decided (method) and when.
-            conn.execute(
-                """
-                UPDATE companies
-                   SET official_domain              = ?,
-                       official_domain_confidence   = ?,
-                       official_domain_source       = ?,
-                       official_domain_checked_at   = ?
-                 WHERE id = ?
-                """,
-                (chosen, confidence, method, now, company_id),
-            )
+            c_cols = _table_columns(conn, "companies")
+            if not c_cols:
+                return
+
+            sets: list[str] = []
+            vals: list[Any] = []
+
+            def set_if(col: str, val: Any) -> None:
+                if col in c_cols:
+                    sets.append(f"{col} = ?")
+                    vals.append(val)
+
+            set_if("official_domain", chosen)
+            set_if("official_domain_confidence", confidence)
+            set_if("official_domain_source", method)
+            set_if("official_domain_checked_at", _now_iso_z())
+
+            set_if("domain_official", chosen)
+            set_if("domain_official_confidence", confidence)
+            set_if("domain_official_source", method)
+            set_if("domain_official_checked_at", _now_iso_z())
+
+            if not sets:
+                return
+
+            if "tenant_id" in c_cols:
+                vals.extend([t, int(company_id)])
+                conn.execute(
+                    f"UPDATE companies SET {', '.join(sets)} WHERE tenant_id = ? AND id = ?",
+                    tuple(vals),
+                )
+            else:
+                vals.append(int(company_id))
+                conn.execute(f"UPDATE companies SET {', '.join(sets)} WHERE id = ?", tuple(vals))

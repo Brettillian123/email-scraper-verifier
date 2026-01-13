@@ -1,158 +1,294 @@
 # src/db_pages.py
-
 from __future__ import annotations
 
-import sqlite3
+import os
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from src.crawl.runner import Page  # keep / adjust this import if you already have it
+
+def _env_tenant_id() -> str:
+    return os.environ.get("TENANT_ID") or os.environ.get("TENANT") or "dev"
 
 
-def _sources_columns(conn: sqlite3.Connection) -> set[str]:
+def _sources_columns(conn: Any) -> set[str]:
     """
     Return the set of column names on the `sources` table.
 
-    We use this to stay robust against schema drift (extra columns, renamed
-    columns, optional company_id, etc.).
+    Uses PRAGMA table_info(...) which is natively supported by SQLite and is
+    emulated by src/db.py's Postgres compatibility layer.
     """
     cur = conn.execute("PRAGMA table_info(sources)")
     return {row[1] for row in cur.fetchall()}
 
 
-def _page_html(page: Page) -> bytes | None:
+def _page_url(page: Any) -> str | None:
+    for attr in ("url", "source_url", "page_url"):
+        val = getattr(page, attr, None)
+        if val:
+            return str(val)
+    return None
+
+
+def _page_html_text(page: Any) -> str | None:
     """
-    Best-effort extraction of the HTML payload from a Page-like object.
+    Best-effort extraction of an HTML/text payload from a Page-like object.
 
     We try common attribute names in order: html, body, content, text.
+    For bytes payloads we decode as UTF-8 with errors ignored.
     """
     for attr in ("html", "body", "content", "text"):
         val = getattr(page, attr, None)
         if val is None:
             continue
         if isinstance(val, (bytes, bytearray)):
-            return bytes(val)
-        # Treat everything else as text and encode to UTF-8
+            try:
+                return bytes(val).decode("utf-8", "ignore")
+            except Exception:
+                return None
         try:
-            return str(val).encode("utf-8")
+            return str(val)
         except Exception:
-            return str(val).encode("utf-8", "ignore")
+            return None
     return None
 
 
+def _page_status_code(page: Any) -> int | None:
+    raw = (
+        getattr(page, "status", None)
+        or getattr(page, "status_code", None)
+        or getattr(page, "code", None)
+    )
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _page_content_type(page: Any) -> str | None:
+    val = getattr(page, "content_type", None) or getattr(page, "mime_type", None)
+    if val:
+        return str(val)
+
+    headers = getattr(page, "headers", None)
+    if isinstance(headers, dict):
+        ct = headers.get("Content-Type") or headers.get("content-type")
+        if ct:
+            return str(ct)
+
+    return None
+
+
+def _status_column(cols: set[str]) -> str | None:
+    if "status_code" in cols:
+        return "status_code"
+    if "http_status" in cols:
+        return "http_status"
+    return None
+
+
+def _effective_tenant(has_tenant_id: bool, tenant_id: str | None) -> str | None:
+    if not has_tenant_id:
+        return None
+    return tenant_id or _env_tenant_id()
+
+
+def _select_existing_source_id(
+    conn: Any,
+    *,
+    has_id: bool,
+    has_tenant_id: bool,
+    url: str,
+    effective_tenant: str | None,
+) -> Any:
+    if not has_id:
+        return None
+
+    where = "source_url = ?"
+    params: list[Any] = [url]
+    if has_tenant_id and effective_tenant is not None:
+        where += " AND tenant_id = ?"
+        params.append(effective_tenant)
+
+    cur = conn.execute(
+        f"SELECT id FROM sources WHERE {where} ORDER BY id DESC LIMIT 1",
+        params,
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def _build_insert_payload(
+    *,
+    cols: set[str],
+    url: str,
+    html_text: str,
+    effective_tenant: str | None,
+    company_id: int | None,
+    status_col: str | None,
+    status_code: int | None,
+    content_type: str | None,
+    now: str,
+) -> tuple[list[str], list[Any]]:
+    insert_cols: list[str] = ["source_url", "html"]
+    insert_vals: list[Any] = [url, html_text]
+
+    if "tenant_id" in cols and effective_tenant is not None:
+        insert_cols.append("tenant_id")
+        insert_vals.append(effective_tenant)
+
+    if "company_id" in cols and company_id is not None:
+        insert_cols.append("company_id")
+        insert_vals.append(company_id)
+
+    if status_col and status_code is not None and status_col in cols:
+        insert_cols.append(status_col)
+        insert_vals.append(status_code)
+
+    if "content_type" in cols and content_type is not None:
+        insert_cols.append("content_type")
+        insert_vals.append(content_type)
+
+    if "fetched_at" in cols:
+        insert_cols.append("fetched_at")
+        insert_vals.append(now)
+
+    return insert_cols, insert_vals
+
+
+def _update_existing_source(
+    conn: Any,
+    *,
+    cols: set[str],
+    existing_id: Any,
+    html_text: str,
+    company_id: int | None,
+    status_col: str | None,
+    status_code: int | None,
+    content_type: str | None,
+    now: str,
+) -> None:
+    set_parts: list[str] = ["html = ?"]
+    vals: list[Any] = [html_text]
+
+    if "company_id" in cols and company_id is not None:
+        set_parts.append("company_id = ?")
+        vals.append(company_id)
+
+    if status_col and status_code is not None and status_col in cols:
+        set_parts.append(f"{status_col} = ?")
+        vals.append(status_code)
+
+    if "content_type" in cols and content_type is not None:
+        set_parts.append("content_type = ?")
+        vals.append(content_type)
+
+    if "fetched_at" in cols:
+        set_parts.append("fetched_at = ?")
+        vals.append(now)
+
+    vals.append(existing_id)
+    conn.execute(
+        f"UPDATE sources SET {', '.join(set_parts)} WHERE id = ?",
+        vals,
+    )
+
+
+def _insert_new_source(conn: Any, *, insert_cols: list[str], insert_vals: list[Any]) -> None:
+    placeholders = ", ".join("?" for _ in insert_cols)
+    cols_sql = ", ".join(insert_cols)
+    conn.execute(
+        f"INSERT INTO sources ({cols_sql}) VALUES ({placeholders})",
+        insert_vals,
+    )
+
+
 def save_pages(
-    conn: sqlite3.Connection,
-    pages: Iterable[Page],
+    conn: Any,
+    pages: Iterable[Any],
     company_id: int | None = None,
+    tenant_id: str | None = None,
 ) -> int:
     """
     Persist crawled pages into the `sources` table.
 
-    Behaviour:
+    Goals:
+      * Work on both SQLite and Postgres via src/db.py compatibility wrappers.
+      * Stay robust to schema drift (extra/optional columns).
+      * Avoid uncontrolled duplication even when the table does not have a
+        UNIQUE constraint on source_url by performing a manual upsert.
 
-      * Inserts one row per Page.
-      * Always writes `source_url` and `html` when those columns exist.
-      * If `company_id` column exists and a value is provided, it is stored.
-      * Uses an UPSERT on `source_url` when possible; otherwise falls back to
-        INSERT OR IGNORE.
-
-    Returns the number of rows written/updated (best-effort).
+    Returns a best-effort count of pages processed (inserted or updated).
     """
     cols = _sources_columns(conn)
-
-    # If the table is missing the expected core columns, there is nothing
-    # sensible we can do.
     if "source_url" not in cols or "html" not in cols:
         return 0
 
-    has_company_id = "company_id" in cols
-    has_status_code = "status_code" in cols or "http_status" in cols
-    status_col = (
-        "status_code"
-        if "status_code" in cols
-        else ("http_status" if "http_status" in cols else None)
-    )
-    has_content_type = "content_type" in cols
-    has_fetched_at = "fetched_at" in cols
+    has_id = "id" in cols
+    has_tenant_id = "tenant_id" in cols
+    status_col = _status_column(cols)
+    effective_tenant = _effective_tenant(has_tenant_id, tenant_id)
 
     now = datetime.now(UTC).replace(microsecond=0).isoformat()
     written = 0
 
     for page in pages:
-        # URL: prefer `url`, fall back to `source_url`.
-        url = getattr(page, "url", None) or getattr(page, "source_url", None)
+        url = _page_url(page)
         if not url:
             continue
 
-        html_blob = _page_html(page)
-        if html_blob is None:
-            # No HTML payload → nothing useful to store for this page.
+        html_text = _page_html_text(page)
+        if html_text is None:
             continue
 
-        params: dict[str, Any] = {
-            "source_url": url,
-            "html": html_blob,
-        }
-        col_list: list[str] = ["source_url", "html"]
+        status_code = _page_status_code(page) if status_col else None
+        content_type = _page_content_type(page)
 
-        # Optional company_id
-        if has_company_id and company_id is not None:
-            params["company_id"] = company_id
-            col_list.append("company_id")
+        existing_id = _select_existing_source_id(
+            conn,
+            has_id=has_id,
+            has_tenant_id=has_tenant_id,
+            url=url,
+            effective_tenant=effective_tenant,
+        )
 
-        # Optional status code
-        if status_col and has_status_code:
-            status_val = (
-                getattr(page, "status", None)
-                or getattr(page, "status_code", None)
-                or getattr(page, "code", None)
+        if existing_id is not None:
+            _update_existing_source(
+                conn,
+                cols=cols,
+                existing_id=existing_id,
+                html_text=html_text,
+                company_id=company_id,
+                status_col=status_col,
+                status_code=status_code,
+                content_type=content_type,
+                now=now,
             )
-            if status_val is not None:
-                params[status_col] = int(status_val)
-                col_list.append(status_col)
+            written += 1
+            continue
 
-        # Optional content_type
-        if has_content_type:
-            ctype = (
-                getattr(page, "content_type", None)
-                or getattr(page, "mime_type", None)
-                or (
-                    getattr(page, "headers", {}).get("Content-Type")
-                    if hasattr(page, "headers")
-                    else None
-                )
-            )
-            if ctype is not None:
-                params["content_type"] = str(ctype)
-                col_list.append("content_type")
-
-        # Optional fetched_at
-        if has_fetched_at:
-            params["fetched_at"] = now
-            col_list.append("fetched_at")
-
-        placeholders = ", ".join(f":{c}" for c in col_list)
-        cols_sql = ", ".join(col_list)
-
-        # Try a proper ON CONFLICT(source_url) UPSERT first; if the schema does
-        # not define a UNIQUE/PK on source_url, fall back to INSERT OR IGNORE.
-        upsert_sql = f"""
-            INSERT INTO sources ({cols_sql})
-            VALUES ({placeholders})
-            ON CONFLICT(source_url) DO UPDATE SET
-              html = excluded.html
-              {", company_id = excluded.company_id" if has_company_id else ""}
-        """
-
-        try:
-            conn.execute(upsert_sql, params)
-        except sqlite3.OperationalError:
-            # Older schemas / different constraints: degrade gracefully.
-            fallback_sql = f"INSERT OR IGNORE INTO sources ({cols_sql}) VALUES ({placeholders})"
-            conn.execute(fallback_sql, params)
-
+        insert_cols, insert_vals = _build_insert_payload(
+            cols=cols,
+            url=url,
+            html_text=html_text,
+            effective_tenant=effective_tenant,
+            company_id=company_id,
+            status_col=status_col,
+            status_code=status_code,
+            content_type=content_type,
+            now=now,
+        )
+        _insert_new_source(conn, insert_cols=insert_cols, insert_vals=insert_vals)
         written += 1
 
-    conn.commit()
+    try:
+        conn.commit()
+    except Exception:
+        # Some callers may pass in a managed/readonly connection; best-effort.
+        pass
+
     return written

@@ -5,146 +5,163 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import sqlite3
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_FILE = ROOT / "db" / "schema.sql"
+DEFAULT_SCHEMA_FILE = ROOT / "db" / "schema.sql"
+DEFAULT_MIGRATIONS_DIR = ROOT / "db" / "migrations"
 
 # Columns that must NEVER be uniquely indexed (multi-brand rule)
 _OFFICIAL_COLS = ("official_domain", "domain_official")
 
-# Optional O26 migration import (handled gracefully if missing)
-try:
-    from migrate_o26_test_send_bounce import migrate as migrate_o26
-except ImportError:  # pragma: no cover - O26 not present in some environments
-    migrate_o26 = None  # type: ignore[assignment]
+_DOLLAR_TAG_RE = re.compile(r"\$[A-Za-z0-9_]*\$")
 
 
-def _is_windows_drive(p: str) -> bool:
-    # e.g., "C:/path" or "D:\\path"
-    return len(p) >= 3 and p[1] == ":" and (p[2] == "/" or p[2] == "\\")
-
-
-def resolve_sqlite_path() -> Path:
+def _import_get_conn():
     """
-    Resolve the SQLite database path.
-
-    Accepts:
-      - no env var  -> defaults to <repo>/data/dev.db if data/ exists, else <repo>/dev.db
-      - DATABASE_URL like sqlite:///relative/dev.db
-      - DATABASE_URL like sqlite:////absolute/posix/dev.db
-      - DATABASE_URL like sqlite:///C:/Users/You/email-scraper/dev.db (Windows)
-      - DATABASE_URL like sqlite:////C:/Users/You/email-scraper/dev.db (Windows + extra slash)
+    Import get_conn() in a way that works when running as:
+      - `python scripts/apply_schema.py` (repo root is on sys.path), or
+      - a direct script call without PYTHONPATH configured.
     """
-    url = (os.getenv("DATABASE_URL") or "").strip()
-    if not url:
-        return ROOT / "data" / "dev.db" if (ROOT / "data").exists() else ROOT / "dev.db"
-
-    parsed = urlparse(url)
-    if parsed.scheme != "sqlite":
-        sys.exit("ERROR: These setup scripts only support SQLite (sqlite:///...).")
-
-    raw_path = unquote(parsed.path or "")
-    # On Windows, urlparse gives "/C:/..." for sqlite:///C:/...
-    if os.name == "nt" and raw_path.startswith("/") and _is_windows_drive(raw_path[1:]):
-        raw_path = raw_path[1:]
-
-    if not raw_path:
-        return ROOT / "dev.db"
-
-    # Windows absolute "C:/..." or "C:\\..."
-    if _is_windows_drive(raw_path):
-        return Path(raw_path)
-
-    # POSIX absolute "/..."
-    if raw_path.startswith("/"):
-        return Path(raw_path)
-
-    # Otherwise treat as relative to repo root
-    return (ROOT / raw_path).resolve()
-
-
-def connect(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    # WAL improves concurrency; safe to attempt here.
     try:
-        conn.execute("PRAGMA journal_mode = WAL;")
-    except sqlite3.OperationalError:
-        pass
-    return conn
+        from src.db import get_conn  # type: ignore
+    except Exception:
+        sys.path.insert(0, str(ROOT))
+        from src.db import get_conn  # type: ignore
+    return get_conn
 
 
-def load_schema_text() -> str:
-    if not SCHEMA_FILE.exists():
-        sys.exit(f"ERROR: Missing schema file: {SCHEMA_FILE}")
-    return SCHEMA_FILE.read_text(encoding="utf-8")
+def _is_postgres_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return u.startswith("postgres://") or u.startswith("postgresql://")
 
 
-def iter_statements(sql: str) -> Iterable[str]:
+@dataclass
+class _SqlSplitState:
+    in_single: bool = False
+    in_double: bool = False
+    in_line_comment: bool = False
+    in_block_comment: bool = False
+    dollar_tag: str | None = None
+
+
+def _match_dollar_tag(sql_text: str, pos: int) -> str | None:
+    m = _DOLLAR_TAG_RE.match(sql_text, pos)
+    return m.group(0) if m else None
+
+
+def _append_stmt_if_any(out: list[str], buf: list[str]) -> None:
+    stmt = "".join(buf).strip()
+    if stmt:
+        out.append(stmt + ";")
+
+
+def _consume_sql_char(
+    sql_text: str, i: int, n: int, buf: list[str], out: list[str], st: _SqlSplitState
+) -> int:
+    ch = sql_text[i]
+    nxt = sql_text[i + 1] if i + 1 < n else ""
+
+    if st.in_line_comment:
+        buf.append(ch)
+        if ch == "\n":
+            st.in_line_comment = False
+        return i + 1
+
+    if st.in_block_comment:
+        buf.append(ch)
+        if ch == "*" and nxt == "/":
+            buf.append(nxt)
+            st.in_block_comment = False
+            return i + 2
+        return i + 1
+
+    if st.dollar_tag is not None:
+        tag = st.dollar_tag
+        if sql_text.startswith(tag, i):
+            buf.append(tag)
+            st.dollar_tag = None
+            return i + len(tag)
+        buf.append(ch)
+        return i + 1
+
+    if not st.in_single and not st.in_double:
+        if ch == "-" and nxt == "-":
+            buf.append(ch)
+            buf.append(nxt)
+            st.in_line_comment = True
+            return i + 2
+
+        if ch == "/" and nxt == "*":
+            buf.append(ch)
+            buf.append(nxt)
+            st.in_block_comment = True
+            return i + 2
+
+        if ch == "$":
+            tag = _match_dollar_tag(sql_text, i)
+            if tag:
+                buf.append(tag)
+                st.dollar_tag = tag
+                return i + len(tag)
+
+    if ch == "'" and not st.in_double:
+        buf.append(ch)
+        if st.in_single and nxt == "'":
+            buf.append(nxt)
+            return i + 2
+        st.in_single = not st.in_single
+        return i + 1
+
+    if ch == '"' and not st.in_single:
+        buf.append(ch)
+        st.in_double = not st.in_double
+        return i + 1
+
+    if ch == ";" and not st.in_single and not st.in_double:
+        _append_stmt_if_any(out, buf)
+        buf.clear()
+        return i + 1
+
+    buf.append(ch)
+    return i + 1
+
+
+def _split_sql_statements(sql_text: str) -> list[str]:  # noqa: C901
     """
-    Split on semicolons (simple splitter). Also upgrades CREATE INDEX/UNIQUE INDEX
-    to IF NOT EXISTS to be idempotent. We don't touch CREATE TABLE/VIEW text beyond that.
+    Robust-ish SQL splitter:
+      - Splits on semicolons not inside:
+          * single quotes
+          * double quotes
+          * dollar-quoted blocks ($$...$$ or $tag$...$tag$)
+          * line comments (-- ...)
+          * block comments (/* ... */)
+
+    Returns statements with trailing ';' preserved.
     """
-    for raw in sql.split(";"):
-        stmt = raw.strip()
-        if not stmt:
-            continue
+    out: list[str] = []
+    buf: list[str] = []
+    st = _SqlSplitState()
 
-        # Make indexes idempotent.
-        stmt = re.sub(
-            r"^\s*CREATE\s+UNIQUE\s+INDEX\s+(?!IF\s+NOT\s+EXISTS)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS ",
-            stmt,
-            flags=re.IGNORECASE,
-        )
-        stmt = re.sub(
-            r"^\s*CREATE\s+INDEX\s+(?!IF\s+NOT\s+EXISTS)",
-            "CREATE INDEX IF NOT EXISTS ",
-            stmt,
-            flags=re.IGNORECASE,
-        )
-        yield stmt + ";"
+    i = 0
+    n = len(sql_text)
+    while i < n:
+        i = _consume_sql_char(sql_text, i, n, buf, out, st)
+
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail if tail.endswith(";") else tail + ";")
+
+    return out
 
 
-def table_columns(conn: sqlite3.Connection, table: str) -> dict:
-    cols = {}
-    for r in conn.execute(f"PRAGMA table_info({table});"):
-        cols[r["name"]] = dict(
-            cid=r["cid"],
-            type=r["type"],
-            not_null=bool(r["notnull"]),
-            default=r["dflt_value"],
-            pk=bool(r["pk"]),
-        )
-    return cols
-
-
-def ensure_email_columns(conn: sqlite3.Connection) -> None:
-    desired: tuple[tuple[str, str], ...] = (
-        ("verify_status", "TEXT"),
-        ("reason", "TEXT"),
-        ("mx_host", "TEXT"),
-        ("verified_at", "TEXT"),  # ISO8601
-    )
-    cols = table_columns(conn, "emails")
-    for col, coltype in desired:
-        if col not in cols:
-            conn.execute(f"ALTER TABLE emails ADD COLUMN {col} {coltype};")
-
-
-def ensure_unique_index(conn: sqlite3.Connection) -> None:
-    # Idempotency guard: one row per email.
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_emails_email ON emails(email);")
-
-
-# ---------- Multi-brand safety helpers ----------
+def _read_text(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    return path.read_text(encoding="utf-8")
 
 
 def _is_official_unique_stmt(stmt: str) -> bool:
@@ -159,177 +176,253 @@ def _is_official_unique_stmt(stmt: str) -> bool:
     return re.search(pat, s) is not None
 
 
-def _drop_unique_official_if_present(conn: sqlite3.Connection) -> None:
+def _drop_unique_official_if_present(conn) -> None:
     """
     If a UNIQUE index exists on companies.(official_domain|domain_official), drop it.
     This enforces "many companies → one domain" regardless of existing state.
     """
-    rows = conn.execute("PRAGMA index_list('companies')").fetchall()
-    for r in rows:
-        # PRAGMA index_list returns: seq, name, unique, origin, partial
-        if int(r["unique"]) != 1:
+    try:
+        rows = conn.execute(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = 'companies'
+            """
+        ).fetchall()
+    except Exception:
+        return
+
+    for row in rows or []:
+        try:
+            indexname = row[0] if isinstance(row, tuple) else row["indexname"]
+            indexdef = row[1] if isinstance(row, tuple) else row["indexdef"]
+        except Exception:
             continue
-        name = r["name"]
-        cols = [ri["name"] for ri in conn.execute(f"PRAGMA index_info('{name}')")]
-        if any(c in _OFFICIAL_COLS for c in cols):
-            conn.execute(f'DROP INDEX "{name}"')
+
+        idef = str(indexdef or "")
+        if "UNIQUE" not in idef.upper():
+            continue
+
+        idef_l = idef.lower()
+        if any(c in idef_l for c in _OFFICIAL_COLS):
+            try:
+                conn.execute(f'DROP INDEX IF EXISTS "{indexname}"')
+            except Exception:
+                pass
 
 
-# ---------- Existence helpers & guarded execution ----------
-
-
-def _object_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE (type='table' OR type='view' OR type='index') AND name=?;",
-            (name,),
-        ).fetchone()
-        is not None
+def _ensure_schema_migrations_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
     )
 
 
-def _extract_create_target(stmt: str) -> tuple[str | None, str | None]:
-    """
-    Try to pull object type and name from a CREATE statement.
-    Returns (obj_type, obj_name) with obj_type in {'table','view','index','unique index'} or (None, None).
-    """
-    s = stmt.strip().rstrip(";")
-    m = re.match(
-        r"(?is)^\s*CREATE\s+(?:(TEMP|TEMPORARY)\s+)?"
-        r"(?P<kind>TABLE|VIEW|UNIQUE\s+INDEX|INDEX)\s+"
-        r"(?:IF\s+NOT\s+EXISTS\s+)?"
-        r'(?P<name>["`\[]?[A-Za-z_][\w$]*["`\]]?)',
-        s,
-    )
-    if not m:
-        return (None, None)
-    kind = m.group("kind").lower()
-    name = m.group("name")
-    # strip quotes/brackets
-    name = re.sub(r'^[`"\[]|[`"\]]$', "", name)
-    return (kind, name)
+def _applied_migrations(conn) -> set[str]:
+    try:
+        rows = conn.execute("SELECT version FROM schema_migrations;").fetchall() or []
+        out: set[str] = set()
+        for r in rows:
+            if isinstance(r, tuple):
+                out.add(str(r[0]))
+            else:
+                out.add(str(r["version"]))
+        return out
+    except Exception:
+        return set()
 
 
-def apply_schema(conn: sqlite3.Connection, schema_text: str) -> None:
-    for stmt in iter_statements(schema_text):
-        # Skip any forbidden UNIQUE index on official-domain (multi-brand rule)
+def _apply_sql_text(conn, sql_text: str) -> None:
+    for stmt in _split_sql_statements(sql_text):
+        # Multi-brand guard: never allow unique index on official_domain / domain_official
         if _is_official_unique_stmt(stmt):
             print(
                 "· Skipping UNIQUE index on companies.(official_domain|domain_official) per multi-brand rule"
             )
             continue
 
-        # If the object already exists, skip CREATE to avoid re-executing broken legacy SQL
-        kind, name = _extract_create_target(stmt)
-        if (
-            kind in {"table", "view", "index", "unique index"}
-            and name
-            and _object_exists(conn, name)
-        ):
-            # Let ALTER statements still run later if present; we only skip CREATEs here.
-            # This is especially helpful if schema.sql has old CREATE TABLE text that would now error.
-            print(f"· Skipping CREATE {kind} {name} (already exists)")
+        if not stmt.strip("; \n\t\r"):
             continue
 
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError as e:
-            # Print the failing statement to help diagnose issues like "near 'domain': syntax error"
-            print("\n--- FAILED SQL STATEMENT ---")
-            print(stmt.strip())
-            print("--- END FAILED SQL STATEMENT ---\n")
-            msg = str(e).lower()
-            # Benign idempotency errors (kept for completeness)
-            if "already exists" in msg or "duplicate column name" in msg:
-                continue
-            raise
-    # After applying schema, enforce multi-brand guard
+        conn.execute(stmt)
+
+    # Enforce multi-brand rule post-apply as well (defensive)
     _drop_unique_official_if_present(conn)
 
 
-def verify_integrity(conn: sqlite3.Connection) -> None:
-    row = conn.execute("PRAGMA integrity_check;").fetchone()
-    if not row or row[0] != "ok":
-        sys.exit(f"ERROR: integrity_check failed: {row[0] if row else 'unknown'}")
+def _apply_migrations(conn, migrations_dir: Path) -> int:
+    if not migrations_dir.exists():
+        return 0
+
+    files = sorted([p for p in migrations_dir.glob("*.sql") if p.is_file()])
+    if not files:
+        return 0
+
+    _ensure_schema_migrations_table(conn)
+    applied = _applied_migrations(conn)
+
+    applied_now = 0
+    for p in files:
+        version = p.name
+        if version in applied:
+            continue
+
+        print(f"→ Applying migration: {p.relative_to(ROOT)}")
+        sql_text = _read_text(p)
+        _apply_sql_text(conn, sql_text)
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (?);", (version,))
+        conn.commit()
+        applied_now += 1
+
+    return applied_now
 
 
-def ensure_v_emails_latest(conn: sqlite3.Connection) -> None:
-    # One row per email, preferring most recent verified_at, then highest id.
-    conn.executescript(
-        """
-        CREATE VIEW IF NOT EXISTS v_emails_latest AS
-        WITH ranked AS (
-          SELECT
-            e.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY e.email
-              ORDER BY
-                (e.verified_at IS NULL) ASC,  -- push NULLs last
-                e.verified_at DESC,
-                e.id DESC
-            ) AS rn
-          FROM emails e
-        )
-        SELECT
-          id, email, person_id, company_id, is_published, source_url, icp_score,
-          verify_status, reason, mx_host, verified_at
-        FROM ranked
-        WHERE rn = 1;
-        """
+def _verify_postgres(conn) -> None:
+    # Lightweight sanity check
+    conn.execute("SELECT 1;").fetchone()
+
+
+def _object_exists(conn, name: str, kind: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return False
+
+    k = (kind or "").strip().lower()
+    try:
+        if k == "table":
+            return (
+                conn.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_name=? LIMIT 1",
+                    (n,),
+                ).fetchone()
+                is not None
+            )
+        if k == "view":
+            return (
+                conn.execute(
+                    "SELECT 1 FROM information_schema.views "
+                    "WHERE table_schema='public' AND table_name=? LIMIT 1",
+                    (n,),
+                ).fetchone()
+                is not None
+            )
+        if k == "index":
+            return (
+                conn.execute(
+                    "SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname=? LIMIT 1",
+                    (n,),
+                ).fetchone()
+                is not None
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _print_summary(conn) -> None:
+    for t in (
+        "tenants",
+        "users",
+        "runs",
+        "companies",
+        "sources",
+        "people",
+        "emails",
+        "verification_results",
+    ):
+        exists = "yes" if _object_exists(conn, t, "table") else "no"
+        print(f"· {t:24} exists: {exists}")
+
+    v_exists = "yes" if _object_exists(conn, "v_emails_latest", "view") else "no"
+    print(f"· v_emails_latest         exists: {v_exists}")
+
+    mig_exists = "yes" if _object_exists(conn, "schema_migrations", "table") else "no"
+    print(f"· schema_migrations       exists: {mig_exists}")
+
+
+def main(argv: Iterable[str] | str | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Apply Postgres schema + SQL migrations (Postgres-only)."
+    )
+    parser.add_argument(
+        "--db",
+        dest="db_url",
+        help="Postgres URL (overrides DATABASE_URL/DB_URL for this run).",
+    )
+    parser.add_argument(
+        "--schema",
+        dest="schema_file",
+        default=str(DEFAULT_SCHEMA_FILE),
+        help="Path to db/schema.sql (defaults to repo db/schema.sql).",
+    )
+    parser.add_argument(
+        "--migrations",
+        dest="migrations_dir",
+        default=str(DEFAULT_MIGRATIONS_DIR),
+        help="Path to db/migrations directory (defaults to repo db/migrations).",
     )
 
-
-def main(db_arg: str | None = None) -> None:
-    if db_arg:
-        db_path = Path(db_arg).resolve()
+    # Defensive: if someone calls main(db_url_string), treat it as --db <url>
+    if isinstance(argv, str):
+        argv_list: list[str] | None = ["--db", argv]
+    elif argv is None:
+        argv_list = None
     else:
-        db_path = resolve_sqlite_path()
+        argv_list = list(argv)
 
-    print(f"→ Using SQLite at: {db_path}")
+    args = parser.parse_args(argv_list)
 
-    with connect(db_path) as conn:
-        schema_text = load_schema_text()
-        apply_schema(conn, schema_text)
+    if args.db_url:
+        if not _is_postgres_url(args.db_url):
+            raise SystemExit(
+                "ERROR: --db must be a Postgres URL (postgresql://... or postgres://...)."
+            )
+        os.environ["DATABASE_URL"] = args.db_url
 
-        # Make sure our idempotency contract is satisfied even if schema predates it:
-        ensure_email_columns(conn)
-        ensure_unique_index(
-            conn
-        )  # emails(email) only; multi-brand forbids uniqueness on official-domain
-        ensure_v_emails_latest(conn)
+    get_conn = _import_get_conn()
 
-        # NEW: ensure O26 schema (verification_results + domain_resolutions)
-        if migrate_o26 is not None:
-            print("→ Ensuring O26 schema (test-send/bounce + domain delivery flags)...")
-            migrate_o26(conn)
+    schema_path = Path(args.schema_file).expanduser()
+    if not schema_path.is_absolute():
+        schema_path = (ROOT / schema_path).resolve()
+
+    migrations_dir = Path(args.migrations_dir).expanduser()
+    if not migrations_dir.is_absolute():
+        migrations_dir = (ROOT / migrations_dir).resolve()
+
+    with get_conn() as conn:
+        # Enforce Postgres-only target state.
+        if not getattr(conn, "is_postgres", False):
+            raise SystemExit(
+                "ERROR: This project is Postgres-only. DATABASE_URL/DB_URL must point to Postgres "
+                "(postgresql://...)."
+            )
+
+        print("→ Using Postgres via src.db.get_conn()")
+        _verify_postgres(conn)
+
+        if schema_path.is_relative_to(ROOT):
+            schema_disp = str(schema_path.relative_to(ROOT))
         else:
-            print("⚠ O26 migration script not found; skipping O26 schema ensure.")
+            schema_disp = str(schema_path)
 
+        print(f"→ Applying base schema: {schema_disp}")
+        schema_text = _read_text(schema_path)
+        _apply_sql_text(conn, schema_text)
         conn.commit()
 
-        verify_integrity(conn)
+        applied_now = _apply_migrations(conn, migrations_dir)
 
-        # Summaries
-        for t in ("companies", "people", "emails", "verification_results"):
-            exists = "yes" if _object_exists(conn, t) else "no"
-            print(f"· {t:24} exists: {exists}")
-        print(
-            f"· v_emails_latest         exists: {'yes' if _object_exists(conn, 'v_emails_latest') else 'no'}"
-        )
-        print(
-            f"· ux_emails_email (index) exists: {'yes' if _object_exists(conn, 'ux_emails_email') else 'no'}"
-        )
+        _verify_postgres(conn)
+        _print_summary(conn)
 
-    print("✔ Schema applied (idempotent), multi-brand guard enforced, integrity OK.")
+    print(f"✔ Schema applied; migrations applied this run: {applied_now}")
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--db",
-        dest="db_path",
-        help="Path to SQLite DB (overrides DATABASE_URL / default dev.db)",
-    )
-    args = parser.parse_args()
-    main(args.db_path)
+    raise SystemExit(main())

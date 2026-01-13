@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 """
-O12 – Seed mailbox & bounce/complaint monitoring.
-O26 – Bounce-based verification integration.
+O12 — Seed mailbox & bounce/complaint monitoring.
+O26 — Bounce-based verification integration.
 
 Minimal IMAP-based importer that:
   - Connects to a mailbox (typically a "seed" or bounce address),
@@ -14,12 +14,11 @@ Minimal IMAP-based importer that:
 
 Example usage:
 
-    $PyExe scripts/import_bounces.py `
-        --db data/dev.db `
-        --host imap.example.com `
-        --user bounce@example.com `
-        --password-env IMAP_PASSWORD `
-        --folder INBOX.Bounces `
+    python scripts/import_bounces.py \
+        --host imap.example.com \
+        --user bounce@example.com \
+        --password-env IMAP_PASSWORD \
+        --folder INBOX.Bounces \
         --seed-address bounce@example.com
 
 The pure function `parse_bounce_addresses` is unit-testable and can be
@@ -37,7 +36,7 @@ import sys
 from email import message_from_bytes
 from email.message import Message
 
-from src.db import get_connection
+from src.db import get_conn
 from src.db_suppression import upsert_suppression
 from src.verify.test_send import apply_bounce
 
@@ -236,11 +235,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Import bounced/complaint addresses into suppression from an IMAP mailbox.",
     )
     parser.add_argument(
-        "--db",
-        default="data/dev.db",
-        help="Path to SQLite DB file (default: data/dev.db).",
-    )
-    parser.add_argument(
         "--host",
         required=True,
         help="IMAP server hostname, e.g. imap.example.com.",
@@ -294,7 +288,7 @@ def main(argv: list[str] | None = None) -> None:
 
     seed_ignore: set[str] = {addr.lower() for addr in (args.seed_address or [])}
 
-    conn = get_connection(args.db)
+    conn = get_conn()
     try:
         processed = import_bounces(
             conn,

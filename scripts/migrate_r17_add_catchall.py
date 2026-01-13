@@ -2,30 +2,53 @@
 from __future__ import annotations
 
 import argparse
-import pathlib
-import sqlite3
+import os
+import sys
+from typing import Any
+
+from src.db import get_conn
 
 
-def col_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    """
-    Return True if the given column exists on the table.
-    """
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == col for row in cur.fetchall())
+def _apply_dsn_override(dsn: str | None) -> None:
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
+    os.environ["PG_DSN"] = dsn
 
 
-def ensure_catchall_columns(cur: sqlite3.Cursor) -> None:
+def _qi(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def col_exists(cur: Any, *, schema: str, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = %s
+           AND table_name = %s
+           AND column_name = %s
+         LIMIT 1
+        """,
+        (schema, table, col),
+    )
+    return cur.fetchone() is not None
+
+
+def ensure_catchall_columns(cur: Any, *, schema: str) -> None:
     """
     Ensure R17 catch-all columns exist on domain_resolutions.
     Idempotent: only ALTER TABLE when a column is missing.
     """
+    table = "domain_resolutions"
+    fq = f"{_qi(schema)}.{_qi(table)}"
 
     def add_col(name: str, ddl: str) -> None:
-        if not col_exists(cur, "domain_resolutions", name):
-            print(f"· Adding domain_resolutions.{name} ...")
-            cur.execute(f"ALTER TABLE domain_resolutions ADD COLUMN {ddl}")
+        if not col_exists(cur, schema=schema, table=table, col=name):
+            print(f"· Adding {table}.{name} ...")
+            cur.execute(f"ALTER TABLE {fq} ADD COLUMN {ddl}")
         else:
-            print(f"· Skipping domain_resolutions.{name} (already exists)")
+            print(f"· Skipping {table}.{name} (already exists)")
 
     print("Ensuring R17 catch-all columns on domain_resolutions...")
 
@@ -38,28 +61,52 @@ def ensure_catchall_columns(cur: sqlite3.Cursor) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="R17 migration: add catch-all columns to domain_resolutions."
+        description="R17 migration: add catch-all columns to domain_resolutions (PostgreSQL)."
     )
     parser.add_argument(
+        "--dsn",
         "--db",
-        required=True,
-        help="Path to SQLite database file (e.g. data/dev.db)",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL for this run).",
+    )
+    parser.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target Postgres schema (default: public, or PGSCHEMA env var).",
     )
     args = parser.parse_args()
+    _apply_dsn_override(args.dsn)
 
-    db_path = pathlib.Path(args.db)
-    print(f"→ Using SQLite at: {db_path.resolve()}")
-
-    conn = sqlite3.connect(str(db_path))
+    conn = get_conn()
     try:
         cur = conn.cursor()
-        ensure_catchall_columns(cur)
+        try:
+            ensure_catchall_columns(cur, schema=args.schema)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
         conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     print("✔ R17 migration completed (catch-all columns ensured on domain_resolutions).")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise

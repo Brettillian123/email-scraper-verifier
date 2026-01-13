@@ -18,6 +18,11 @@ New in R16:
 - Add a best-effort helper to enqueue SMTP RCPT probes (`task_probe_email`) with
   {email_id, email, domain}. This *does not* skip freemail domains — acceptance
   uses gmail.com and similar for manual smoke tests.
+
+DATABASE SUPPORT:
+- Supports both SQLite and PostgreSQL via DATABASE_URL environment variable
+- SQLite: DATABASE_URL=sqlite:///path/to/db.sqlite
+- PostgreSQL: DATABASE_URL=postgresql://user:pass@host:port/dbname
 """
 
 from __future__ import annotations
@@ -25,8 +30,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -81,33 +86,128 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
+# Database connection helpers (SQLite + PostgreSQL support)
+# ---------------------------------------------------------------------------
 
 
-def _sqlite_path_from_env() -> str:
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url.startswith("sqlite:///"):
-        raise RuntimeError(f"DATABASE_URL must be sqlite:///...; got {url!r}")
-    # works for Windows paths like C:/... and POSIX /...
-    return url[len("sqlite:///") :]
+def _get_database_url() -> str:
+    """Get DATABASE_URL from environment with sensible default."""
+    return os.getenv("DATABASE_URL", "").strip()
 
 
-def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
-    cur = con.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}  # column name is at index 1
+def _is_postgresql() -> bool:
+    """Check if DATABASE_URL points to PostgreSQL."""
+    url = _get_database_url()
+    return url.startswith("postgresql://") or url.startswith("postgres://")
 
 
-def _extract_company_norm_fields(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
+def _is_sqlite() -> bool:
+    """Check if DATABASE_URL points to SQLite."""
+    url = _get_database_url()
+    return url.startswith("sqlite:///") or not url
+
+
+def _param_placeholder(is_pg: bool) -> str:
+    return "%s" if is_pg else "?"
+
+
+def _placeholders(is_pg: bool, n: int) -> str:
+    return ",".join([_param_placeholder(is_pg)] * n)
+
+
+@contextmanager
+def _get_connection():
+    """
+    Get a database connection (SQLite or PostgreSQL).
+
+    Yields a connection object that supports:
+    - execute(sql, params)
+    - commit()
+    - row_factory for dict-like row access (SQLite)
+    """
+    url = _get_database_url()
+
+    if _is_postgresql():
+        # Use src.db.get_conn() for PostgreSQL (handles connection pooling)
+        try:
+            from src.db import get_conn
+
+            conn = get_conn()
+            yield conn
+            # Note: get_conn() connections handle their own lifecycle
+            return
+        except ImportError as err:
+            raise RuntimeError(
+                "PostgreSQL support requires src.db module. "
+                "Ensure DATABASE_URL is correct and dependencies are installed."
+            ) from err
+
+    # SQLite fallback
+    import sqlite3
+
+    if url.startswith("sqlite:///"):
+        db_path = url[len("sqlite:///") :]
+    elif not url:
+        # Default to dev.db in project root
+        from pathlib import Path
+
+        db_path = str(Path(__file__).resolve().parents[2] / "dev.db")
+    else:
+        raise RuntimeError(f"Unsupported DATABASE_URL format: {url!r}")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield conn
+    finally:
+        conn.close()
+
+
+def _table_columns(con: Any, table: str) -> set[str]:
+    """
+    Get column names for a table (works with SQLite and PostgreSQL).
+    """
+    if _is_postgresql():
+        # PostgreSQL: use information_schema
+        try:
+            cur = con.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                """,
+                (table,),
+            )
+            return {row[0] for row in cur.fetchall()}
+        except Exception:
+            # Try PRAGMA emulation (CompatConnection may support it)
+            pass
+
+    # SQLite or fallback: use PRAGMA
+    try:
+        cur = con.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cur.fetchall()}  # column name is at index 1
+    except Exception:
+        return set()
+
+
+def _extract_company_norm_fields(
+    normalized: dict[str, Any],
+) -> tuple[str | None, str | None]:
     """
     Support both legacy and R13 field names from normalize_row():
       - display name: company_name_norm (legacy) or company_norm (R13)
       - key: company_norm_key (legacy) or company_key (R13)
     """
     name_norm = (
-        normalized.get("company_name_norm") or normalized.get("company_norm") or ""
-    ).strip() or None
+        (normalized.get("company_name_norm") or normalized.get("company_norm") or "").strip()
+        or None
+    )
     norm_key = (
-        normalized.get("company_norm_key") or normalized.get("company_key") or ""
-    ).strip() or None
+        (normalized.get("company_norm_key") or normalized.get("company_key") or "").strip()
+        or None
+    )
     return name_norm, norm_key
 
 
@@ -116,8 +216,107 @@ def _extract_company_norm_fields(normalized: dict[str, Any]) -> tuple[str | None
 # ---------------------------------------------------------------------------
 
 
+def _company_find_id_by_domain(con: Any, domain: str, *, is_pg: bool) -> int | None:
+    sql = f"SELECT id FROM companies WHERE domain = {_param_placeholder(is_pg)}"
+    cur = con.execute(sql, (domain,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _company_find_id_by_name(con: Any, name: str, *, is_pg: bool) -> int | None:
+    sql = f"SELECT id FROM companies WHERE name = {_param_placeholder(is_pg)}"
+    cur = con.execute(sql, (name,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _company_fill_if_empty(
+    con: Any,
+    *,
+    company_id: int,
+    cols: set[str],
+    is_pg: bool,
+    name: str | None,
+    name_norm: str | None,
+    norm_key: str | None,
+) -> None:
+    """
+    Only fill empty (NULL/'') fields using COALESCE(NULLIF(col,''), ?).
+    """
+    updates: list[tuple[str, Any]] = []
+    if name and "name" in cols:
+        updates.append(("name", name))
+    if name_norm and "name_norm" in cols:
+        updates.append(("name_norm", name_norm))
+    if norm_key and "norm_key" in cols:
+        updates.append(("norm_key", norm_key))
+
+    if not updates:
+        return
+
+    ph = _param_placeholder(is_pg)
+    for field, value in updates:
+        sql = (
+            f"UPDATE companies SET {field} = COALESCE(NULLIF({field},''), {ph}) "
+            f"WHERE id = {ph}"
+        )
+        con.execute(sql, (value, company_id))
+
+
+def _company_insert(
+    con: Any,
+    *,
+    cols: set[str],
+    is_pg: bool,
+    name: str | None,
+    domain: str | None,
+    name_norm: str | None,
+    norm_key: str | None,
+) -> int:
+    insert_cols: list[str] = []
+    vals: list[Any] = []
+
+    if "name" in cols:
+        insert_cols.append("name")
+        vals.append(name)
+    if "domain" in cols:
+        insert_cols.append("domain")
+        vals.append(domain)
+    if "name_norm" in cols:
+        insert_cols.append("name_norm")
+        vals.append(name_norm)
+    if "norm_key" in cols:
+        insert_cols.append("norm_key")
+        vals.append(norm_key)
+
+    if not insert_cols:
+        if is_pg:
+            cur = con.execute("INSERT INTO companies DEFAULT VALUES RETURNING id")
+            row = cur.fetchone()
+            con.commit()
+            return int(row[0]) if row else 0
+        cur = con.execute("INSERT INTO companies DEFAULT VALUES")
+        con.commit()
+        return int(cur.lastrowid)
+
+    cols_sql = ",".join(insert_cols)
+    phs = _placeholders(is_pg, len(insert_cols))
+
+    if is_pg:
+        sql = f"INSERT INTO companies ({cols_sql}) VALUES ({phs}) RETURNING id"
+        cur = con.execute(sql, vals)
+        row = cur.fetchone()
+        con.commit()
+        return int(row[0]) if row else 0
+
+    sql = f"INSERT INTO companies ({cols_sql}) VALUES ({phs})"
+    cur = con.execute(sql, vals)
+    con.commit()
+    return int(cur.lastrowid)
+
+
 def _upsert_company(
-    con: sqlite3.Connection,
+    con: Any,
     name: str | None,
     domain: str | None,
     name_norm: str | None,
@@ -127,92 +326,70 @@ def _upsert_company(
     Upsert a company record keyed by domain, then by *exact* name.
     - On INSERT, set name/domain plus R13 fields (name_norm, norm_key) when available.
     - On UPDATE, only fill empty (NULL/'') fields using COALESCE(NULLIF(col,''), ?).
+
+    Works with both SQLite and PostgreSQL.
     """
-    cur = con.cursor()
     cols = _table_columns(con, "companies")
+    is_pg = _is_postgresql()
 
-    def _insert(n: str | None, d: str | None, nn: str | None, nk: str | None) -> int:
-        insert_cols: list[str] = []
-        vals: list[Any] = []
-        if "name" in cols:
-            insert_cols.append("name")
-            vals.append(n)
-        if "domain" in cols:
-            insert_cols.append("domain")
-            vals.append(d)
-        if "name_norm" in cols:
-            insert_cols.append("name_norm")
-            vals.append(nn)
-        if "norm_key" in cols:
-            insert_cols.append("norm_key")
-            vals.append(nk)
-        placeholders = ",".join("?" for _ in insert_cols) or "DEFAULT VALUES"
-        if insert_cols:
-            cur.execute(
-                f"INSERT INTO companies ({','.join(insert_cols)}) VALUES ({placeholders})",
-                vals,
-            )
-        else:
-            cur.execute("INSERT INTO companies DEFAULT VALUES")
-        return int(cur.lastrowid)
-
-    # Prefer domain key
     if domain:
-        row = cur.execute(
-            "SELECT id FROM companies WHERE domain = ?",
-            (domain,),
-        ).fetchone()
-        if row:
-            company_id = int(row[0])
-            # Fill missing display name if we learned one
-            if name and "name" in cols:
-                cur.execute(
-                    "UPDATE companies SET name = COALESCE(NULLIF(name,''), ?) WHERE id = ?",
-                    (name, company_id),
-                )
-            # Fill R13 normalized fields if columns exist
-            if "name_norm" in cols and name_norm:
-                cur.execute(
-                    "UPDATE companies "
-                    "SET name_norm = COALESCE(NULLIF(name_norm,''), ?) "
-                    "WHERE id = ?",
-                    (name_norm, company_id),
-                )
-            if "norm_key" in cols and norm_key:
-                cur.execute(
-                    "UPDATE companies SET norm_key = COALESCE(NULLIF(norm_key,''), ?) WHERE id = ?",
-                    (norm_key, company_id),
-                )
+        company_id = _company_find_id_by_domain(con, domain, is_pg=is_pg)
+        if company_id is not None:
+            _company_fill_if_empty(
+                con,
+                company_id=company_id,
+                cols=cols,
+                is_pg=is_pg,
+                name=name,
+                name_norm=name_norm,
+                norm_key=norm_key,
+            )
+            con.commit()
             return company_id
-        # No domain match → insert
-        return _insert(name, domain, name_norm, norm_key)
+        return _company_insert(
+            con,
+            cols=cols,
+            is_pg=is_pg,
+            name=name,
+            domain=domain,
+            name_norm=name_norm,
+            norm_key=norm_key,
+        )
 
-    # No domain; fall back to exact name
     if name:
-        row = cur.execute(
-            "SELECT id FROM companies WHERE name = ?",
-            (name,),
-        ).fetchone()
-        if row:
-            company_id = int(row[0])
-            # Fill normalized fields if available
-            if "name_norm" in cols and name_norm:
-                cur.execute(
-                    "UPDATE companies "
-                    "SET name_norm = COALESCE(NULLIF(name_norm,''), ?) "
-                    "WHERE id = ?",
-                    (name_norm, company_id),
-                )
-            if "norm_key" in cols and norm_key:
-                cur.execute(
-                    "UPDATE companies SET norm_key = COALESCE(NULLIF(norm_key,''), ?) WHERE id = ?",
-                    (norm_key, company_id),
-                )
+        company_id = _company_find_id_by_name(con, name, is_pg=is_pg)
+        if company_id is not None:
+            _company_fill_if_empty(
+                con,
+                company_id=company_id,
+                cols=cols,
+                is_pg=is_pg,
+                name=None,
+                name_norm=name_norm,
+                norm_key=norm_key,
+            )
+            con.commit()
             return company_id
-        return _insert(name, None, name_norm, norm_key)
+        return _company_insert(
+            con,
+            cols=cols,
+            is_pg=is_pg,
+            name=name,
+            domain=None,
+            name_norm=name_norm,
+            norm_key=norm_key,
+        )
 
-    # Shouldn’t happen (ingest guarantees name or domain), but be safe:
-    return _insert(None, None, name_norm, norm_key)
+    # Shouldn't happen (ingest guarantees name or domain), but be safe:
+    return _company_insert(
+        con,
+        cols=cols,
+        is_pg=is_pg,
+        name=None,
+        domain=None,
+        name_norm=name_norm,
+        norm_key=norm_key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +398,7 @@ def _upsert_company(
 
 
 def _enqueue_domain_resolution(
-    con: sqlite3.Connection,
+    con: Any,
     company_id: int,
     company_name: str,
     normalized_hint: str | None,
@@ -325,7 +502,9 @@ def _enqueue_mx_resolution(
                 },
             )
             logger.info(
-                "R15 MX enqueue via ingest shim: company_id=%s domain=%s", company_id, canon
+                "R15 MX enqueue via ingest shim: company_id=%s domain=%s",
+                company_id,
+                canon,
             )
             # NOTE: Do NOT return here; fall through to RQ to ensure real enqueue in runtime.
         except Exception as e:
@@ -350,12 +529,7 @@ def _enqueue_mx_resolution(
                 job_timeout=10,
                 retry=None,
             )
-            logger.info(
-                "R15 MX enqueue via ingest shim: company_id=%s domain=%s",
-                company_id,
-                canon,
-            )
-
+            logger.info("R15 MX enqueue via RQ: company_id=%s domain=%s", company_id, canon)
         except (ConnectionError, TimeoutError, OSError) as e:
             logger.warning("Queue degraded (MX resolution not enqueued): %s", e)
         except Exception as e:
@@ -461,62 +635,37 @@ def _enqueue_probe_email(
 # ---------------------------------------------------------------------------
 
 
-def _insert_person(con: sqlite3.Connection, company_id: int, normalized: dict[str, Any]) -> None:
+def _insert_person(con: Any, company_id: int, normalized: dict[str, Any]) -> None:
     """
     Insert a person row. Honors new R13/R14 fields if present in schema.
     Never drops provenance: source_url is passed through as provided.
+
+    Works with both SQLite and PostgreSQL.
     """
     people_cols = _table_columns(con, "people")
-    payload: dict[str, Any] = {}
+    is_pg = _is_postgresql()
 
-    # Foreign key
-    if "company_id" in people_cols:
-        payload["company_id"] = company_id
+    desired: dict[str, Any] = {
+        "company_id": company_id,
+        "first_name": normalized.get("first_name") or "",
+        "last_name": normalized.get("last_name") or "",
+        "full_name": normalized.get("full_name") or "",
+        "title": normalized.get("title") or "",
+        "title_raw": (normalized.get("title_raw") or normalized.get("title") or ""),
+        "title_norm": normalized.get("title_norm") or "",
+        "role": normalized.get("role") or "",
+        "role_family": normalized.get("role_family") or "",
+        "seniority": normalized.get("seniority") or "",
+        "source_url": normalized.get("source_url") or "",
+        "notes": normalized.get("notes") or "",
+        "errors": normalized.get("errors") or "",
+    }
 
-    # Core person fields (display names were normalized in normalize_row)
-    if "first_name" in people_cols:
-        payload["first_name"] = normalized.get("first_name") or ""
-    if "last_name" in people_cols:
-        payload["last_name"] = normalized.get("last_name") or ""
-    if "full_name" in people_cols:
-        payload["full_name"] = normalized.get("full_name") or ""
-
-    # Title fields (original + normalized)
-    if "title" in people_cols:
-        payload["title"] = normalized.get("title") or ""
-    if "title_raw" in people_cols:
-        payload["title_raw"] = normalized.get("title_raw") or normalized.get("title") or ""
-    if "title_norm" in people_cols:
-        payload["title_norm"] = normalized.get("title_norm") or ""
-
-    # Role (legacy), plus O02-derived role_family/seniority if present
-    if "role" in people_cols:
-        payload["role"] = normalized.get("role") or ""
-    if "role_family" in people_cols:
-        payload["role_family"] = normalized.get("role_family") or ""
-    if "seniority" in people_cols:
-        payload["seniority"] = normalized.get("seniority") or ""
-
-    # Provenance
-    if "source_url" in people_cols:
-        payload["source_url"] = normalized.get("source_url") or ""
-
-    # Notes
-    if "notes" in people_cols:
-        payload["notes"] = normalized.get("notes") or ""
-
-    # Optional errors snapshot (if schema has it)
-    if "errors" in people_cols:
-        payload["errors"] = normalized.get("errors") or ""
+    payload = {k: v for k, v in desired.items() if k in people_cols}
 
     # R14: inline ICP scoring for new rows (null-safe, config-aware)
-    # Only attempt if config is present and columns exist.
-    if (
-        ICPCFG
-        and "icp_score" in people_cols
-        and "icp_reasons" in people_cols
-        and "last_scored_at" in people_cols
-    ):
+    needed = {"icp_score", "icp_reasons", "last_scored_at"}
+    if ICPCFG and needed.issubset(people_cols):
         person_for_icp = {
             "domain": normalized.get("domain"),
             "role_family": normalized.get("role_family"),
@@ -526,16 +675,21 @@ def _insert_person(con: sqlite3.Connection, company_id: int, normalized: dict[st
             res = compute_icp(person_for_icp, None, ICPCFG)
             payload["icp_score"] = int(res.score)
             payload["icp_reasons"] = json.dumps(res.reasons, ensure_ascii=False)
-            payload["last_scored_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            payload["last_scored_at"] = (
+                datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            )
         except Exception as e:  # best-effort; do not break ingest on scoring errors
             logger.warning("ICP scoring failed during insert; continuing without score: %s", e)
 
     cols = list(payload.keys())
-    placeholders = ",".join("?" for _ in cols)
-    con.execute(
-        f"INSERT INTO people ({','.join(cols)}) VALUES ({placeholders})",
-        [payload[c] for c in cols],
-    )
+    if not cols:
+        con.execute("INSERT INTO people DEFAULT VALUES")
+        return
+
+    cols_sql = ",".join(cols)
+    phs = _placeholders(is_pg, len(cols))
+    sql = f"INSERT INTO people ({cols_sql}) VALUES ({phs})"
+    con.execute(sql, [payload[c] for c in cols])
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +726,10 @@ def persist_best_effort(normalized: dict[str, Any]) -> None:
     """
     Back-compat entrypoint that assumes the input dict is already normalized.
     (Used by earlier scripts/tests.) For new code, prefer upsert_row()/persist_rows()."
-    """
-    db_path = _sqlite_path_from_env()
-    con = sqlite3.connect(db_path)
-    try:
-        con.execute("PRAGMA foreign_keys = ON")
-        con.row_factory = sqlite3.Row
 
+    Works with both SQLite and PostgreSQL.
+    """
+    with _get_connection() as con:
         company = (normalized.get("company") or "").strip() or None
         domain = (normalized.get("domain") or "").strip() or None
 
@@ -604,8 +755,6 @@ def persist_best_effort(normalized: dict[str, Any]) -> None:
         # (e.g., R12 generation or extractors) using `_enqueue_probe_email(...)`.
 
         con.commit()
-    finally:
-        con.close()
 
 
 def upsert_row(raw: dict[str, Any]) -> None:
@@ -623,14 +772,11 @@ def persist_rows(rows: Iterable[dict[str, Any]]) -> int:
     """
     Normalize and persist an iterable of raw rows.
     Returns the number of rows persisted.
-    """
-    db_path = _sqlite_path_from_env()
-    con = sqlite3.connect(db_path)
-    n = 0
-    try:
-        con.execute("PRAGMA foreign_keys = ON")
-        con.row_factory = sqlite3.Row
 
+    Works with both SQLite and PostgreSQL.
+    """
+    n = 0
+    with _get_connection() as con:
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
@@ -657,10 +803,8 @@ def persist_rows(rows: Iterable[dict[str, Any]]) -> int:
             if domain:
                 _enqueue_mx_resolution(company_id, domain, force=False)
 
-            # NOTE (R16): As above, this file doesn’t create emails; call
+            # NOTE (R16): As above, this file doesn't create emails; call
             # _enqueue_probe_email(...) at the point where an email row is created.
 
         con.commit()
         return n
-    finally:
-        con.close()

@@ -31,6 +31,29 @@ from src.generate.patterns import (
     generate_candidate_emails_for_person,  # (first, last, domain, company_pattern) -> list[str]
 )
 
+# Optional ranking + cap (may not exist in older branches/tests).
+try:
+    from src.generate.patterns import (  # type: ignore
+        DEFAULT_MAX_PERMUTATIONS_PER_PERSON,
+        PATTERN_RANKS,
+    )
+except Exception:  # pragma: no cover
+    DEFAULT_MAX_PERMUTATIONS_PER_PERSON = 6  # sensible default
+    PATTERN_RANKS: dict[str, int] = {
+        "first.last": 1,
+        "first_last": 2,
+        "firstlast": 3,
+        "first": 4,
+        "flast": 5,
+        "firstl": 6,
+        "f.last": 7,
+        "first.l": 8,
+        "first-last": 10,
+        "first_l": 11,
+        "f_last": 12,
+        # anything unknown ranks worse
+    }
+
 # ---------------------------------------------------------------------------
 # Legacy R12 pattern templates (kept for backward compatibility with tests)
 # Placeholders: {first}, {last}, {f}, {l}
@@ -49,6 +72,34 @@ PATTERNS: tuple[str, ...] = (
     "{last}{f}",
     "{l}{first}",
 )
+
+# Map legacy templates to canonical keys (where possible) so we can apply ranks.
+_TEMPLATE_TO_CANON_KEY: dict[str, str] = {
+    "{first}.{last}": "first.last",
+    "{first}{last}": "firstlast",
+    "{f}{last}": "flast",
+    "{first}{l}": "firstl",
+    "{f}.{last}": "f.last",
+    "{first}.{l}": "first.l",
+    "{first}_{last}": "first_last",
+    "{first}-{last}": "first-last",
+    "{last}{first}": "lastfirst",
+    "{last}.{first}": "last.first",
+    "{last}{f}": "lastf",
+    "{l}{first}": "lfirst",
+}
+
+
+def _pattern_rank_for_template(template: str) -> int:
+    """
+    Rank a legacy template using PATTERN_RANKS when mappable; otherwise push late.
+    Lower rank = more preferred.
+    """
+    key = _TEMPLATE_TO_CANON_KEY.get(template, "")
+    if key and key in PATTERN_RANKS:
+        return int(PATTERN_RANKS[key])
+    # Unknown / uncommon shapes should be least preferred.
+    return 10_000
 
 
 def _is_role_or_placeholder(addr: str, *, local_hint: str | None = None) -> bool:
@@ -110,6 +161,108 @@ def normalize_name_parts(first: str, last: str) -> tuple[str, str, str, str]:
     return first, last, f_initial, last_initial
 
 
+def _compute_cap(max_permutations_per_person: int | None) -> int:
+    cap = (
+        DEFAULT_MAX_PERMUTATIONS_PER_PERSON
+        if max_permutations_per_person is None
+        else int(max_permutations_per_person)
+    )
+    return cap if cap > 0 else 0
+
+
+def _legacy_ctx(first: str, last: str) -> dict[str, str]:
+    first_n, last_n, f_initial, l_initial = normalize_name_parts(first, last)
+    return {"first": first_n, "last": last_n, "f": f_initial, "l": l_initial}
+
+
+def _render_legacy_local(template: str, ctx: dict[str, str]) -> str:
+    try:
+        return template.format(**ctx)
+    except Exception:
+        return ""
+
+
+class _EmailAccumulator:
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._set: set[str] = set()
+        self._list: list[str] = []
+
+    def full(self) -> bool:
+        return len(self._list) >= self._cap
+
+    def add(self, email: str) -> None:
+        if not email or "@" not in email:
+            return
+        if email in self._set:
+            return
+
+        local = email.split("@", 1)[0]
+        if not local:
+            return
+        if _is_role_or_placeholder(email, local_hint=local):
+            return
+        if self.full():
+            return
+
+        self._set.add(email)
+        self._list.append(email)
+
+    def as_set(self) -> set[str]:
+        return set(self._list)
+
+
+def _add_only_pattern(
+    *,
+    acc: _EmailAccumulator,
+    first: str,
+    last: str,
+    dom: str,
+    only_pattern: str,
+    ctx: dict[str, str],
+) -> None:
+    if only_pattern in CANON_PATTERNS:
+        local = apply_pattern(first, last, only_pattern)
+    else:
+        local = _render_legacy_local(only_pattern, ctx)
+
+    if local:
+        acc.add(f"{local}@{dom}")
+
+
+def _add_canonical_candidates(
+    *,
+    acc: _EmailAccumulator,
+    first: str,
+    last: str,
+    dom: str,
+    company_pattern: str | None,
+) -> None:
+    for email in generate_candidate_emails_for_person(
+        first_name=first,
+        last_name=last,
+        domain=dom,
+        company_pattern=company_pattern,
+    ):
+        acc.add(email)
+        if acc.full():
+            return
+
+
+def _add_legacy_fallback(
+    *,
+    acc: _EmailAccumulator,
+    dom: str,
+    ctx: dict[str, str],
+) -> None:
+    for template in sorted(PATTERNS, key=_pattern_rank_for_template):
+        if acc.full():
+            return
+        local = _render_legacy_local(template, ctx)
+        if local:
+            acc.add(f"{local}@{dom}")
+
+
 # -----------------------
 # Candidate generation
 # -----------------------
@@ -126,6 +279,8 @@ def generate_permutations(
     # Optional company-level pattern (canonical key) to *prefer* when generating
     # the full candidate set. Ignored when only_pattern is supplied.
     company_pattern: str | None = None,
+    # Hard cap to prevent permutation explosion. If None, uses the project default.
+    max_permutations_per_person: int | None = None,
 ) -> set[str]:
     """
     Make email candidates for first/last@domain.
@@ -143,63 +298,45 @@ def generate_permutations(
 
     Role/distribution aliases and other placeholder addresses are always skipped
     when known, using the central classifier plus ROLE_ALIASES.
+
+    IMPORTANT:
+      - Enforces a strict per-person cap (DEFAULT_MAX_PERMUTATIONS_PER_PERSON, or
+        max_permutations_per_person if provided) after dedupe/normalization.
     """
     if not (first or last) or not domain:
         return set()
 
     dom = domain.lower().strip()
-    out: set[str] = set()
+    cap = _compute_cap(max_permutations_per_person)
+    if cap <= 0:
+        return set()
 
-    # 1) Canonical key path (O01/O26 "only this pattern")
-    if only_pattern and only_pattern in CANON_PATTERNS:
-        local = apply_pattern(first, last, only_pattern)
-        if local and not _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
-            out.add(f"{local}@{dom}")
-        return out
+    acc = _EmailAccumulator(cap)
+    ctx = _legacy_ctx(first, last)
 
-    # Prepare legacy formatting context
-    first_n, last_n, f_initial, l_initial = normalize_name_parts(first, last)
-    ctx = {"first": first_n, "last": last_n, "f": f_initial, "l": l_initial}
+    if only_pattern:
+        _add_only_pattern(
+            acc=acc,
+            first=first,
+            last=last,
+            dom=dom,
+            only_pattern=only_pattern,
+            ctx=ctx,
+        )
+        return acc.as_set()
 
-    # 2) Legacy single-template path
-    if only_pattern and only_pattern not in CANON_PATTERNS:
-        try:
-            local = only_pattern.format(**ctx)
-        except Exception:
-            local = ""
-        if local and not _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
-            out.add(f"{local}@{dom}")
-        return out
-
-    # 3) Canonical multi-pattern generator (O26) + legacy full-set fallback
-
-    # 3a) Canonical candidates in O26 priority order. This covers:
-    #       flast, first.last, first, firstl, firstlast, f.last, last,
-    #       first_last, first-last, lastfirst
-    #     and will prefer company_pattern first if provided.
-    for email in generate_candidate_emails_for_person(
-        first_name=first,
-        last_name=last,
-        domain=dom,
+    _add_canonical_candidates(
+        acc=acc,
+        first=first,
+        last=last,
+        dom=dom,
         company_pattern=company_pattern,
-    ):
-        local = email.split("@", 1)[0]
-        if not local or _is_role_or_placeholder(email, local_hint=local):
-            continue
-        out.add(email)
+    )
+    if acc.full():
+        return acc.as_set()
 
-    # 3b) Legacy R12 templates as fallback (adds any shapes not covered above,
-    #     such as `{last}.{first}`, `{last}{f}`, `{l}{first}`).
-    for pattern in PATTERNS:
-        try:
-            local = pattern.format(**ctx)
-        except Exception:
-            continue
-        if not local or _is_role_or_placeholder(f"{local}@{dom}", local_hint=local):
-            continue
-        out.add(f"{local}@{dom}")
-
-    return out
+    _add_legacy_fallback(acc=acc, dom=dom, ctx=ctx)
+    return acc.as_set()
 
 
 # -----------------------------------------

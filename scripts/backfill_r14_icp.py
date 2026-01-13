@@ -4,20 +4,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
-import sqlite3
-from pathlib import Path
+from contextlib import closing
 from typing import Any
 
 from src.config import load_icp_config
+from src.db import get_conn
 from src.scoring.icp import compute_icp
-
-
-def _ensure_db_exists(db_path: str) -> None:
-    p = Path(db_path)
-    if not p.exists():
-        raise SystemExit(f"Database not found: {db_path}")
-
 
 # Precompiled patterns/keyword maps to keep the fallback simple and reduce complexity.
 _SENIORITY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -61,104 +55,187 @@ def _infer_role_family_and_seniority(title_norm: str | None) -> tuple[str | None
     return role_family, seniority
 
 
-def main(db: str = "data/dev.db") -> None:
+def _has_column(conn, table: str, column: str) -> bool:
+    sql = """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (table, column))
+        return cur.fetchone() is not None
+
+
+def _safe_attrs_dict(raw: Any) -> dict[str, Any]:
+    """
+    Normalize companies.attrs into a dict regardless of storage type:
+      - json/jsonb may come back as dict (driver-dependent)
+      - text/json string needs json.loads
+    """
+    if not raw:
+        return {}
+
+    if isinstance(raw, dict):
+        return raw
+
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    # Some drivers may return a specialized JSON wrapper; try best-effort.
+    try:
+        s = str(raw)
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def main() -> None:
     """
     Backfill ICP scores (R14) for existing people/companies.
 
     Reads minimal fields from people + companies and writes:
       - people.icp_score (INTEGER)
-      - people.icp_reasons (TEXT JSON list[str])
+      - people.icp_reasons (TEXT/JSON)
       - people.last_scored_at (UTC ISO8601)
     """
-    _ensure_db_exists(db)
+    parser = argparse.ArgumentParser(description="Backfill R14 ICP scores for existing data.")
+    parser.add_argument(
+        "--tenant-id",
+        dest="tenant_id",
+        default=None,
+        help="Optional tenant_id to scope the backfill to one tenant. Default: all tenants.",
+    )
+    parser.add_argument(
+        "--dsn",
+        dest="dsn",
+        default=None,
+        help="Optional Postgres DSN/URL override. If provided, sets DATABASE_URL for this run.",
+    )
+    args = parser.parse_args()
+
+    if args.dsn:
+        os.environ["DATABASE_URL"] = args.dsn
 
     cfg: dict[str, Any] = load_icp_config()
     if not cfg:
         raise SystemExit("ICP config is empty or missing; expected docs/icp-schema.yaml")
 
-    conn = sqlite3.connect(db)
-    try:
-        cur = conn.cursor()
+    with closing(get_conn()) as conn:
+        people_has_tenant = _has_column(conn, "people", "tenant_id")
+        companies_has_tenant = _has_column(conn, "companies", "tenant_id")
+        companies_has_attrs = _has_column(conn, "companies", "attrs")
 
-        # Join via company_id (domain is not stored as a column on people/companies).
-        # O03 provides companies.attrs (TEXT JSON). No dedicated columns for industry/size.
-        cur.execute(
-            """
+        join_pred = "c.id = p.company_id"
+        if people_has_tenant and companies_has_tenant:
+            join_pred += " AND c.tenant_id = p.tenant_id"
+
+        select_attrs = "c.attrs" if companies_has_attrs else "NULL"
+
+        sql = f"""
             SELECT
                 p.id,                   -- 0
                 p.role_family,          -- 1
                 p.seniority,            -- 2
                 p.title_norm,           -- 3
                 p.company_id,           -- 4
-                c.attrs                 -- 5 (TEXT JSON from O03)
+                {select_attrs}          -- 5
+                {", p.tenant_id" if people_has_tenant else ""}
             FROM people p
             LEFT JOIN companies c
-              ON c.id = p.company_id
-            """
-        )
-        rows = cur.fetchall()
+              ON {join_pred}
+        """
 
-        # Aware UTC timestamp like 2025-11-13T12:34:56Z
+        params: list[Any] = []
+        if args.tenant_id and people_has_tenant:
+            sql += " WHERE p.tenant_id = %s"
+            params.append(args.tenant_id)
+
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+
         now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-        for pid, rf, sr, title_norm, company_id, attrs_json in rows:
-            # Parse company attrs safely
-            try:
-                attrs_dict = json.loads(attrs_json or "{}")
-                if not isinstance(attrs_dict, dict):
-                    attrs_dict = {}
-            except Exception:
-                attrs_dict = {}
+        update_sql_base = """
+            UPDATE people
+               SET icp_score = %s,
+                   icp_reasons = %s,
+                   last_scored_at = %s,
+                   role_family = COALESCE(role_family, %s),
+                   seniority   = COALESCE(seniority, %s)
+             WHERE id = %s
+        """
 
-            # Fill missing O02 fields from title_norm (fallback only)
-            rf_fallback, sr_fallback = _infer_role_family_and_seniority(title_norm)
-            role_family = (rf or rf_fallback) or None
-            seniority = (sr or sr_fallback) or None
+        updated = 0
+        with conn:
+            with conn.cursor() as cur:
+                for row in rows:
+                    if people_has_tenant:
+                        pid, rf, sr, title_norm, company_id, attrs_raw, tid = row
+                    else:
+                        pid, rf, sr, title_norm, company_id, attrs_raw = row
+                        tid = None
 
-            company = {
-                "id": company_id,
-                "industry": attrs_dict.get("industry"),
-                "size": attrs_dict.get("size"),
-                "attrs": attrs_dict,
-            }
-            person = {
-                "role_family": role_family,
-                "seniority": seniority,
-                "title_norm": title_norm,
-                "domain": None,  # not stored; keep key for scorer API compatibility
-            }
+                    attrs_dict = _safe_attrs_dict(attrs_raw)
 
-            res = compute_icp(person, company, cfg)
+                    # Fill missing O02 fields from title_norm (fallback only)
+                    rf_fallback, sr_fallback = _infer_role_family_and_seniority(title_norm)
+                    role_family = (rf or rf_fallback) or None
+                    seniority = (sr or sr_fallback) or None
 
-            cur.execute(
-                """
-                UPDATE people
-                   SET icp_score = ?,
-                       icp_reasons = ?,
-                       last_scored_at = ?,
-                       role_family = COALESCE(role_family, ?),
-                       seniority   = COALESCE(seniority, ?)
-                 WHERE id = ?
-                """,
-                (
-                    int(res.score),
-                    json.dumps(res.reasons, ensure_ascii=False),
-                    now,
-                    role_family,
-                    seniority,
-                    pid,
-                ),
-            )
+                    company = {
+                        "id": company_id,
+                        "industry": attrs_dict.get("industry"),
+                        "size": attrs_dict.get("size"),
+                        "attrs": attrs_dict,
+                    }
+                    person = {
+                        "role_family": role_family,
+                        "seniority": seniority,
+                        "title_norm": title_norm,
+                        "domain": None,  # not stored; keep key for scorer API compatibility
+                    }
 
-        conn.commit()
-    finally:
-        conn.close()
+                    res = compute_icp(person, company, cfg)
+
+                    if people_has_tenant:
+                        cur.execute(
+                            update_sql_base + " AND tenant_id = %s",
+                            (
+                                int(res.score),
+                                json.dumps(res.reasons, ensure_ascii=False),
+                                now,
+                                role_family,
+                                seniority,
+                                pid,
+                                tid,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            update_sql_base,
+                            (
+                                int(res.score),
+                                json.dumps(res.reasons, ensure_ascii=False),
+                                now,
+                                role_family,
+                                seniority,
+                                pid,
+                            ),
+                        )
+
+                    updated += cur.rowcount or 0
+
+        print(f"R14: updated {updated} people row(s).")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backfill R14 ICP scores for existing data.")
-    parser.add_argument(
-        "--db", default="data/dev.db", help="Path to SQLite database (default: data/dev.db)"
-    )
-    args = parser.parse_args()
-    main(args.db)
+    main()

@@ -46,6 +46,18 @@ from src.config import (
 from src.resolve.mx import get_or_resolve_mx
 from src.verify import smtp as smtp_mod
 
+try:  # pragma: no cover
+    from src.verify.preflight import (
+        SmtpProbingDisabledError,
+        assert_smtp_probing_allowed,
+    )
+except Exception:  # pragma: no cover
+    SmtpProbingDisabledError = RuntimeError  # type: ignore
+
+    def assert_smtp_probing_allowed() -> None:  # type: ignore
+        raise RuntimeError("SMTP preflight module unavailable; refusing to run SMTP probing.")
+
+
 CatchallStatus = Literal[
     "catch_all",
     "not_catch_all",
@@ -256,9 +268,15 @@ def _smtp_probe_random_address(
     """
     Low-level SMTP probe used by R17.
 
+    HARD GUARDRAIL:
+      This is a TCP/25 operation. It must be blocked on non-approved hosts.
+
     Tests replace this with a fake via monkeypatch.setattr(catchall_mod,
     "_smtp_probe_random_address", fake_probe).
     """
+    # Enforce "where can SMTP probing run?" before any preflight/probe.
+    assert_smtp_probing_allowed()
+
     email = f"{localpart}@{domain}"
     started = time.perf_counter()
     try:
@@ -292,6 +310,10 @@ def _smtp_probe_random_address(
             elapsed_ms,
             str(error) if error is not None else None,
         )
+    except SmtpProbingDisabledError:
+        # Preserve the explicit guardrail error for clear operator visibility.
+        elapsed_ms = float(int((time.perf_counter() - started) * 1000))
+        raise
     except Exception as exc:
         elapsed_ms = float(int((time.perf_counter() - started) * 1000))
         return None, None, elapsed_ms, f"{type(exc).__name__}:{exc}"

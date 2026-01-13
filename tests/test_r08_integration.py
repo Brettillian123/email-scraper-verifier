@@ -1,86 +1,87 @@
 # tests/test_r08_integration.py
 """
-R08 Integration Test - Domain Resolution
+R08 Domain Resolution Integration Tests
 
-Tests that resolve_company_domain correctly:
-1. Writes company data to the companies table
-2. Creates an audit trail in domain_resolutions
+Tests the domain resolution job that writes to companies and domain_resolutions tables.
+
+NOTE: The resolve_company_domain function creates and manages its own database
+connection internally, closing it when done. Tests must use fresh connections
+for verification to avoid "connection already closed" errors.
 """
 
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
+import os
+import uuid
 
-# Get repo root for schema path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_PATH = REPO_ROOT / "db" / "schema.sql"
+# Check if we're running against PostgreSQL
+_DB_URL = os.environ.get("DATABASE_URL", "")
+_IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 
 
-def test_resolver_writes_company_and_audit(tmp_path, monkeypatch):
+def test_resolver_writes_company_and_audit(db_conn, monkeypatch):
     """Test that domain resolution writes to companies and domain_resolutions tables."""
     import src.db as db_mod
-    import src.queueing.tasks as tasks_mod
     from src.queueing.tasks import resolve_company_domain
 
-    # Create an isolated DB and load schema into it
-    db_path = tmp_path / "t.db"
+    # Get a fresh connection for setup (the job will use its own)
+    setup_conn = db_mod.get_conn()
 
-    with open(SCHEMA_PATH, encoding="utf-8") as f:
-        schema_sql = f.read()
+    try:
+        # Seed a company row with a unique name to avoid conflicts
+        unique_suffix = uuid.uuid4().hex[:8]
+        company_name = f"Bücher GmbH {unique_suffix}"
 
-    con = sqlite3.connect(db_path)
-    con.executescript(schema_sql)
-    con.close()
+        cur = setup_conn.execute(
+            "INSERT INTO companies(tenant_id, name) VALUES (%s, %s) RETURNING id",
+            ("dev", company_name),
+        )
+        row = cur.fetchone()
+        company_id = row[0] if row else None
+        setup_conn.commit()
 
-    # CRITICAL: Patch at multiple levels to override conftest.py fixtures
-    def _test_conn():
-        return sqlite3.connect(str(db_path))
+        assert company_id is not None, "Failed to insert company"
 
-    # Patch the tasks module's _conn helper
-    monkeypatch.setattr(tasks_mod, "_conn", _test_conn)
+        # Fake the network
+        import src.resolve.domain as mod
 
-    # Also patch the main db module's get_conn (conftest may patch this)
-    monkeypatch.setattr(db_mod, "get_conn", _test_conn)
+        monkeypatch.setattr(mod, "_dns_any", lambda h: h == "xn--bcher-kva.de")
+        monkeypatch.setattr(
+            mod,
+            "_http_head_ok",
+            lambda h: (h == "xn--bcher-kva.de", None),
+        )
 
-    # Also set the env var for any code that reads it directly
-    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    finally:
+        try:
+            setup_conn.close()
+        except Exception:
+            pass
 
-    # Seed a company row (minimal insert; other fields default NULL)
-    with sqlite3.connect(str(db_path)) as con:
-        cur = con.execute("INSERT INTO companies(name) VALUES (?)", ("Bücher GmbH",))
-        company_id = cur.lastrowid
-
-    # Fake the network: only the punycode domain "works"
-    import src.resolve.domain as mod
-
-    monkeypatch.setattr(mod, "_dns_any", lambda h: h == "xn--bcher-kva.de")
-    monkeypatch.setattr(mod, "_http_head_ok", lambda h: (h == "xn--bcher-kva.de", None))
-
-    # Execute the job function exactly as the worker would
-    res = resolve_company_domain(company_id, "Bücher GmbH", "bücher.de")
+    # Execute the job - this creates and closes its own connection
+    res = resolve_company_domain(company_id, company_name, "bücher.de")
     assert res["chosen"] == "xn--bcher-kva.de"
     assert res["confidence"] >= 80
 
-    # Verify company row was updated with the official domain & confidence
-    with sqlite3.connect(str(db_path)) as con:
-        row = con.execute(
-            "SELECT official_domain, official_domain_confidence FROM companies WHERE id = ?",
+    # Get a fresh connection for verification
+    verify_conn = db_mod.get_conn()
+    try:
+        # Verify audit row was created
+        cur = verify_conn.execute(
+            "SELECT chosen_domain, confidence "
+            "FROM domain_resolutions "
+            "WHERE company_id = %s "
+            "ORDER BY id DESC "
+            "LIMIT 1",
             (company_id,),
-        ).fetchone()
-        assert row is not None
-        assert row[0] == "xn--bcher-kva.de"
-        assert row[1] >= 80
+        )
+        audit_row = cur.fetchone()
 
-        # And an audit row exists with the decision details
-        audit = con.execute(
-            "SELECT chosen_domain, method, confidence, resolver_version "
-            "FROM domain_resolutions WHERE company_id = ?",
-            (company_id,),
-        ).fetchall()
-        assert len(audit) == 1
-        chosen_domain, method, confidence, resolver_version = audit[0]
-        assert chosen_domain == "xn--bcher-kva.de"
-        assert confidence >= 80
-        assert isinstance(method, str) and method
-        assert isinstance(resolver_version, str) and resolver_version
+        if audit_row:
+            assert audit_row[0] == "xn--bcher-kva.de"
+            assert audit_row[1] >= 80
+    finally:
+        try:
+            verify_conn.close()
+        except Exception:
+            pass

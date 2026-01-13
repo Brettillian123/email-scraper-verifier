@@ -5,7 +5,7 @@ scripts/demo_autodiscovery.py
 
 End-to-end demo for the email-scraper project:
 
-Given a single company name + domain and a SQLite DB path, this script will:
+Given a single company name + domain and a database URL, this script will:
 
   1. Ensure the schema is applied (optional flag).
   2. Upsert the company into `companies`.
@@ -15,12 +15,17 @@ Given a single company name + domain and a SQLite DB path, this script will:
   6. Persist people + emails linked to the company.
   7. Generate permutations for people without emails (R12 + O01/O09 + O26),
      restricted to people that came through the AI refiner when AI is enabled.
-  8. Verify emails synchronously via task_probe_email (R16–R18 + O07).
+  8. Verify emails synchronously via task_probe_email (R16â€“R18 + O07).
   9. Optionally backfill ICP scores using scripts/backfill_r14_icp.py (R14).
  10. Print a small summary from v_emails_latest and, if available, search backend.
 
 The goal is *clarity* rather than maximum throughput: everything runs
 synchronously in-process, without depending on RQ workers.
+
+Task D/E enhancements:
+  - Tracks all metrics via AutodiscoveryResult
+  - Prints compact summary at the end using result.print_summary()
+  - Logs robots blocks with full explainability
 """
 
 import argparse
@@ -30,7 +35,6 @@ import logging
 import os
 import re
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
@@ -47,12 +51,15 @@ import httpx
 from bs4 import BeautifulSoup, Tag  # noqa: F401
 
 import src.extract.candidates as _extract_mod  # noqa: F401
+from src.autodiscovery_result import AutodiscoveryResult
 from src.crawl.runner import Page, crawl_domain
 from src.db import get_conn, upsert_generated_email  # noqa: F401
 from src.db_pages import save_pages as _save_pages
 from src.emails.classify import is_role_or_placeholder_email
 from src.extract.candidates import ROLE_ALIASES, Candidate, extract_candidates
+from src.extract.source_filters import is_blocked_source_url
 from src.extract.stopwords import NAME_STOPWORDS
+from src.extract.url_filters import is_people_page_url
 from src.generate.patterns import (
     PATTERNS as CANON_PATTERNS,
 )
@@ -74,6 +81,18 @@ from src.queueing.tasks import (
 )
 from src.search.indexing import LeadSearchParams, search_people_leads
 
+# Task A: Robots explainability imports
+try:
+    from src.fetch.robots import RobotsBlockInfo, explain_block
+    from src.fetch.robots import is_allowed as robots_is_allowed
+
+    _HAS_ROBOTS_EXPLAINABILITY = True
+except ImportError:
+    _HAS_ROBOTS_EXPLAINABILITY = False
+    RobotsBlockInfo = None  # type: ignore[assignment,misc]
+    explain_block = None  # type: ignore[assignment]
+    robots_is_allowed = None  # type: ignore[assignment]
+
 # Optional AI-assisted people extractor (O27).
 try:
     from src.extract.ai_candidates import extract_ai_candidates as _ai_extract_candidates
@@ -83,17 +102,67 @@ except Exception:  # pragma: no cover - optional / older repos
     _ai_extract_candidates = None  # type: ignore[assignment]
     _HAS_AI_EXTRACTOR = False
 
+# Check if AI is globally enabled
+try:
+    from src.extract.ai_candidates import AI_PEOPLE_ENABLED
+except ImportError:
+    AI_PEOPLE_ENABLED = False  # type: ignore[assignment]
+
+# People cards extractor for Paddle-style pages (no emails, LinkedIn anchors)
+try:
+    from src.extract.people_cards import extract_people_cards
+
+    _HAS_PEOPLE_CARDS = True
+except ImportError:
+    _HAS_PEOPLE_CARDS = False
+    extract_people_cards = None  # type: ignore[assignment]
+
+# Quality gates for fallback validation
+try:
+    from src.extract.quality_gates import (
+        should_persist_as_person,
+        validate_candidate_for_persistence,
+    )
+
+    _HAS_QUALITY_GATES = True
+except ImportError:
+    _HAS_QUALITY_GATES = False
+    should_persist_as_person = None  # type: ignore[assignment]
+    validate_candidate_for_persistence = None  # type: ignore[assignment]
+
 LOG = logging.getLogger("demo_autodiscovery")
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT_DIR / "db" / "schema.sql"
+
+
+def _row_val(row: Any, key: str, idx: int | None = None) -> Any:
+    """
+    Helper to access row values supporting both dict-like and tuple rows.
+
+    For PostgreSQL DictCursor rows, row[key] works.
+    For tuple rows (fallback), row[idx] is used.
+    """
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key)
+    if hasattr(row, "get"):
+        return row.get(key)
+    if hasattr(row, "__getitem__") and idx is not None:
+        try:
+            return row[idx]
+        except (IndexError, KeyError):
+            return None
+    return None
+
 
 # Optional: demo-only skip list so we can avoid probing certain emails
 DEMO_SKIP_EMAILS: set[str] = {
     s.strip().lower() for s in os.getenv("DEMO_SKIP_EMAILS", "").split(",") if s.strip()
 }
 
-# Common “people / about” pages that we care about for robots + fallback crawling.
+# Common "people / about" pages that we care about for robots + fallback crawling.
 _MANUAL_HINT_PATHS: list[str] = [
     "/",
     "/company",
@@ -110,20 +179,6 @@ _MANUAL_HINT_PATHS: list[str] = [
     "/people",
     "/staff",
 ]
-
-# URL path hints that usually correspond to people/leadership/team pages
-PEOPLE_URL_HINTS: tuple[str, ...] = (
-    "team",
-    "our-team",
-    "our_team",
-    "leadership",
-    "people",
-    "staff",
-    "associates",
-    "partners",
-    "who-we-are",
-    "who_we_are",
-)
 
 # O26: cap how many *people without emails* we auto-generate permutations for,
 # per company, to avoid blowing up the queue/domain while still getting a
@@ -244,7 +299,7 @@ GENERATION_NAME_STOPWORDS: set[str] = set(NAME_STOPWORDS) | {
     "management",
     "executive",
     "executives",
-    # Crestwell-specific marketing/tagline words we’ve seen
+    # Crestwell-specific marketing/tagline words we've seen
     "ambitious",
     "efficient",
     "dedicated",
@@ -280,7 +335,7 @@ GENERATION_NAME_STOPWORDS: set[str] = set(NAME_STOPWORDS) | {
     "payroll",
     "contractor",
     "contractors",
-    # Brandt pseudo-“people” role labels
+    # Brandt pseudo-"people" role labels
     "certified",
     "public",
     "accountant",
@@ -370,7 +425,7 @@ TEAM_CREDENTIAL_SUFFIXES: set[str] = {
     "cfp",
 }
 
-# Simple pattern: 2–4 capitalized tokens, letters/dot/hyphen/apostrophe allowed.
+# Simple pattern: 2â€“4 capitalized tokens, letters/dot/hyphen/apostrophe allowed.
 _NAME_RE = re.compile(r"^[A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){1,3}$")
 
 # Strip trailing professional credentials like ", CPA", ", MBA" etc.
@@ -491,16 +546,29 @@ def _smtp_tcp25_preflight(
     }
 
 
-def apply_schema(conn: sqlite3.Connection) -> None:
+def apply_schema(conn: Any) -> None:
     """
     Apply db/schema.sql to the given connection.
 
     Safe to run multiple times thanks to IF NOT EXISTS / DROP VIEW IF EXISTS
     patterns used throughout schema.sql.
+
+    Note: For PostgreSQL, foreign_keys are always ON by default.
+    The CompatConnection handles SQL translation automatically.
     """
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    conn.executescript("PRAGMA foreign_keys = ON;")
-    conn.executescript(sql)
+
+    # Split SQL into individual statements and execute each
+    # This replaces executescript() which isn't available in psycopg2
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    for stmt in statements:
+        if stmt:
+            try:
+                conn.execute(stmt)
+            except Exception as e:
+                # Log but continue - some statements may fail on re-run
+                LOG.debug("Schema statement skipped: %s", e)
+    conn.commit()
 
 
 def _default_for_column(col_type: str, name: str) -> Any:
@@ -526,7 +594,7 @@ def _default_for_column(col_type: str, name: str) -> Any:
 
 
 def insert_row(
-    conn: sqlite3.Connection,
+    conn: Any,
     table: str,
     values: dict[str, Any],
     *,
@@ -539,6 +607,8 @@ def insert_row(
       * Populates any NOT NULL columns without defaults with conservative
         synthetic values.
       * Ignores keys that do not correspond to actual columns.
+
+    Note: PRAGMA table_info is emulated for PostgreSQL by CompatCursor.
     """
     cur = conn.execute(f"PRAGMA table_info({table})")
     cols = cur.fetchall()
@@ -550,10 +620,18 @@ def insert_row(
     params: list[Any] = []
 
     for col in cols:
-        name = col["name"]
-        col_type = col["type"]
-        notnull = bool(col["notnull"])
-        has_default = col["dflt_value"] is not None
+        # Handle both tuple and dict-like row access
+        if isinstance(col, tuple):
+            name = col[1]
+            col_type = col[2]
+            notnull = bool(col[3])
+            has_default = col[4] is not None
+        else:
+            name = col.get("name", col[1]) if hasattr(col, "get") else col[1]
+            col_type = col.get("type", col[2]) if hasattr(col, "get") else col[2]
+            notnull = bool(col.get("notnull", col[3]) if hasattr(col, "get") else col[3])
+            dflt = col.get("dflt_value", col[4]) if hasattr(col, "get") else col[4]
+            has_default = dflt is not None
 
         if name in values:
             insert_cols.append(name)
@@ -581,7 +659,7 @@ def insert_row(
 
 
 def ensure_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     name: str,
     domain: str,
@@ -607,7 +685,7 @@ def ensure_company(
         (dom, dom, dom),
     ).fetchone()
     if row:
-        company_id = int(row["id"])
+        company_id = int(row[0] if isinstance(row, tuple) else row.get("id", row[0]))
         LOG.info("Using existing company id=%s for domain=%s", company_id, dom)
         return company_id
 
@@ -629,9 +707,7 @@ def ensure_company(
     return company_id
 
 
-def get_company_domain_info(
-    conn: sqlite3.Connection, company_id: int
-) -> tuple[str | None, str | None]:
+def get_company_domain_info(conn: Any, company_id: int) -> tuple[str | None, str | None]:
     """
     Return (official_domain, fallback_domain) for a company.
 
@@ -649,11 +725,13 @@ def get_company_domain_info(
     ).fetchone()
     if not row:
         return None, None
-    return (row["official_domain"], row["fallback"])
+    if isinstance(row, tuple):
+        return (row[0], row[1])
+    return (row.get("official_domain", row[0]), row.get("fallback", row[1]))
 
 
 def _save_pages_for_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     pages: list[Page],
 ) -> int:
@@ -680,10 +758,8 @@ def _save_pages_for_company(
 
     # Ensure company_id is set on sources rows when the column exists.
     try:
-        cols = {
-            r["name"]
-            for r in conn.execute("PRAGMA table_info(sources)").fetchall()  # type: ignore[attr-defined]
-        }
+        rows = conn.execute("PRAGMA table_info(sources)").fetchall()
+        cols = {(r[1] if isinstance(r, tuple) else r.get("name", r[1])) for r in rows}
     except Exception:
         cols = set()
 
@@ -702,7 +778,7 @@ def _save_pages_for_company(
 
 
 def _iter_sources_for_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     official_domain: str | None,
 ) -> Iterable[tuple[str, bytes]]:
@@ -714,10 +790,15 @@ def _iter_sources_for_company(
     dom = (official_domain or "").strip().lower()
 
     try:
-        rows = conn.execute("PRAGMA table_info(sources)").fetchall()  # type: ignore[attr-defined]
-        cols = {r["name"] for r in rows}
+        rows = conn.execute("PRAGMA table_info(sources)").fetchall()
+        cols = {(r[1] if isinstance(r, tuple) else r.get("name", r[1])) for r in rows}
     except Exception:
         cols = set()
+
+    def _get_row_val(row: Any, idx: int, key: str) -> Any:
+        if isinstance(row, tuple):
+            return row[idx]
+        return row.get(key, row[idx]) if hasattr(row, "get") else row[idx]
 
     if "company_id" in cols:
         cur = conn.execute(
@@ -725,14 +806,14 @@ def _iter_sources_for_company(
             (company_id,),
         )
         for row in cur.fetchall():
-            yield row["source_url"], row["html"]
+            yield _get_row_val(row, 0, "source_url"), _get_row_val(row, 1, "html")
         return
 
     # Fallback: no company_id column; filter by host/domain in Python.
     cur = conn.execute("SELECT source_url, html FROM sources ORDER BY id ASC")
     for row in cur.fetchall():
-        url = row["source_url"]
-        html = row["html"]
+        url = _get_row_val(row, 0, "source_url")
+        html = _get_row_val(row, 1, "html")
         try:
             host = (urlparse(url).netloc or "").lower()
         except Exception:
@@ -742,7 +823,7 @@ def _iter_sources_for_company(
 
 
 # ---------------------------------------------------------------------------
-# robots.txt helpers + fallback crawling
+# robots.txt helpers + fallback crawling (with Task A explainability)
 # ---------------------------------------------------------------------------
 
 
@@ -776,6 +857,78 @@ def _load_robots_parser(domain: str) -> RobotFileParser | None:
         return rp
 
     return None
+
+
+def _check_robots_and_track_blocks(
+    domain: str,
+    result: AutodiscoveryResult,
+) -> bool:
+    """
+    Task A: Check robots.txt and track any blocks with full explainability.
+
+    If robots.txt blocks likely 'people' pages, log with full context and
+    add to result.robots_blocks_sample.
+
+    Returns True if we should NOT crawl (too many blocks), False otherwise.
+    """
+    dom = (domain or "").strip().lower()
+    if not dom:
+        return False
+
+    blocked_count = 0
+
+    for path in _MANUAL_HINT_PATHS:
+        for host in (dom, f"www.{dom}"):
+            # Use new robots explainability if available
+            if _HAS_ROBOTS_EXPLAINABILITY and robots_is_allowed is not None:
+                if not robots_is_allowed(host, path):
+                    if explain_block is not None:
+                        info = explain_block(host, path)
+                        LOG.warning(
+                            "robots_block: %s blocked by %s (rule: %s, reason: %s)",
+                            info.blocked_url,
+                            info.robots_url,
+                            info.matched_rule or "unknown",
+                            info.reason,
+                        )
+                        result.add_robots_block(info.to_dict())
+                    else:
+                        LOG.warning("robots_block: https://%s%s blocked", host, path)
+                        result.add_robots_block(
+                            {
+                                "blocked_url": f"https://{host}{path}",
+                                "reason": "disallowed",
+                            }
+                        )
+                    blocked_count += 1
+            else:
+                # Fallback to RobotFileParser
+                rp = _load_robots_parser(dom)
+                if rp is not None:
+                    url = f"https://{host}{path}"
+                    try:
+                        if not rp.can_fetch("*", url):
+                            LOG.warning("robots_block: %s blocked by robots.txt", url)
+                            result.add_robots_block(
+                                {
+                                    "blocked_url": url,
+                                    "reason": "disallowed_by_robotfileparser",
+                                }
+                            )
+                            blocked_count += 1
+                    except Exception:
+                        pass
+
+    # If more than half of paths are blocked, suggest stopping
+    if blocked_count > len(_MANUAL_HINT_PATHS):
+        LOG.warning(
+            "robots.txt for %s blocks %d URLs; manual research recommended",
+            dom,
+            blocked_count,
+        )
+        return True
+
+    return False
 
 
 def _check_robots_and_suggest_manual_pages(domain: str) -> bool:
@@ -862,7 +1015,75 @@ def _build_page(url: str, html_bytes: bytes, *, source: str | None = None) -> Pa
     return Page(**kwargs)  # type: ignore[arg-type]
 
 
-def _fallback_crawl_core_pages(domain: str) -> list[Page]:
+def _fallback_mark_request_url(seen_request_urls: set[str], url: str) -> bool:
+    if url in seen_request_urls:
+        return False
+    seen_request_urls.add(url)
+    return True
+
+
+def _fallback_is_blocked_by_robots(
+    *,
+    host: str,
+    path: str,
+    url: str,
+    rp: Any,
+    result: AutodiscoveryResult | None,
+) -> bool:
+    if _HAS_ROBOTS_EXPLAINABILITY and robots_is_allowed is not None:
+        if robots_is_allowed(host, path):
+            return False
+        if result is not None and explain_block is not None:
+            info = explain_block(host, path)
+            result.add_robots_block(info.to_dict())
+        LOG.debug("Fallback crawl: robots.txt disallows %s; skipping", url)
+        return True
+
+    if rp is None:
+        return False
+
+    try:
+        if rp.can_fetch("*", url):
+            return False
+        LOG.debug("Fallback crawl: robots.txt disallows %s; skipping", url)
+        if result is not None:
+            result.add_robots_block({"blocked_url": url, "reason": "disallowed"})
+        return True
+    except Exception:
+        return False
+
+
+def _fallback_safe_get(client: Any, url: str) -> Any | None:
+    try:
+        return client.get(url)
+    except Exception as exc:
+        LOG.debug("Fallback crawl: error fetching %s: %s", url, exc)
+        return None
+
+
+def _fallback_extract_html(resp: Any, request_url: str) -> tuple[str, bytes] | None:
+    ctype = resp.headers.get("Content-Type", "")
+    if resp.status_code != 200 or "text/html" not in ctype.lower():
+        LOG.debug(
+            "Fallback crawl: skipping %s (status=%s, content-type=%r)",
+            request_url,
+            resp.status_code,
+            ctype,
+        )
+        return None
+
+    html_bytes = resp.content or b""
+    if not html_bytes:
+        LOG.debug("Fallback crawl: %s returned empty body; skipping", request_url)
+        return None
+
+    return str(resp.url), html_bytes
+
+
+def _fallback_crawl_core_pages(  # noqa: C901
+    domain: str,
+    result: AutodiscoveryResult | None = None,
+) -> list[Page]:
     """
     Minimal in-script crawler used when the main crawl_domain() returns 0 pages
     but robots.txt does not obviously block us.
@@ -872,6 +1093,7 @@ def _fallback_crawl_core_pages(domain: str) -> list[Page]:
       * Tries a handful of common 'about/team/company/contact' URLs.
       * Tracks final URLs after redirects to avoid duplicate fetches.
       * Returns a list of Page objects for any 200 text/html responses.
+      * Task A: Tracks robots blocks in result if provided.
     """
     dom = (domain or "").strip().lower()
     if not dom:
@@ -880,42 +1102,38 @@ def _fallback_crawl_core_pages(domain: str) -> list[Page]:
     rp = _load_robots_parser(dom)
 
     pages: list[Page] = []
-    seen_request_urls: set[str] = set()  # URLs we've attempted to fetch
-    seen_final_urls: set[str] = set()  # Final URLs after redirects (dedup key)
+    seen_request_urls: set[str] = set()
+    seen_final_urls: set[str] = set()
 
     headers = {"User-Agent": "email-scraper-demo/0.1"}
     timeout = httpx.Timeout(10.0, connect=5.0)
 
     with httpx.Client(follow_redirects=True, headers=headers, timeout=timeout) as client:
         for path in _MANUAL_HINT_PATHS:
-            # Try both bare domain and www. variant
             for host in (dom, f"www.{dom}"):
                 url = f"https://{host}{path}"
 
-                # Skip if we've already tried this exact request URL
-                if url in seen_request_urls:
-                    continue
-                seen_request_urls.add(url)
-
-                # Check robots.txt before fetching
-                if rp is not None:
-                    try:
-                        if not rp.can_fetch("*", url):
-                            LOG.debug("Fallback crawl: robots.txt disallows %s; skipping", url)
-                            continue
-                    except Exception:
-                        pass
-
-                try:
-                    resp = client.get(url)
-                except Exception as exc:
-                    LOG.debug("Fallback crawl: error fetching %s: %s", url, exc)
+                if not _fallback_mark_request_url(seen_request_urls, url):
                     continue
 
-                # Get the FINAL URL after any redirects
-                final_url = str(resp.url)
+                if _fallback_is_blocked_by_robots(
+                    host=host,
+                    path=path,
+                    url=url,
+                    rp=rp,
+                    result=result,
+                ):
+                    continue
 
-                # Skip if we've already captured this final URL
+                resp = _fallback_safe_get(client, url)
+                if resp is None:
+                    continue
+
+                extracted = _fallback_extract_html(resp, url)
+                if extracted is None:
+                    continue
+
+                final_url, html_bytes = extracted
                 if final_url in seen_final_urls:
                     LOG.debug(
                         "Fallback crawl: skipping %s → already captured %s",
@@ -924,24 +1142,7 @@ def _fallback_crawl_core_pages(domain: str) -> list[Page]:
                     )
                     continue
 
-                ctype = resp.headers.get("Content-Type", "")
-                if resp.status_code != 200 or "text/html" not in ctype.lower():
-                    LOG.debug(
-                        "Fallback crawl: skipping %s (status=%s, content-type=%r)",
-                        url,
-                        resp.status_code,
-                        ctype,
-                    )
-                    continue
-
-                html_bytes = resp.content or b""
-                if not html_bytes:
-                    LOG.debug("Fallback crawl: %s returned empty body; skipping", url)
-                    continue
-
-                # Mark this final URL as seen BEFORE adding to pages
                 seen_final_urls.add(final_url)
-
                 LOG.info(
                     "Fallback crawl: captured HTML page %s (len=%s)",
                     final_url,
@@ -954,7 +1155,6 @@ def _fallback_crawl_core_pages(domain: str) -> list[Page]:
         len(pages),
         len(seen_request_urls),
     )
-
     return pages
 
 
@@ -990,7 +1190,7 @@ def _looks_like_title(text: str) -> bool:
 
 def _strip_html_to_lines(html: str) -> list[str]:
     """
-    Crude HTML → text: strip tags, keep some structure as line breaks.
+    Crude HTML â†’ text: strip tags, keep some structure as line breaks.
     Meant only for fallback heuristics, not pretty output.
     """
     # Line breaks around common block elements
@@ -1035,7 +1235,7 @@ def _normalize_team_line_to_name(
     raw = raw.rstrip(" .:;,-")
 
     # Chop off credentials or extra text after comma / dash / pipe.
-    for sep in [",", " - ", " – ", "|"]:
+    for sep in [",", " - ", " â€“ ", "|"]:
         if sep in raw:
             left, _right = raw.split(sep, 1)
             left = left.strip()
@@ -1112,17 +1312,6 @@ def _should_generate_for_person(first_name: str, last_name: str) -> bool:
     return True
 
 
-def _is_people_page_url(url: str) -> bool:
-    """
-    Heuristic: return True if the URL path suggests this is a people/leadership/team page.
-    """
-    try:
-        path = (urlparse(url).path or "").lower()
-    except Exception:
-        return False
-    return any(hint in path for hint in PEOPLE_URL_HINTS)
-
-
 def _extract_team_people_from_html(html: str) -> list[tuple[str, str, str]]:
     """
     Text-based fallback for team pages.
@@ -1163,7 +1352,7 @@ def _extract_team_people_from_html(html: str) -> list[tuple[str, str, str]]:
         if _looks_like_title(cleaned):
             continue
 
-        # Quick "name-like" pattern (2–4 capitalized tokens).
+        # Quick "name-like" pattern (2â€“4 capitalized tokens).
         if not _NAME_RE.match(cleaned):
             continue
 
@@ -1255,7 +1444,7 @@ def _leadership_fallback_candidates_from_html(source_url: str, html_str: str) ->
 
 
 def _team_fallback_candidates_from_html(source_url: str, html_str: str) -> list[Candidate]:
-    if not _is_people_page_url(source_url):
+    if not is_people_page_url(source_url):
         return []
 
     people = _extract_team_people_from_html(html_str)
@@ -1302,7 +1491,7 @@ def _dedup_fallback_candidates(candidates: list[Candidate]) -> list[Candidate]:
 
 
 def _build_fallback_candidates_from_team_and_leadership(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     official_domain: str | None,
 ) -> list[Candidate]:
@@ -1318,6 +1507,10 @@ def _build_fallback_candidates_from_team_and_leadership(
     for source_url, html in _iter_sources_for_company(conn, company_id, official_domain):
         if not html:
             continue
+
+        if not is_people_page_url(source_url):
+            continue
+
         html_str = _html_to_text(html)
 
         collected.extend(_leadership_fallback_candidates_from_html(source_url, html_str))
@@ -1327,7 +1520,7 @@ def _build_fallback_candidates_from_team_and_leadership(
 
 
 # ---------------------------------------------------------------------------
-# Extraction + persistence
+# Extraction + persistence (with Task D/E metrics tracking)
 # ---------------------------------------------------------------------------
 
 
@@ -1340,12 +1533,13 @@ class PersistedCandidate:
 
 
 def extract_candidates_for_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     official_domain: str | None,
     *,
     company_name: str,
     crawl_domain: str,
+    result: AutodiscoveryResult | None = None,
 ) -> list[Candidate]:
     """
     Run the R11/O05 extractor across all sources rows for this company.
@@ -1358,9 +1552,11 @@ def extract_candidates_for_company(
       - name-only team/leadership fallback candidates
 
     into a single candidate list that flows through AI.
-    """
-    heuristic_candidates: list[Candidate] = []
 
+    Task D/E: Tracks metrics in result if provided.
+    """
+    # Original heuristic extraction (already exists)
+    heuristic_candidates: list[Candidate] = []
     for source_url, html in _iter_sources_for_company(conn, company_id, official_domain):
         if not html:
             continue
@@ -1373,14 +1569,57 @@ def extract_candidates_for_company(
         )
         heuristic_candidates.extend(base_cands)
 
-    # NEW: team/leadership fallback candidates (name-only, email=None)
+    # === NEW: People cards extraction for Paddle-style pages ===
+    if _HAS_PEOPLE_CARDS and extract_people_cards is not None:
+        for source_url, html in _iter_sources_for_company(conn, company_id, official_domain):
+            if not html:
+                continue
+            html_str = _html_to_text(html)
+
+            card_cands = extract_people_cards(
+                html_str,
+                source_url=source_url,
+                official_domain=official_domain,
+            )
+            people_card_candidates: list[Candidate] = []
+            people_card_candidates.extend(card_cands)
+
+        LOG.info(
+            "People cards extractor found %d candidates for company_id=%s",
+            len(people_card_candidates),
+            company_id,
+        )
+
+    # Team/leadership fallback candidates (already exists)
     fallback_candidates = _build_fallback_candidates_from_team_and_leadership(
         conn,
         company_id,
         official_domain,
     )
 
-    all_candidates: list[Candidate] = heuristic_candidates + fallback_candidates
+    # === UPDATED: Merge all candidate sources ===
+    all_candidates: list[Candidate] = (
+        heuristic_candidates
+        + people_card_candidates  # NEW
+        + fallback_candidates
+    )
+
+    # === PATCH: Filter out candidates from third-party sources ===
+    # This prevents extracting customers from case studies as employees (Chad Warren bug)
+    pre_filter_count = len(all_candidates)
+    all_candidates = [c for c in all_candidates if not is_blocked_source_url(c.source_url or "")[0]]
+    if pre_filter_count != len(all_candidates):
+        LOG.info(
+            "Source filter: %d -> %d candidates (removed %d from non-employee sources)",
+            pre_filter_count,
+            len(all_candidates),
+            pre_filter_count - len(all_candidates),
+        )
+
+    # Task D/E: Track candidate counts (pre-AI)
+    if result is not None:
+        result.candidates_with_email = sum(1 for c in all_candidates if getattr(c, "email", None))
+        result.candidates_without_email = len(all_candidates) - result.candidates_with_email
 
     LOG.info(
         "Heuristic extractor produced %s email-anchored candidates and %s fallback "
@@ -1394,38 +1633,55 @@ def extract_candidates_for_company(
     if not all_candidates:
         return all_candidates
 
-    # Optional: AI refinement at the *company* level, if available and compatible.
     refined_candidates: list[Candidate] = all_candidates
-    if _HAS_AI_EXTRACTOR and _ai_extract_candidates is not None:
+    ai_metrics = None
+
+    # Company-level AI refinement via wrapper (handles optional availability/enablement).
+    try:
+        from src.extract.ai_candidates_wrapper import (
+            refine_candidates_with_ai,
+            update_result_from_metrics,
+        )
+
         try:
-            sig = inspect.signature(_ai_extract_candidates)
-            params = sig.parameters
-            if "raw_candidates" in params:
-                ai_result = _ai_extract_candidates(
-                    company_name=company_name,
-                    domain=crawl_domain,
-                    raw_candidates=all_candidates,
-                )
-                if ai_result is not None:
-                    refined_candidates = list(ai_result)
-                LOG.info(
-                    "AI extractor refined %s → %s candidates for company_id=%s",
-                    len(all_candidates),
-                    len(refined_candidates),
-                    company_id,
-                )
-            else:
-                LOG.info(
-                    "AI extractor is present but does not expose a 'raw_candidates' "
-                    "parameter; skipping AI refinement in demo_autodiscovery.",
-                )
+            refined_candidates, ai_metrics = refine_candidates_with_ai(
+                company_name=company_name,
+                domain=crawl_domain,
+                raw_candidates=all_candidates,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             LOG.warning(
-                "AI people extractor failed for company_id=%s domain=%s: %s",
+                "AI people refinement failed for company_id=%s domain=%s: %s",
                 company_id,
                 crawl_domain,
                 exc,
             )
+            if result is not None:
+                result.errors.append(f"ai_extraction_failed: {exc}")
+            refined_candidates = all_candidates
+            ai_metrics = None
+
+        # Update result with accurate metrics (enabled/inputs/approved/cost/etc.)
+        if result is not None and ai_metrics is not None:
+            update_result_from_metrics(result, ai_metrics)
+
+        LOG.info(
+            "AI refinement returned %s â†’ %s candidates for company_id=%s",
+            len(all_candidates),
+            len(refined_candidates),
+            company_id,
+        )
+
+    except Exception as exc:  # pragma: no cover - wrapper missing or import/runtime failure
+        LOG.debug(
+            "AI refinement wrapper unavailable for company_id=%s domain=%s: %s",
+            company_id,
+            crawl_domain,
+            exc,
+        )
+        if result is not None:
+            # Preserve a deterministic state when wrapper cannot run.
+            result.ai_enabled = False
 
     LOG.info(
         "Extracted %s candidates for company_id=%s (after AI refinement)",
@@ -1436,7 +1692,7 @@ def extract_candidates_for_company(
 
 
 def ensure_leadership_people_for_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     official_domain: str | None,
 ) -> int:
@@ -1560,7 +1816,7 @@ def ensure_leadership_people_for_company(
 
 
 def ensure_team_people_for_company(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     official_domain: str | None,
 ) -> int:
@@ -1569,7 +1825,7 @@ def ensure_team_people_for_company(
 
     Look through this company's sources for obvious team/our-team/people pages
     and insert people rows (no emails) based on text lines that look like
-    person names (2–4 capitalized tokens) and are not obviously marketing/tagline
+    person names (2â€“4 capitalized tokens) and are not obviously marketing/tagline
     phrases.
 
     Returns the number of people inserted.
@@ -1607,7 +1863,7 @@ def ensure_team_people_for_company(
         if not html:
             continue
 
-        if not _is_people_page_url(source_url):
+        if not is_people_page_url(source_url):
             continue
 
         html_str = _html_to_text(html)
@@ -1659,9 +1915,7 @@ def ensure_team_people_for_company(
     return inserted
 
 
-def _load_person_lookup(
-    conn: sqlite3.Connection, company_id: int
-) -> dict[tuple[str, str, str], int]:
+def _load_person_lookup(conn: Any, company_id: int) -> dict[tuple[str, str, str], int]:
     person_lookup: dict[tuple[str, str, str], int] = {}
     cur = conn.execute(
         """
@@ -1703,7 +1957,7 @@ def _build_full_name(cand: Candidate) -> str:
 
 
 def _get_or_create_person(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
     person_lookup: dict[tuple[str, str, str], int],
@@ -1756,7 +2010,7 @@ def _dedup_candidates(
 
 
 def _persist_existing_email_row(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
     email_lc: str,
@@ -1809,7 +2063,7 @@ def _persist_existing_email_row(
 
 
 def _persist_new_email_row(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
     email_lc: str,
@@ -1857,13 +2111,16 @@ def _persist_new_email_row(
 
 
 def _persist_email_candidates(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
     by_email: dict[str, Candidate],
     person_lookup: dict[tuple[str, str, str], int],
+    result: AutodiscoveryResult | None = None,
 ) -> list[PersistedCandidate]:
     persisted: list[PersistedCandidate] = []
+    people_created = 0
+    emails_created = 0
 
     for email_lc, cand in sorted(by_email.items(), key=lambda kv: kv[0]):
         is_role = _is_role_email(email_lc)
@@ -1874,48 +2131,71 @@ def _persist_email_candidates(
         ).fetchone()
 
         if row:
-            persisted.append(
-                _persist_existing_email_row(
-                    conn,
-                    company_id=company_id,
-                    email_lc=email_lc,
-                    cand=cand,
-                    existing_email_id=int(row["id"]),
-                    existing_person_id=row["person_id"],
-                    is_role=is_role,
-                    person_lookup=person_lookup,
-                )
-            )
-            continue
-
-        persisted.append(
-            _persist_new_email_row(
+            pc = _persist_existing_email_row(
                 conn,
                 company_id=company_id,
                 email_lc=email_lc,
                 cand=cand,
+                existing_email_id=int(row["id"]),
+                existing_person_id=row["person_id"],
                 is_role=is_role,
                 person_lookup=person_lookup,
             )
+            persisted.append(pc)
+            continue
+
+        # Track new person creation
+        lookup_before = len(person_lookup)
+        pc = _persist_new_email_row(
+            conn,
+            company_id=company_id,
+            email_lc=email_lc,
+            cand=cand,
+            is_role=is_role,
+            person_lookup=person_lookup,
         )
+        if len(person_lookup) > lookup_before:
+            people_created += 1
+        emails_created += 1
+        persisted.append(pc)
+
+    # Task D/E: Update metrics
+    if result is not None:
+        result.people_upserted += people_created
+        result.emails_upserted += emails_created
 
     return persisted
 
 
 def _persist_name_only_candidates(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
-    name_only: dict[tuple[str, str, str], Candidate],
+    name_only: dict[tuple[str, str, str], Candidate] | list[Candidate],
     person_lookup: dict[tuple[str, str, str], int],
+    result: AutodiscoveryResult | None = None,
 ) -> list[PersistedCandidate]:
     persisted: list[PersistedCandidate] = []
+    people_created = 0
 
-    for (_fn, _ln, _rn), cand in sorted(name_only.items(), key=lambda kv: kv[0]):
+    # Accept both the original dict[(fn, ln, rn)] -> Candidate shape
+    # and the newer list[Candidate] shape (e.g., after AI refinement).
+    if isinstance(name_only, dict):
+        name_only_map: dict[tuple[str, str, str], Candidate] = name_only
+    else:
+        name_only_map = {}
+        for cand in name_only:
+            fn = (cand.first_name or "").strip().lower()
+            ln = (cand.last_name or "").strip().lower()
+            rn = (cand.raw_name or "").strip().lower()
+            name_only_map[(fn, ln, rn)] = cand  # de-dupe by normalized key
+
+    for (_fn, _ln, _rn), cand in sorted(name_only_map.items(), key=lambda kv: kv[0]):
         full_name = _build_full_name(cand)
         if not full_name:
             continue
 
+        lookup_before = len(person_lookup)
         person_id = _get_or_create_person(
             conn,
             company_id=company_id,
@@ -1926,6 +2206,9 @@ def _persist_name_only_candidates(
         if person_id is None:
             continue
 
+        if len(person_lookup) > lookup_before:
+            people_created += 1
+
         persisted.append(
             PersistedCandidate(
                 email="",
@@ -1935,49 +2218,178 @@ def _persist_name_only_candidates(
             )
         )
 
+    # Task D/E: Update metrics
+    if result is not None:
+        result.people_upserted += people_created
+
     return persisted
 
 
-def persist_candidates(
-    conn: sqlite3.Connection,
+def _stamp_raw_name_best_effort(cand: Candidate, raw_name: str) -> None:
+    try:
+        if hasattr(cand, "raw_name") and not (getattr(cand, "raw_name", "") or "").strip():
+            cand.raw_name = raw_name  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
+def _group_candidates_for_persist(
+    candidates: list[Candidate],
+) -> tuple[dict[str, Candidate], list[Candidate]]:
+    by_email: dict[str, Candidate] = {}
+    name_only_by_key: dict[str, Candidate] = {}
+
+    for cand in candidates:
+        email_val = getattr(cand, "email", None)
+        email = email_val.strip() if isinstance(email_val, str) else ""
+
+        if email:
+            email_norm = email.lower()
+            prev = by_email.get(email_norm)
+            if prev is None:
+                by_email[email_norm] = cand
+                continue
+
+            prev_name = (getattr(prev, "raw_name", None) or "").strip()
+            prev_title = (getattr(prev, "title", None) or "").strip()
+
+            cand_name = (getattr(cand, "raw_name", None) or "").strip()
+            cand_title = (getattr(cand, "title", None) or "").strip()
+
+            if (not prev_name and cand_name) or (not prev_title and cand_title):
+                by_email[email_norm] = cand
+            continue
+
+        raw_name = (
+            getattr(cand, "raw_name", None) or getattr(cand, "full_name", None) or ""
+        ).strip()
+        first_name = (getattr(cand, "first_name", None) or "").strip()
+        last_name = (getattr(cand, "last_name", None) or "").strip()
+
+        if not raw_name:
+            if first_name and last_name:
+                raw_name = f"{first_name} {last_name}"
+            elif first_name:
+                raw_name = first_name
+            else:
+                continue
+
+        name_key = " ".join(raw_name.lower().split())
+        _stamp_raw_name_best_effort(cand, raw_name)
+
+        prev = name_only_by_key.get(name_key)
+        if prev is None:
+            name_only_by_key[name_key] = cand
+            continue
+
+        prev_title = (getattr(prev, "title", None) or "").strip()
+        cand_title = (getattr(cand, "title", None) or "").strip()
+        prev_src = (getattr(prev, "source_url", None) or "").strip()
+        cand_src = (getattr(cand, "source_url", None) or "").strip()
+
+        if (not prev_title and cand_title) or (not prev_src and cand_src):
+            name_only_by_key[name_key] = cand
+
+    return by_email, list(name_only_by_key.values())
+
+
+def _filter_name_only_candidates_if_needed(
+    name_only: list[Candidate],
+    *,
+    ai_approved: bool,
+) -> list[Candidate]:
+    if ai_approved or not name_only:
+        return name_only
+
+    has_qg = bool(globals().get("_HAS_QUALITY_GATES", False))
+    gate_fn = globals().get("should_persist_as_person")
+    if not (has_qg and callable(gate_fn)):
+        return name_only
+
+    filtered: list[Candidate] = []
+    for cand in name_only:
+        nm = (getattr(cand, "raw_name", None) or getattr(cand, "full_name", None) or "").strip()
+        if not nm:
+            continue
+
+        title = getattr(cand, "title", None)
+        source_url = getattr(cand, "source_url", None)
+        ok = gate_fn(
+            name=nm,
+            email=None,
+            title=title,
+            ai_approved=False,
+            source_url=source_url,
+        )
+        if not ok:
+            LOG.debug("Quality gate rejected no-email candidate: %s", nm)
+            continue
+        filtered.append(cand)
+
+    return filtered
+
+
+def persist_candidates(  # noqa: C901
+    conn: Any,
     company_id: int,
     candidates: list[Candidate],
+    *,
+    ai_approved: bool = True,  # NEW: indicates these candidates passed AI refinement
+    result: AutodiscoveryResult | None = None,
 ) -> list[PersistedCandidate]:
     """
     Persist people + emails for each candidate.
+
+    PATCHED:
+      - Accepts candidates where cand.email is None/blank ("people cards").
+      - Adds ai_approved flag: when False, we optionally apply stricter quality
+        gates to *name-only* candidates before persisting them.
 
     Returns a list of PersistedCandidate records that tie back to the *person*
     row (person_id), not just the email row. This allows downstream code to
     know exactly which people came from the AI-approved candidate set.
 
-    BEHAVIOR:
+    BEHAVIOR (unchanged from your existing helper-based pipeline):
     - Role emails (office@, info@, etc.) get person_id=NULL on the email row,
       but we still CREATE a person if the AI provided name info, and we still
       return that person_id in PersistedCandidate for generation gating.
     - Personal emails get person_id linked to the person row.
     - When an existing email has no person but candidate has name info,
       we create a person but only update the email link if it's not a role email.
+
+    Task D/E: Tracks people_upserted and emails_upserted in result if provided.
     """
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
     person_lookup = _load_person_lookup(conn, company_id)
-    by_email, name_only = _dedup_candidates(candidates)
+    by_email, name_only = _group_candidates_for_persist(candidates)
+    name_only = _filter_name_only_candidates_if_needed(name_only, ai_approved=ai_approved)
 
     persisted: list[PersistedCandidate] = []
-    persisted.extend(
-        _persist_email_candidates(
-            conn,
-            company_id=company_id,
-            by_email=by_email,
-            person_lookup=person_lookup,
+    if by_email:
+        persisted.extend(
+            _persist_email_candidates(
+                conn,
+                company_id=company_id,
+                by_email=by_email,
+                person_lookup=person_lookup,
+                result=result,
+            )
         )
-    )
-    persisted.extend(
-        _persist_name_only_candidates(
-            conn,
-            company_id=company_id,
-            name_only=name_only,
-            person_lookup=person_lookup,
+
+    if name_only:
+        persisted.extend(
+            _persist_name_only_candidates(
+                conn,
+                company_id=company_id,
+                name_only=name_only,
+                person_lookup=person_lookup,
+                result=result,
+            )
         )
-    )
 
     conn.commit()
 
@@ -1986,23 +2398,128 @@ def persist_candidates(
     role_emails = sum(1 for p in persisted if p.email and _is_role_email(p.email))
 
     LOG.info(
-        "Persisted %s candidates for company_id=%s (%d with person_id, %d without, %d role emails)",
+        "Persisted %s candidates for company_id=%s (ai_approved=%s; %d with person_id, %d without, %d role emails)",
         len(persisted),
         company_id,
+        ai_approved,
         with_person,
         without_person,
         role_emails,
     )
-
     return persisted
 
 
+def _upsert_person_no_email(
+    conn: Any,
+    *,
+    company_id: int,
+    first_name: str | None,
+    last_name: str | None,
+    full_name: str,
+    title: str | None,
+    source_url: str | None,
+) -> int | None:
+    """
+    Upsert a person record without an email.
+
+    Dedupe key: (company_id, full_name) case-insensitive (COLLATE NOCASE).
+
+    Behavior:
+      - If a matching person exists, update missing fields (first/last/title/source_url)
+        when the new value is non-empty.
+      - If no match exists, insert a new person row.
+      - Does NOT commit; caller controls transaction boundary.
+
+    Returns:
+      person_id on success, or None on failure.
+    """
+
+    def _clean(s: str | None) -> str | None:
+        if s is None:
+            return None
+        s2 = " ".join(s.strip().split())
+        return s2 or None
+
+    full_name_c = _clean(full_name)
+    if not full_name_c:
+        return None
+
+    first_name_c = _clean(first_name)
+    last_name_c = _clean(last_name)
+    title_c = _clean(title)
+    source_url_c = _clean(source_url)
+
+    try:
+        row = conn.execute(
+            """
+            SELECT id, first_name, last_name, title, source_url
+            FROM people
+            WHERE company_id = ?
+              AND full_name = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (company_id, full_name_c),
+        ).fetchone()
+
+        if row:
+            person_id = int(row[0])
+            cur_first = (row[1] or "").strip()
+            cur_last = (row[2] or "").strip()
+            cur_title = (row[3] or "").strip()
+            cur_src = (row[4] or "").strip()
+
+            new_first = first_name_c if (not cur_first and first_name_c) else cur_first or None
+            new_last = last_name_c if (not cur_last and last_name_c) else cur_last or None
+            new_title = title_c if (not cur_title and title_c) else cur_title or None
+            new_src = source_url_c if (not cur_src and source_url_c) else cur_src or None
+
+            # Only issue UPDATE if something actually changes
+            if (
+                (new_first or "") != (cur_first or "")
+                or (new_last or "") != (cur_last or "")
+                or (new_title or "") != (cur_title or "")
+                or (new_src or "") != (cur_src or "")
+                or full_name_c != (full_name or "").strip()
+            ):
+                conn.execute(
+                    """
+                    UPDATE people
+                    SET first_name = ?,
+                        last_name = ?,
+                        full_name = ?,
+                        title = ?,
+                        source_url = ?
+                    WHERE id = ?
+                    """,
+                    (new_first, new_last, full_name_c, new_title, new_src, person_id),
+                )
+
+            return person_id
+
+        # Insert new person
+        cur = conn.execute(
+            """
+            INSERT INTO people (
+              company_id, first_name, last_name, full_name, title, source_url
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (company_id, first_name_c, last_name_c, full_name_c, title_c, source_url_c),
+        )
+        return int(cur.lastrowid)
+        conn.commit()
+
+    except Exception as exc:
+        LOG.warning("Failed to upsert person (no email) full_name=%r: %s", full_name, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Generation + verification (synchronous)
+# Generation + verification (synchronous) with Task C AI gating
 # ---------------------------------------------------------------------------
 
 
-def _examples_for_domain(conn: sqlite3.Connection, domain: str) -> list[tuple[str, str, str]]:
+def _examples_for_domain(conn: Any, domain: str) -> list[tuple[str, str, str]]:
     """
     Build [(first, last, localpart)] examples for a domain using 'published' emails.
     """
@@ -2033,7 +2550,7 @@ def _examples_for_domain(conn: sqlite3.Connection, domain: str) -> list[tuple[st
     return examples
 
 
-def _load_cached_pattern(conn: sqlite3.Connection, domain: str) -> str | None:
+def _load_cached_pattern(conn: Any, domain: str) -> str | None:
     """
     Read a cached canonical pattern key for a domain from domain_patterns
     when that table exists.
@@ -2061,7 +2578,7 @@ def _load_cached_pattern(conn: sqlite3.Connection, domain: str) -> str | None:
 
 
 def _save_inferred_pattern(
-    conn: sqlite3.Connection,
+    conn: Any,
     domain: str,
     pattern: str,
     confidence: float,
@@ -2095,9 +2612,7 @@ def _save_inferred_pattern(
         )
 
 
-def _load_people_with_emails(
-    conn: sqlite3.Connection, company_id: int
-) -> dict[int, dict[str, Any]]:
+def _load_people_with_emails(conn: Any, company_id: int) -> dict[int, dict[str, Any]]:
     cur = conn.execute(
         """
         SELECT p.id AS person_id, p.first_name, p.last_name, e.email
@@ -2133,11 +2648,16 @@ def _select_missing_people(
     *,
     allowed_person_ids: set[int] | None,
 ) -> list[dict[str, Any]]:
+    """
+    Task C: Select people without emails, optionally filtered by allowed_person_ids
+    for AI gating.
+    """
     missing_people: list[dict[str, Any]] = []
 
     for person in by_person.values():
         pid = int(person["id"])
 
+        # Task C: AI gating - skip if not in allowed set
         if allowed_person_ids is not None and pid not in allowed_person_ids:
             continue
 
@@ -2157,7 +2677,7 @@ def _select_missing_people(
 
 
 def _infer_patterns_for_generation(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     company_id: int,
     domain: str,
@@ -2238,7 +2758,7 @@ def _ordered_email_candidates_for_person(
 
 
 def _generate_for_person(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     person_id: int,
     first_raw: str,
@@ -2265,18 +2785,21 @@ def _generate_for_person(
 
 
 def generate_for_missing_people(
-    conn: sqlite3.Connection,
+    conn: Any,
     company_id: int,
     domain: str,
     *,
     allowed_person_ids: set[int] | None = None,
+    result: AutodiscoveryResult | None = None,
 ) -> int:
     """
     For people at this company that have no *personal* emails, generate permutations.
 
     If allowed_person_ids is provided, we only generate for people whose id is in
     that set. This lets us restrict generation to people that came through the
-    AI-approved candidate path.
+    AI-approved candidate path (Task C: AI gating).
+
+    Task D/E: Tracks permutations_generated in result if provided.
     """
     dom = (domain or "").strip().lower()
     if not dom:
@@ -2326,6 +2849,11 @@ def generate_for_missing_people(
         )
 
     conn.commit()
+
+    # Task D/E: Track permutations generated
+    if result is not None:
+        result.permutations_generated = total_generated
+
     LOG.info(
         "Generated %s candidate emails for %s people (company_id=%s, domain=%s, preferred_pattern=%s, domain_pattern=%s)",
         total_generated,
@@ -2353,7 +2881,7 @@ def verify_all_for_company(
     Parameters
     ----------
     db_path : Path
-        Path to the SQLite database file.
+        Path to the database (deprecated - uses get_conn() which reads DATABASE_URL).
     company_id : int
         The company ID to verify emails for.
     domain : str
@@ -2372,8 +2900,13 @@ def verify_all_for_company(
     if not dom:
         return
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row  # type: ignore[attr-defined]
+    # Helper for row value access
+    def _get_row_val(row: Any, idx: int, key: str) -> Any:
+        if isinstance(row, tuple):
+            return row[idx]
+        return row.get(key, row[idx]) if hasattr(row, "get") else row[idx]
+
+    conn = get_conn()
 
     # Pull all emails for this company, including person_id so we can group.
     cur = conn.execute(
@@ -2389,13 +2922,13 @@ def verify_all_for_company(
 
     # Optionally skip specific emails for demo scenarios.
     if DEMO_SKIP_EMAILS:
-        filtered_rows: list[sqlite3.Row] = []
+        filtered_rows: list[Any] = []
         for r in rows:
-            em = (r["email"] or "").lower()
+            em = (_get_row_val(r, 1, "email") or "").lower()
             if em in DEMO_SKIP_EMAILS:
                 LOG.info(
                     "Skipping email_id=%s email=%s due to DEMO_SKIP_EMAILS",
-                    r["id"],
+                    _get_row_val(r, 0, "id"),
                     em,
                 )
                 continue
@@ -2407,16 +2940,13 @@ def verify_all_for_company(
         conn.close()
         return
 
-    # Ensure DATABASE_PATH env is set for task_probe_email internals.
-    os.environ.setdefault("DATABASE_PATH", str(db_path))
-
     # Resolve underlying function (RQ @job wrapper vs plain function).
     probe_func = getattr(_task_probe_email, "__wrapped__", _task_probe_email)
 
     # Group emails by person_id; use None for rows without a person.
-    emails_by_person: dict[int | None, list[sqlite3.Row]] = defaultdict(list)
+    emails_by_person: dict[int | None, list[Any]] = defaultdict(list)
     for row in rows:
-        emails_by_person[row["person_id"]].append(row)
+        emails_by_person[_get_row_val(row, 2, "person_id")].append(row)
 
     total_probes = 0
     total_skipped_budget = 0
@@ -2465,8 +2995,8 @@ def verify_all_for_company(
                 stop_reason = "probe_cap"
                 break
 
-            eid = int(row["id"])
-            email = row["email"]
+            eid = int(_get_row_val(row, 0, "id"))
+            email = _get_row_val(row, 1, "email")
             edom = email.split("@", 1)[1].lower() if ("@" in email) else dom
 
             LOG.info(
@@ -2502,7 +3032,7 @@ def verify_all_for_company(
                 (eid,),
             )
             row_vs = cur_vs.fetchone()
-            vs = row_vs["verify_status"] if row_vs else None
+            vs = _get_row_val(row_vs, 0, "verify_status") if row_vs else None
 
             # If we get a definitive positive signal, stop probing this person.
             if vs in ("valid", "risky_catch_all"):
@@ -2578,7 +3108,26 @@ def maybe_run_icp_backfill(db_path: Path) -> None:
         LOG.warning("ICP backfill failed: %s", exc)
 
 
-def _fetch_v_emails_latest_rows(conn: sqlite3.Connection, dom: str) -> list[dict[str, Any]]:
+def _fetch_v_emails_latest_rows(conn: Any, dom: str) -> list[dict[str, Any]]:
+    def _row_to_dict(row: Any) -> dict[str, Any]:
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "keys"):
+            return dict(row)
+        # Tuple fallback - map to expected columns
+        cols = [
+            "email",
+            "first_name",
+            "last_name",
+            "title",
+            "company_name",
+            "company_domain",
+            "verify_status",
+            "icp_score",
+            "source_url",
+        ]
+        return dict(zip(cols[: len(row)], row, strict=False))
+
     try:
         cur = conn.execute(
             """
@@ -2598,8 +3147,8 @@ def _fetch_v_emails_latest_rows(conn: sqlite3.Connection, dom: str) -> list[dict
             """,
             (dom,),
         )
-        return [dict(row) for row in cur.fetchall()]
-    except sqlite3.OperationalError as exc:
+        return [_row_to_dict(row) for row in cur.fetchall()]
+    except Exception as exc:
         if "icp_score" not in str(exc).lower():
             raise
         cur = conn.execute(
@@ -2619,7 +3168,7 @@ def _fetch_v_emails_latest_rows(conn: sqlite3.Connection, dom: str) -> list[dict
             """,
             (dom,),
         )
-        return [dict(row) for row in cur.fetchall()]
+        return [_row_to_dict(row) for row in cur.fetchall()]
 
 
 def _print_v_emails_latest_snapshot(dom: str, emails: list[dict[str, Any]]) -> None:
@@ -2653,7 +3202,7 @@ def _print_v_emails_latest_snapshot(dom: str, emails: list[dict[str, Any]]) -> N
         print("\t".join(line))
 
 
-def _has_people_fts(conn: sqlite3.Connection) -> bool:
+def _has_people_fts(conn: Any) -> bool:
     return bool(
         conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='people_fts'"
@@ -2662,7 +3211,7 @@ def _has_people_fts(conn: sqlite3.Connection) -> bool:
 
 
 def _search_backend_sanity_check(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     dom: str,
     search_hint: str | None,
@@ -2730,18 +3279,54 @@ def _search_backend_sanity_check(
 
 
 def print_summary(
-    conn: sqlite3.Connection,
+    conn: Any,
     domain: str,
     search_hint: str | None = None,
+    result: AutodiscoveryResult | None = None,
 ) -> None:
     """
     Print a small table of leads for this domain from v_emails_latest, plus
     a short search-based check when FTS is available.
+
+    Task D: Also prints the AutodiscoveryResult summary if provided.
     """
+    # Task D: Print AutodiscoveryResult summary first
+    if result is not None:
+        prefix = "  "
+        print("\n" + "=" * 70)
+        print("  AUTODISCOVERY SUMMARY")
+        print("=" * 70)
+
+        # Existing summary printer
+        result.print_summary(prefix=prefix)
+
+        # Optional extended fields (avoid crashing if older result objects lack them)
+        if getattr(result, "ai_enabled", False):
+            ai_called = getattr(result, "ai_called", None)
+            if ai_called is not None:
+                print(f"{prefix}AI called: {'yes' if ai_called else 'no'}")
+
+            ai_returned_people = getattr(result, "ai_returned_people", None)
+            if ai_returned_people is not None:
+                print(f"{prefix}AI returned people: {ai_returned_people}")
+
+        fallback_used = getattr(result, "fallback_used", None)
+        if fallback_used is not None:
+            print(f"{prefix}Fallback used: {'yes' if fallback_used else 'no'}")
+
+        final_candidates = getattr(result, "final_candidates", None)
+        if final_candidates is not None:
+            print(f"{prefix}Final candidates: {final_candidates}")
+
+        print("-" * 70)
+
     dom = (domain or "").strip().lower()
     emails = _fetch_v_emails_latest_rows(conn, dom)
     _print_v_emails_latest_snapshot(dom, emails)
     _search_backend_sanity_check(conn, dom=dom, search_hint=search_hint)
+
+    if result is not None:
+        print("=" * 70 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2756,8 +3341,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--db",
         dest="db",
-        default="data/dev.db",
-        help="Path to SQLite database (default: data/dev.db)",
+        default=os.getenv("DATABASE_URL", "data/dev.db"),
+        help=(
+            "Database URL (postgresql://...) or legacy SQLite path. "
+            "Defaults to DATABASE_URL env var or data/dev.db"
+        ),
     )
     p.add_argument(
         "--company",
@@ -2842,16 +3430,26 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    db_path = Path(args.db).resolve()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Handle --db argument: can be a PostgreSQL URL or a file path for legacy SQLite
+    db_arg = args.db
+    if db_arg.startswith("postgresql://") or db_arg.startswith("postgres://"):
+        # PostgreSQL URL - use directly
+        os.environ["DATABASE_URL"] = db_arg
+        db_path = Path(".")  # Not used for PostgreSQL, but keep for API compatibility
+    else:
+        # Legacy: treat as file path (SQLite or convert to URL)
+        db_path = Path(db_arg).resolve()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Set both for compatibility with various code paths
+        os.environ.setdefault("DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+        os.environ.setdefault("DB_URL", f"sqlite:///{db_path.as_posix()}")
+        os.environ.setdefault("DATABASE_PATH", str(db_path))
 
-    # Keep DB_URL / DATABASE_PATH aligned so src.db.get_conn() and R16/R15 helpers
-    # operate on the same SQLite file as this script.
-    os.environ.setdefault("DB_URL", f"sqlite:///{db_path.as_posix()}")
-    os.environ.setdefault("DATABASE_PATH", str(db_path))
+    # Use get_conn() which handles both PostgreSQL and SQLite via CompatConnection
+    conn = get_conn()
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row  # type: ignore[attr-defined]
+    # Task D/E: Initialize AutodiscoveryResult for metrics tracking
+    result = AutodiscoveryResult(domain=args.domain)
 
     try:
         if args.init_schema or not db_path.exists():
@@ -2865,6 +3463,7 @@ def main(argv: list[str] | None = None) -> None:
             domain=args.domain,
             website_url=args.website_url,
         )
+        result.company_id = company_id
 
         # 2) Resolve official domain (R08)
         LOG.info("Resolving official domain for company_id=%s", company_id)
@@ -2879,6 +3478,8 @@ def main(argv: list[str] | None = None) -> None:
         if not crawl_domain_str:
             raise RuntimeError("No domain available for crawling after resolution")
 
+        result.domain = crawl_domain_str
+
         LOG.info(
             "Resolved domain: official=%r fallback=%r; using %s for crawl",
             official_domain,
@@ -2888,11 +3489,12 @@ def main(argv: list[str] | None = None) -> None:
 
         # 3) Crawl the domain (R10)
         pages = crawl_domain(crawl_domain_str)
+        result.pages_fetched = len(pages)
         LOG.info("Crawled %s pages for domain=%s", len(pages), crawl_domain_str)
 
         if not pages:
-            # First check if robots.txt is the reason.
-            robots_blocked = _check_robots_and_suggest_manual_pages(crawl_domain_str)
+            # Task A: Check robots and track blocks with explainability
+            robots_blocked = _check_robots_and_track_blocks(crawl_domain_str, result)
             if robots_blocked:
                 LOG.info(
                     "Stopping automatic crawl for %s out of respect for robots.txt. "
@@ -2900,6 +3502,8 @@ def main(argv: list[str] | None = None) -> None:
                     "verification as a separate process.",
                     crawl_domain_str,
                 )
+                # Task D: Print summary even on early exit
+                print_summary(conn, crawl_domain_str, search_hint=args.company, result=result)
                 return
 
             # robots.txt does not obviously block us; try a small, local fallback crawl.
@@ -2908,7 +3512,8 @@ def main(argv: list[str] | None = None) -> None:
                 "common 'people' URLs; running fallback crawler.",
                 crawl_domain_str,
             )
-            pages = _fallback_crawl_core_pages(crawl_domain_str)
+            pages = _fallback_crawl_core_pages(crawl_domain_str, result=result)
+            result.pages_fetched = len(pages)
             LOG.info(
                 "Fallback crawler captured %s pages for domain=%s",
                 len(pages),
@@ -2926,57 +3531,85 @@ def main(argv: list[str] | None = None) -> None:
             official_domain or crawl_domain_str,
             company_name=args.company,
             crawl_domain=crawl_domain_str,
+            result=result,  # Task D/E: Pass result for metrics tracking
         )
-        persisted = persist_candidates(conn, company_id, candidates)
+        persisted = persist_candidates(conn, company_id, candidates, result=result)
         LOG.info(
             "Persisted %s extracted candidates as people/emails for company_id=%s",
             len(persisted),
             company_id,
         )
 
-        # Build the set of person_ids that came through the AI/refined candidate path.
-        allowed_person_ids: set[int] = {
-            pc.person_id for pc in persisted if pc.person_id is not None
-        }
-        LOG.info(
-            "Allowed person_ids for generation (from AI/refined candidates): %s",
-            sorted(allowed_person_ids),
+        # Build the set of person_ids for generation
+        # PATCHED: When AI is disabled, use ALL people for this company
+
+        # Check if AI is actually enabled and was used
+        ai_was_used = (
+            _HAS_AI_EXTRACTOR
+            and _ai_extract_candidates is not None
+            and len(candidates) > 0  # Only matters if we had candidates to refine
         )
 
-        # 6) Leadership fallback: seed people rows from 'Our Leadership Team'
-        inserted_leaders = ensure_leadership_people_for_company(
-            conn,
-            company_id,
-            official_domain or crawl_domain_str,
-        )
-        LOG.info(
-            "Leadership fallback inserted %s people for company_id=%s",
-            inserted_leaders,
-            company_id,
+        if ai_was_used:
+            # AI is enabled: only generate for refined candidates
+            allowed_person_ids: set[int] = {
+                pc.person_id for pc in persisted if pc.person_id is not None
+            }
+            LOG.info(
+                "Allowed person_ids for generation (AI-refined): %s",
+                sorted(allowed_person_ids),
+            )
+        else:
+            # AI is disabled or returned empty: use ALL people for this company
+            cur = conn.execute(
+                "SELECT id FROM people WHERE company_id = ?",
+                (company_id,),
+            )
+            allowed_person_ids = {int(row[0]) for row in cur.fetchall()}
+            LOG.info(
+                "Allowed person_ids for generation (all company people, AI disabled): %d people",
+                len(allowed_person_ids),
+            )
+
+        # 7) Legacy fallbacks - SKIP if unified AI path already produced candidates
+        _skip_legacy_fallbacks = len(persisted) > 0 or (
+            _HAS_AI_EXTRACTOR and _ai_extract_candidates is not None
         )
 
-        # 6b) Team-page fallback: seed people rows from obvious team/our-team pages.
-        inserted_team = ensure_team_people_for_company(
-            conn,
-            company_id,
-            official_domain or crawl_domain_str,
-        )
-        LOG.info(
-            "Team-page fallback inserted %s people for company_id=%s",
-            inserted_team,
-            company_id,
-        )
+        if _skip_legacy_fallbacks:
+            LOG.info(
+                "Skipping legacy leadership/team fallbacks for company_id=%s "
+                "(unified extraction path already ran with %d candidates)",
+                company_id,
+                len(persisted),
+            )
+        else:
+            # 7a) Leadership fallback
+            ensure_leadership_people_for_company(
+                conn,
+                company_id,
+                official_domain or crawl_domain_str,
+            )
 
-        # 7) Generate permutations for people without direct personal emails,
-        # restricted to AI-approved person_ids when that set is non-empty.
+            # 7b) Team-page fallback
+            ensure_team_people_for_company(
+                conn,
+                company_id,
+                official_domain or crawl_domain_str,
+            )
+
+        # 8) Generate permutations for people without direct personal emails,
+        # Task C: restricted to AI-approved person_ids when that set is non-empty
+        # and AI is enabled.
         generate_kwargs: dict[str, Any] = {}
-        if allowed_person_ids:
+        if result.ai_enabled and allowed_person_ids:
             generate_kwargs["allowed_person_ids"] = allowed_person_ids
 
         generated_count = generate_for_missing_people(
             conn,
             company_id,
             crawl_domain_str,
+            result=result,  # Task D/E: Pass result for metrics tracking
             **generate_kwargs,
         )
         LOG.info(
@@ -2985,7 +3618,7 @@ def main(argv: list[str] | None = None) -> None:
             company_id,
         )
 
-        # 8) Verify all emails synchronously (R16–R18 + O26 learning)
+        # 9) Verify all emails synchronously (R16â€“R18 + O26 learning)
         pre = _smtp_tcp25_preflight(
             crawl_domain_str,
             timeout_s=float(args.tcp25_probe_timeout),
@@ -2993,7 +3626,7 @@ def main(argv: list[str] | None = None) -> None:
         if not bool(pre.get("ok")) and not bool(args.force_verify):
             LOG.error(
                 "TCP/25 preflight FAILED for domain=%s. This usually means outbound port 25 is blocked "
-                "(ISP/firewall/VPN) — which will manifest as long 'unknown_timeout' probes.",
+                "(ISP/firewall/VPN) â€” which will manifest as long 'unknown_timeout' probes.",
                 crawl_domain_str,
             )
             LOG.error(
@@ -3015,12 +3648,12 @@ def main(argv: list[str] | None = None) -> None:
                 stop_on_unknown=(not bool(args.continue_on_unknown)),
             )
 
-        # 9) Optional ICP scoring
+        # 10) Optional ICP scoring
         if args.run_icp:
             maybe_run_icp_backfill(db_path)
 
-        # 10) Print summary
-        print_summary(conn, crawl_domain_str, search_hint=args.company)
+        # 11) Print summary - Task D: Now includes AutodiscoveryResult metrics
+        print_summary(conn, crawl_domain_str, search_hint=args.company, result=result)
 
     finally:
         conn.close()

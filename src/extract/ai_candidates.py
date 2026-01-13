@@ -36,8 +36,7 @@ log = logging.getLogger(__name__)
 
 # Prefer src.config.settings (which already reads env), but keep env compatibility.
 OPENAI_API_KEY = (
-    os.getenv("OPENAI_API_KEY")
-    or (getattr(settings, "openai_api_key", "") or "")
+    os.getenv("OPENAI_API_KEY") or (getattr(settings, "openai_api_key", "") or "")
 ).strip() or None
 
 # Prefer AI_PEOPLE_MODEL; support legacy OPENAI_MODEL.

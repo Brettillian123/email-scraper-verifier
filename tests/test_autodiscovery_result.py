@@ -6,17 +6,20 @@ NOTE: Previous test failures were due to incorrect test expectations, not source
 - merge() correctly only copies AI metrics when other.ai_called is True
 - summary_lines() correctly only shows AI input candidates when ai_called is True
 """
+
 from __future__ import annotations
 
 import pytest
 
 try:
     from src.autodiscovery.result import AutodiscoveryResult
+
     HAS_RESULT = True
 except ImportError:
     try:
         # Try alternate import path
         from autodiscovery_result import AutodiscoveryResult
+
         HAS_RESULT = True
     except ImportError:
         HAS_RESULT = False
@@ -110,7 +113,7 @@ class TestMerge:
         # But ai_called metrics should NOT be copied when ai_called=False
         assert a.ai_called is False
         assert a.ai_input_candidates == 0  # Not copied
-        assert a.ai_approved_people == 0   # Not copied
+        assert a.ai_approved_people == 0  # Not copied
 
     def test_merge_robots_sample_respects_cap(self):
         """merge() respects sample cap when combining."""

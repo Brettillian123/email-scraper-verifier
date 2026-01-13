@@ -7,7 +7,7 @@ These tests validate that:
   - Compliance acronyms are not treated as person names
   - Placeholder emails are filtered
   - Valid person names pass through
-  
+
 NOTE: Title validation has been tightened to require specific role keywords
 (chief, ceo, director, manager, vp, etc.) to prevent marketing blurbs.
 """
@@ -181,7 +181,7 @@ class TestValidatePersonName:
 class TestValidateTitle:
     """
     Tests for job title validation.
-    
+
     NOTE: Title validation now requires at least one role keyword
     (chief, ceo, director, manager, vp, head, partner, etc.) to prevent
     marketing blurbs from being treated as titles.
@@ -197,13 +197,13 @@ class TestValidateTitle:
 
         result = validate_title("VP of Sales")
         assert result.is_valid is True
-        
+
         result = validate_title("Engineering Manager")
         assert result.is_valid is True
-        
+
         result = validate_title("Director of Operations")
         assert result.is_valid is True
-        
+
         result = validate_title("Head of Marketing")
         assert result.is_valid is True
 
@@ -212,7 +212,7 @@ class TestValidateTitle:
         result = validate_title("Software Engineer")
         assert result.is_valid is False
         assert result.rejection_reason == "missing_role_keyword"
-        
+
         result = validate_title("Data Scientist")
         assert result.is_valid is False
         assert result.rejection_reason == "missing_role_keyword"
@@ -282,36 +282,48 @@ class TestShouldPersistAsPerson:
 
     def test_ai_approved_with_valid_name_passes(self):
         """AI approval with valid name should pass (source URL checks still apply)."""
-        assert should_persist_as_person(
-            name="John Smith",
-            email="test@acme.com",
-            ai_approved=True,
-        ) is True
+        assert (
+            should_persist_as_person(
+                name="John Smith",
+                email="test@acme.com",
+                ai_approved=True,
+            )
+            is True
+        )
 
     def test_valid_data_passes_without_ai(self):
-        assert should_persist_as_person(
-            name="John Smith",
-            email="john.smith@acme.com",
-            ai_approved=False,
-        ) is True
+        assert (
+            should_persist_as_person(
+                name="John Smith",
+                email="john.smith@acme.com",
+                ai_approved=False,
+            )
+            is True
+        )
 
     def test_geography_rejected_without_ai(self):
-        assert should_persist_as_person(
-            name="San Francisco",
-            email="marketplace@aircall.io",
-            ai_approved=False,
-        ) is False
+        assert (
+            should_persist_as_person(
+                name="San Francisco",
+                email="marketplace@aircall.io",
+                ai_approved=False,
+            )
+            is False
+        )
 
     def test_placeholder_email_with_invalid_name_rejected(self):
         """Placeholder email + invalid name should be rejected."""
         # Note: should_persist_as_person doesn't check placeholder emails directly
         # It relies on validate_candidate_for_persistence for that
         # This test checks that invalid names are rejected
-        assert should_persist_as_person(
-            name="San Francisco",  # Invalid geography name
-            email="jdoe@acme.com",
-            ai_approved=False,
-        ) is False
+        assert (
+            should_persist_as_person(
+                name="San Francisco",  # Invalid geography name
+                email="jdoe@acme.com",
+                ai_approved=False,
+            )
+            is False
+        )
 
 
 class TestCleanTitleIfInvalid:

@@ -201,13 +201,11 @@ def _extract_company_norm_fields(
       - key: company_norm_key (legacy) or company_key (R13)
     """
     name_norm = (
-        (normalized.get("company_name_norm") or normalized.get("company_norm") or "").strip()
-        or None
-    )
+        normalized.get("company_name_norm") or normalized.get("company_norm") or ""
+    ).strip() or None
     norm_key = (
-        (normalized.get("company_norm_key") or normalized.get("company_key") or "").strip()
-        or None
-    )
+        normalized.get("company_norm_key") or normalized.get("company_key") or ""
+    ).strip() or None
     return name_norm, norm_key
 
 
@@ -256,10 +254,7 @@ def _company_fill_if_empty(
 
     ph = _param_placeholder(is_pg)
     for field, value in updates:
-        sql = (
-            f"UPDATE companies SET {field} = COALESCE(NULLIF({field},''), {ph}) "
-            f"WHERE id = {ph}"
-        )
+        sql = f"UPDATE companies SET {field} = COALESCE(NULLIF({field},''), {ph}) WHERE id = {ph}"
         con.execute(sql, (value, company_id))
 
 
@@ -675,9 +670,7 @@ def _insert_person(con: Any, company_id: int, normalized: dict[str, Any]) -> Non
             res = compute_icp(person_for_icp, None, ICPCFG)
             payload["icp_score"] = int(res.score)
             payload["icp_reasons"] = json.dumps(res.reasons, ensure_ascii=False)
-            payload["last_scored_at"] = (
-                datetime.utcnow().isoformat(timespec="seconds") + "Z"
-            )
+            payload["last_scored_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         except Exception as e:  # best-effort; do not break ingest on scoring errors
             logger.warning("ICP scoring failed during insert; continuing without score: %s", e)
 

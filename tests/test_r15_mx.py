@@ -15,6 +15,7 @@ This is a source code bug in src/resolve/mx.py that needs to be fixed:
 
 The fix would be to use `chosen_domain` instead of `domain` in the SQL queries.
 """
+
 from __future__ import annotations
 
 import os
@@ -28,7 +29,7 @@ _IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 # Skip ALL tests in this module for PostgreSQL
 pytestmark = pytest.mark.skipif(
     _IS_POSTGRES,
-    reason="SOURCE BUG: mx.py queries 'domain' column but PostgreSQL has 'chosen_domain'"
+    reason="SOURCE BUG: mx.py queries 'domain' column but PostgreSQL has 'chosen_domain'",
 )
 
 

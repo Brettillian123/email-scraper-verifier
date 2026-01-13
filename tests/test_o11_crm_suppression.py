@@ -5,6 +5,7 @@ Tests for CRM suppression import functionality.
 Updated for PostgreSQL-only mode: uses src.db.get_conn() and
 src.db_suppression module instead of SQLite with a separate script.
 """
+
 from __future__ import annotations
 
 import csv

@@ -17,6 +17,7 @@ The underlying issue is in scripts/migrate_r21_search_indexing.py:
 This needs to be fixed in the source code to properly handle PostgreSQL
 dollar-quoted strings before these tests can run.
 """
+
 from __future__ import annotations
 
 import os
@@ -30,7 +31,7 @@ _IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 # Skip ALL tests in this module for PostgreSQL
 pytestmark = pytest.mark.skipif(
     _IS_POSTGRES,
-    reason="SOURCE BUG: migrate_r21._exec_multi() breaks $$ delimited PL/pgSQL functions"
+    reason="SOURCE BUG: migrate_r21._exec_multi() breaks $$ delimited PL/pgSQL functions",
 )
 
 

@@ -9,6 +9,7 @@ CRITICAL: Avoid placeholder emails that are filtered by quality_gates.py:
 - jane.doe, john.doe, jdoe, test@, example@, etc.
 Use realistic names like alice.smith, bob.wilson, maria.garcia, etc.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable

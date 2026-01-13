@@ -8,6 +8,7 @@ CRITICAL: Avoid placeholder emails that are filtered by quality_gates.py:
 - jane.doe, john.doe, jdoe, etc. are in the placeholder list
 Use realistic names like alice.smith, bob.wilson, maria.garcia, etc.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -24,6 +25,7 @@ from src.extract import Candidate, extract_candidates  # noqa: E402
 
 try:
     from scripts.extract_candidates import _persist_candidates  # noqa: E402
+
     HAS_PERSIST = True
 except ImportError:
     HAS_PERSIST = False

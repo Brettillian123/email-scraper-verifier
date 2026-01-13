@@ -24,9 +24,7 @@ def _getenv_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError as err:
-        raise ValueError(
-            f"Environment variable {name} must be an integer; got {raw!r}"
-        ) from err
+        raise ValueError(f"Environment variable {name} must be an integer; got {raw!r}") from err
 
 
 def _getenv_float(name: str, default: float) -> float:
@@ -34,9 +32,7 @@ def _getenv_float(name: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError as err:
-        raise ValueError(
-            f"Environment variable {name} must be a float; got {raw!r}"
-        ) from err
+        raise ValueError(f"Environment variable {name} must be a float; got {raw!r}") from err
 
 
 def _getenv_str(name: str, default: str) -> str:
@@ -144,8 +140,7 @@ def _getenv_user_agent(env_var: str, default: str) -> str:
 # Defaults expected by tests
 DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"
 DEFAULT_USER_AGENT = (
-    f"{BOT_NAME}/1.0 (+{CONTACT_URL}; contact: {CONTACT_EMAIL}; "
-    f"compatible; {BOT_NAME_ALIAS})"
+    f"{BOT_NAME}/1.0 (+{CONTACT_URL}; contact: {CONTACT_EMAIL}; compatible; {BOT_NAME_ALIAS})"
 )
 
 # ---------------------------------------------------------------------------

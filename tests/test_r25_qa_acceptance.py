@@ -13,6 +13,7 @@ These tests must be skipped when running against PostgreSQL.
 The conftest.py db_conn fixture would override our SQLite fixtures,
 causing connection type mismatches.
 """
+
 from __future__ import annotations
 
 import csv
@@ -31,7 +32,7 @@ _IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 # Skip all tests in this module if PostgreSQL is configured
 pytestmark = pytest.mark.skipif(
     _IS_POSTGRES,
-    reason="R25 tests use SQLite-specific features (PRAGMA, executescript, SqliteFtsBackend)"
+    reason="R25 tests use SQLite-specific features (PRAGMA, executescript, SqliteFtsBackend)",
 )
 
 # Directory where this test file lives
@@ -178,7 +179,7 @@ def _seed_known_verifications(conn: sqlite3.Connection) -> None:
                 "email_id": 1,
                 "verify_status": fixture.get(
                     ("crestwellpartners.com", "banderson@crestwellpartners.com"),
-                    {"expected_verify_status": "valid"}
+                    {"expected_verify_status": "valid"},
                 )["expected_verify_status"],
                 "verify_reason": "r25_fixture_valid",
                 "verified_mx": "mx.crestwellpartners.com",
@@ -188,7 +189,7 @@ def _seed_known_verifications(conn: sqlite3.Connection) -> None:
                 "email_id": 2,
                 "verify_status": fixture.get(
                     ("example.com", "bad-address@example.com"),
-                    {"expected_verify_status": "invalid"}
+                    {"expected_verify_status": "invalid"},
                 )["expected_verify_status"],
                 "verify_reason": "r25_fixture_invalid",
                 "verified_mx": "mx.example.com",
@@ -198,7 +199,7 @@ def _seed_known_verifications(conn: sqlite3.Connection) -> None:
                 "email_id": 3,
                 "verify_status": fixture.get(
                     ("catchall.test", "random@catchall.test"),
-                    {"expected_verify_status": "risky_catch_all"}
+                    {"expected_verify_status": "risky_catch_all"},
                 )["expected_verify_status"],
                 "verify_reason": "r25_fixture_catchall",
                 "verified_mx": "mx.catchall.test",
@@ -271,7 +272,7 @@ def test_r25_v_emails_latest_exposes_expected_fields(fresh_db: sqlite3.Connectio
 
     emails = [email for (_domain, email) in fixture.keys()]
     placeholders = ", ".join(["?"] * len(emails))
-    
+
     # Try to query v_emails_latest view
     try:
         cur = fresh_db.execute(

@@ -9,6 +9,7 @@ src.ingest.persist.upsert_row() explicitly raises RuntimeError:
 The ingest module's persistence layer only supports SQLite databases.
 This is a known limitation that would require source code changes to fix.
 """
+
 from __future__ import annotations
 
 import os
@@ -22,7 +23,7 @@ _IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 # Skip ALL tests in this module for PostgreSQL
 pytestmark = pytest.mark.skipif(
     _IS_POSTGRES,
-    reason="src.ingest.persist only supports SQLite (raises RuntimeError for PostgreSQL)"
+    reason="src.ingest.persist only supports SQLite (raises RuntimeError for PostgreSQL)",
 )
 
 
@@ -41,6 +42,7 @@ def enqueue_spy(monkeypatch):
 
     try:
         import src.queueing.tasks as tasks_mod
+
         monkeypatch.setattr(tasks_mod, "enqueue_task", fake_enqueue, raising=False)
     except (ImportError, AttributeError):
         pass

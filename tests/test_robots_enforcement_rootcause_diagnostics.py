@@ -30,6 +30,7 @@ RESOLUTION OPTIONS:
 
 These tests are SKIPPED until the User-Agent configuration is fixed.
 """
+
 from __future__ import annotations
 
 import os
@@ -56,8 +57,7 @@ except ImportError:
     CONFIGURED_UA = "Unknown"
 
 UA_MISMATCH_REASON = (
-    "UA mismatch - configured UA is "
-    f"'{CONFIGURED_UA}', tests expect 'Email-Scraper'"
+    f"UA mismatch - configured UA is '{CONFIGURED_UA}', tests expect 'Email-Scraper'"
 )
 
 # The tests expect "Email-Scraper" in the UA but the system uses "EmailVerifierBot"

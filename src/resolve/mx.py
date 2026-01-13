@@ -969,9 +969,7 @@ class MXInfo:
     mx_behavior: dict[str, Any] | None
 
 
-def get_or_resolve_mx(
-    domain: str, *, force: bool = False, db_path: str | None = None
-) -> MXInfo:
+def get_or_resolve_mx(domain: str, *, force: bool = False, db_path: str | None = None) -> MXInfo:
     """
     Lightweight helper used by R16 to get lowest_mx plus a behavior hint.
     Falls back to bare DNS if your R15 resolver isn't available.

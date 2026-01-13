@@ -14,9 +14,9 @@ def _get_setting_str(*names: str) -> str:
 def test_settings_loads_defaults() -> None:
     db_url = _get_setting_str("DB_URL", "DATABASE_URL", "db_url", "database_url")
     assert db_url, "No DB URL found on settings (tried DB_URL/DATABASE_URL/db_url/database_url)"
-    assert db_url.startswith(
-        ("sqlite://", "sqlite:///", "postgresql://", "postgres://")
-    ), f"Unexpected DB URL scheme: {db_url!r}"
+    assert db_url.startswith(("sqlite://", "sqlite:///", "postgresql://", "postgres://")), (
+        f"Unexpected DB URL scheme: {db_url!r}"
+    )
 
 
 def test_user_agent_has_name() -> None:

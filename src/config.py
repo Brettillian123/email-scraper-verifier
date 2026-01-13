@@ -406,6 +406,12 @@ class Settings:
     def ADMIN_ALLOWED_IPS(self) -> tuple[str, ...]:  # noqa: N802
         return self.admin_allowed_ips
 
+    # O27: AI people extraction config
+    openai_api_key: str | None = os.getenv("OPENAI_API_KEY", "").strip() or None
+    ai_people_model: str = _getenv_str("AI_PEOPLE_MODEL", "gpt-5-nano")
+    ai_people_enabled: bool = _getenv_bool("AI_PEOPLE_ENABLED", False)
+    ai_people_max_input_tokens: int = _getenv_int("AI_PEOPLE_MAX_INPUT_TOKENS", 1500)
+
 
 @dataclass(frozen=True)
 class QueueConfig:

@@ -1995,3 +1995,18 @@ def crawl_domain_for_company(domain: str, company_id: int, *, result: Any = None
     for p in pages:
         p.company_id = company_id
     return pages
+
+
+def crawl_domain_for_company(domain: str, company_id: int) -> list[Page]:
+    """
+    Convenience helper: crawl a domain and tag each Page with a company_id.
+
+    This does not touch the database; it simply runs the standard R10 crawl
+    and annotates the resulting Page objects. Callers can then pass the pages
+    to src.db_pages.save_pages(..., default_company_id=company_id) or rely
+    on save_pages() to read the Page.company_id attribute directly.
+    """
+    pages = crawl_domain(domain)
+    for p in pages:
+        p.company_id = company_id
+    return pages

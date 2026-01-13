@@ -125,6 +125,70 @@ class SqliteFtsBackend:
 
         return f"sqlite:mem:{id(self._conn)}"
 
+    def _annotate_verify_labels(self, leads: list[dict[str, Any]]) -> None:
+        """
+        O26 helper: mutate leads in-place to add verify_label and
+        is_primary_for_person flags where possible.
+
+        Strategy:
+
+          1) For rows without a person_id, compute a simple verify_label based
+             only on the row fields (no primary/alternate distinction).
+
+          2) For rows grouped by person_id, use choose_primary_index() to
+             select a canonical primary among valid addresses, then recompute
+             verify_label for each row in the group with is_primary set
+             appropriately.
+
+        This keeps all logic derived from a single pass over the already
+        fetched search results; no additional SQL is executed here.
+        """
+        if not leads:
+            return
+
+        # First pass: group rows by person_id, and give standalone rows a base
+        # verify_label so they still get something even if they are not part
+        # of a person group.
+        by_person: dict[Any, list[int]] = defaultdict(list)
+
+        for idx, lead in enumerate(leads):
+            person_id = lead.get("person_id")
+            if person_id is None:
+                # No person context; we can still compute a label, but we
+                # cannot mark primary vs alternate.
+                lead["verify_label"] = compute_verify_label_from_row(
+                    lead,
+                    is_primary=None,
+                )
+            else:
+                by_person[person_id].append(idx)
+
+        # Second pass: for each person with one or more rows, choose a primary
+        # among valid addresses (if any) and assign labels accordingly.
+        for _, indices in by_person.items():
+            if not indices:
+                continue
+
+            group_rows = [leads[i] for i in indices]
+            primary_idx = choose_primary_index(group_rows)
+
+            for rel_idx, global_idx in enumerate(indices):
+                lead = leads[global_idx]
+
+                # If there were no valid addresses for this person, we still
+                # want a coarse verify_label, but there is no concept of
+                # primary vs alternate.
+                if primary_idx is None:
+                    label = compute_verify_label_from_row(lead, is_primary=None)
+                    lead["verify_label"] = label
+                    # Do not set is_primary_for_person in this case.
+                    continue
+
+                is_primary = rel_idx == primary_idx
+                label = compute_verify_label_from_row(lead, is_primary=is_primary)
+                lead["verify_label"] = label
+                lead["is_primary_for_person"] = is_primary
+
     def search(self, params: LeadSearchParams) -> SearchResult:
         leads = search_people_leads(self._conn, params)
 

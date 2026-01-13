@@ -132,6 +132,36 @@ def _is_role_or_placeholder(addr: str, *, local_hint: str | None = None) -> bool
     return local in ROLE_ALIASES
 
 
+def _is_role_or_placeholder(addr: str, *, local_hint: str | None = None) -> bool:
+    """
+    Internal helper used by permutation generation to decide whether a candidate
+    local-part/email should be treated as a generic/role/placeholder address.
+
+    Resolution:
+      1) Prefer the central classifier in src.emails.classify (captures info@,
+         support@, hello@, example@, noreply@, info+foo@, etc.).
+      2) Fall back to legacy ROLE_ALIASES checks on the local-part.
+
+    This ensures we never generate or keep obviously non-personal addresses
+    as permutations for a specific person.
+    """
+    # 1) Central classifier (uses full addr, including '+' patterns and prefixes)
+    try:
+        if is_role_or_placeholder_email(addr):
+            return True
+    except Exception:
+        # If classifier is missing or misconfigured, we fall back to aliases only.
+        pass
+
+    # 2) Legacy alias-based check on local-part
+    local = local_hint
+    if not local:
+        local = addr.split("@", 1)[0]
+    local = local.lower()
+
+    return local in ROLE_ALIASES
+
+
 # ------------------------------
 # Name normalization (R12 legacy)
 # ------------------------------

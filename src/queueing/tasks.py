@@ -2039,6 +2039,7 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
         "R12 generated emails",
         extra={
             "person_id": person_id,
+            "company_id": company_id,
             "domain": dom,
             "first_norm": nf,
             "last_norm": nl,

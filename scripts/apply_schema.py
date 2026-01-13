@@ -415,4 +415,11 @@ def main(argv: Iterable[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--db",
+        dest="db_path",
+        help="Path to SQLite DB (overrides DATABASE_URL / default dev.db)",
+    )
+    args = parser.parse_args()
+    main(args.db_path)

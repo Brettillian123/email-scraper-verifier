@@ -43,6 +43,20 @@ from src.emails.classify import is_role_or_placeholder_email  # noqa: E402
 from src.extract import Candidate, extract_candidates  # noqa: E402
 from src.extract.url_filters import is_people_page_url
 
+# URL path hints that usually correspond to people/leadership/team pages
+PEOPLE_URL_HINTS = (
+    "team",
+    "our-team",
+    "our_team",
+    "leadership",
+    "people",
+    "staff",
+    "associates",
+    "partners",
+    "who-we-are",
+    "who_we_are",
+)
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="R11: extract people/emails from saved sources")

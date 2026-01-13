@@ -279,6 +279,8 @@ def test_5xx_maps_to_hard_fail(monkeypatch):
     assert res["ok"] is False
     assert res["category"] == "hard_fail"
     assert res["code"] == 550
+    assert len(calls) == 1
+    assert calls[0]["code"] == 550
 
     assert calls, "Expected MX behavior to be recorded at least once"
     assert calls[-1]["code"] == 550
@@ -299,6 +301,8 @@ def test_4xx_maps_to_temp_fail(monkeypatch):
     assert res["ok"] is False
     assert res["category"] == "temp_fail"
     assert res["code"] == 450
+    assert len(calls) == 1
+    assert calls[0]["code"] == 450
 
     assert calls, "Expected MX behavior to be recorded at least once"
     assert calls[-1]["code"] == 450

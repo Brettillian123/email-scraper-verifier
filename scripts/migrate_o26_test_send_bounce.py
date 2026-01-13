@@ -22,10 +22,6 @@ This migration adds the columns needed for bounce-based verification:
 and an index on verification_results.test_send_token to support fast
 lookup when processing bounce messages.
 
-Usage (example):
-
-    python scripts/migrate_o26_test_send_bounce.py data/dev.db
-
 The migration is idempotent:
   - It checks for existing columns before ALTER TABLE.
   - It uses CREATE INDEX IF NOT EXISTS for the new index.
@@ -33,77 +29,83 @@ The migration is idempotent:
 """
 
 import argparse
-import sqlite3
-from collections.abc import Iterable
-from pathlib import Path
+import os
+import sys
+from typing import Any
+
+from src.db import get_conn
 
 
-def _ensure_db_exists(db_path: str) -> None:
-    p = Path(db_path)
-    if not p.exists():
-        raise SystemExit(f"Database not found: {db_path}")
+def _apply_dsn_override(dsn: str | None) -> None:
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
+    os.environ["PG_DSN"] = dsn
 
 
-def _get_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}
+def _table_exists(cur: Any, *, schema: str, table: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+    row = cur.fetchone()
+    return row is not None and row[0] is not None
 
 
-def _execute_many(conn: sqlite3.Connection, statements: Iterable[str]) -> None:
-    cur = conn.cursor()
-    for stmt in statements:
-        cur.execute(stmt)
-    conn.commit()
+def _col_exists(cur: Any, *, schema: str, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = %s
+           AND table_name = %s
+           AND column_name = %s
+         LIMIT 1
+        """,
+        (schema, table, col),
+    )
+    return cur.fetchone() is not None
 
 
-# ---------- O26 schema helpers ----------
+def _index_exists(cur: Any, *, schema: str, name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{name}",))
+    row = cur.fetchone()
+    return row is not None and row[0] is not None
 
 
-def _migrate_verification_results(conn: sqlite3.Connection) -> None:
+def _migrate_verification_results(cur: Any, *, schema: str) -> None:
     """
     Ensure O26 test-send / bounce columns on verification_results.
     """
     table = "verification_results"
-    columns = _get_columns(conn, table)
+    if not _table_exists(cur, schema=schema, table=table):
+        raise RuntimeError(f'Table "{schema}.{table}" does not exist.')
 
-    statements: list[str] = []
+    fq = f'{schema}."{table}"'
 
-    if "test_send_status" not in columns:
+    if not _col_exists(cur, schema=schema, table=table, col="test_send_status"):
         # Default to "not_requested" so existing rows have a sensible state.
-        statements.append(
-            f"ALTER TABLE {table} ADD COLUMN test_send_status TEXT NOT NULL DEFAULT 'not_requested'"
+        cur.execute(
+            f"ALTER TABLE {fq} ADD COLUMN test_send_status TEXT NOT NULL DEFAULT 'not_requested'"
         )
 
-    if "test_send_token" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN test_send_token TEXT")
+    if not _col_exists(cur, schema=schema, table=table, col="test_send_token"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN test_send_token TEXT")
 
-    if "test_send_at" not in columns:
+    if not _col_exists(cur, schema=schema, table=table, col="test_send_at"):
         # Store timestamps as ISO8601 text, consistent with other *_at fields.
-        statements.append(f"ALTER TABLE {table} ADD COLUMN test_send_at TEXT")
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN test_send_at TEXT")
 
-    if "bounce_code" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN bounce_code TEXT")
+    if not _col_exists(cur, schema=schema, table=table, col="bounce_code"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN bounce_code TEXT")
 
-    if "bounce_reason" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN bounce_reason TEXT")
+    if not _col_exists(cur, schema=schema, table=table, col="bounce_reason"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN bounce_reason TEXT")
 
-    if statements:
-        print(f"Applying {len(statements)} schema changes to {table}...")
-        _execute_many(conn, statements)
-    else:
-        print(f"No schema changes needed for {table} (columns already present).")
-
-    # Index for fast bounce lookups by token.
-    # This is safe and idempotent due to IF NOT EXISTS.
-    print("Ensuring index idx_verif_test_send_token exists...")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_verif_test_send_token "
-        "ON verification_results(test_send_token)"
-    )
-    conn.commit()
+    # Index for fast bounce lookups by token (safe + idempotent).
+    idx_name = "idx_verif_test_send_token"
+    if not _index_exists(cur, schema=schema, name=idx_name):
+        cur.execute(f'CREATE INDEX {idx_name} ON {schema}."verification_results"(test_send_token)')
 
 
-def _migrate_domain_resolutions(conn: sqlite3.Connection) -> None:
+def _migrate_domain_resolutions(cur: Any, *, schema: str) -> None:
     """
     Ensure O26 domain-level delivery columns on domain_resolutions.
 
@@ -112,66 +114,89 @@ def _migrate_domain_resolutions(conn: sqlite3.Connection) -> None:
       - backfill_o26_upgrade_risky_to_valid.py
     """
     table = "domain_resolutions"
-    columns = _get_columns(conn, table)
+    if not _table_exists(cur, schema=schema, table=table):
+        raise RuntimeError(f'Table "{schema}.{table}" does not exist.')
 
-    statements: list[str] = []
+    fq = f'{schema}."{table}"'
 
-    if "delivery_catchall_status" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN delivery_catchall_status TEXT")
+    if not _col_exists(cur, schema=schema, table=table, col="delivery_catchall_status"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN delivery_catchall_status TEXT")
 
-    if "delivery_catchall_checked_at" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN delivery_catchall_checked_at TEXT")
+    if not _col_exists(cur, schema=schema, table=table, col="delivery_catchall_checked_at"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN delivery_catchall_checked_at TEXT")
 
-    if "domain" not in columns:
-        statements.append(f"ALTER TABLE {table} ADD COLUMN domain TEXT")
-
-    if statements:
-        print(f"Applying {len(statements)} schema changes to {table}...")
-        _execute_many(conn, statements)
-    else:
-        print(f"No schema changes needed for {table} (columns already present).")
+    if not _col_exists(cur, schema=schema, table=table, col="domain"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN domain TEXT")
 
     # Backfill domain from chosen_domain where missing/empty.
-    conn.execute(
-        """
-        UPDATE domain_resolutions
-        SET domain = chosen_domain
-        WHERE (domain IS NULL OR domain = '')
-          AND chosen_domain IS NOT NULL
+    cur.execute(
+        f"""
+        UPDATE {fq}
+           SET domain = chosen_domain
+         WHERE (domain IS NULL OR domain = '')
+           AND chosen_domain IS NOT NULL
         """
     )
-    conn.commit()
 
 
-def migrate(conn: sqlite3.Connection) -> None:
+def migrate(cur: Any, *, schema: str) -> None:
     """
-    Apply the O26 migration to the given SQLite connection.
+    Apply the O26 migration.
 
     Idempotent and safe to run multiple times.
     """
-    _migrate_domain_resolutions(conn)
-    _migrate_verification_results(conn)
-    print("O26 migration complete.")
+    _migrate_domain_resolutions(cur, schema=schema)
+    _migrate_verification_results(cur, schema=schema)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="O26: Ensure test-send/bounce fields and domain delivery flags."
+        description="O26: Ensure test-send/bounce fields and domain delivery flags (PostgreSQL)."
     )
     parser.add_argument(
-        "db_path",
-        help="Path to the SQLite database (e.g. data/dev.db)",
+        "--dsn",
+        "--db",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL/PG_DSN for this run).",
+    )
+    parser.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target schema (default: public, or PGSCHEMA env var).",
     )
     args = parser.parse_args()
+    _apply_dsn_override(args.dsn)
 
-    _ensure_db_exists(args.db_path)
-
-    conn = sqlite3.connect(args.db_path)
+    conn = get_conn()
     try:
-        migrate(conn)
+        cur = conn.cursor()
+        try:
+            migrate(cur, schema=args.schema)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    print("O26 migration complete.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise

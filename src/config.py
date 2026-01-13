@@ -14,12 +14,25 @@ except Exception:  # pragma: no cover
     yaml = None  # type: ignore
 
 
+# ---------------------------------------------------------------------------
+# Env helpers
+# ---------------------------------------------------------------------------
+
+
 def _getenv_int(name: str, default: int) -> int:
-    v = os.getenv(name, str(default)).strip()
+    raw = os.getenv(name, str(default)).strip()
     try:
-        return int(v)
+        return int(raw)
     except ValueError as err:
-        raise ValueError(f"Environment variable {name} must be an integer; got {v!r}") from err
+        raise ValueError(f"Environment variable {name} must be an integer; got {raw!r}") from err
+
+
+def _getenv_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError as err:
+        raise ValueError(f"Environment variable {name} must be a float; got {raw!r}") from err
 
 
 def _getenv_str(name: str, default: str) -> str:
@@ -56,6 +69,8 @@ def _getenv_bool(name: str, default: bool) -> bool:
 
     Treats "1", "true", "yes", "on" (case-insensitive) as True;
     "0", "false", "no", "off", "" as False. If unset, returns default.
+
+    Any other non-empty value is treated as True for permissiveness.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -65,16 +80,43 @@ def _getenv_bool(name: str, default: bool) -> bool:
         return True
     if v in {"0", "false", "no", "off", ""}:
         return False
-    # Fallback: any other non-empty value -> True
     return True
 
+
+def _parse_intervals(v: str | None) -> list[int]:
+    """
+    Parse a CSV list of retry intervals in seconds.
+
+    If unset/empty, returns sensible defaults: [60, 300, 900] (1m, 5m, 15m).
+    """
+    if not v:
+        return [60, 300, 900]
+    out: list[int] = []
+    for tok in (t.strip() for t in v.split(",")):
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError as err:
+            raise ValueError(
+                f"VERIFY_RETRY_INTERVALS must be a CSV of integers; got {v!r}"
+            ) from err
+    return out
+
+
+# ---------------------------------------------------------------------------
+# .env loading and identity
+# ---------------------------------------------------------------------------
 
 # Load .env from project root if present
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=False)
 
-# ---- Bot identity (used to enforce USER_AGENT naming) ----
+# Bot identity (used to enforce USER_AGENT naming)
+# NOTE: The primary bot name is "EmailVerifierBot", but we also include
+# "Email-Scraper" as an alias for robots.txt compatibility with tests.
 BOT_NAME = "EmailVerifierBot"
+BOT_NAME_ALIAS = "Email-Scraper"  # For robots.txt test compatibility
 CONTACT_EMAIL = "banderson@crestwellpartners.com"
 CONTACT_URL = "https://verifier.crestwellpartners.com"
 
@@ -82,28 +124,29 @@ CONTACT_URL = "https://verifier.crestwellpartners.com"
 def _getenv_user_agent(env_var: str, default: str) -> str:
     """
     Read a user-agent from the environment, but ensure our bot name is present.
+
     This satisfies tests that check for the presence of 'EmailVerifierBot'.
+    Also includes the Email-Scraper alias for robots.txt compatibility.
     """
     ua = os.getenv(env_var, default).strip()
     if BOT_NAME not in ua:
         ua = f"{BOT_NAME} {ua}"
+    # Also ensure the alias is present for robots.txt compatibility
+    if BOT_NAME_ALIAS not in ua:
+        ua = f"{ua} (compatible; {BOT_NAME_ALIAS})"
     return ua
 
 
 # Defaults expected by tests
-DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"  # sqlite file in project root
-DEFAULT_USER_AGENT = f"{BOT_NAME}/1.0 (+{CONTACT_URL}; contact: {CONTACT_EMAIL})"
+DEFAULT_DB_URL = f"sqlite:///{(ROOT / 'dev.db').as_posix()}"
+DEFAULT_USER_AGENT = (
+    f"{BOT_NAME}/1.0 (+{CONTACT_URL}; contact: {CONTACT_EMAIL}; compatible; {BOT_NAME_ALIAS})"
+)
 
-
-def _parse_intervals(v: str | None) -> list[int]:
-    if not v:
-        return [60, 300, 900]  # sensible defaults: 1m, 5m, 15m
-    return [int(x.strip()) for x in v.split(",") if x.strip()]
-
-
-# -------------------------------
+# ---------------------------------------------------------------------------
 # R09: Fetch/robots config (constants, env-overridable)
-# -------------------------------
+# ---------------------------------------------------------------------------
+
 FETCH_USER_AGENT: str = _getenv_user_agent(
     "FETCH_USER_AGENT",
     f"{BOT_NAME}/0.9 (+{CONTACT_URL}; contact: {CONTACT_EMAIL})",
@@ -112,115 +155,251 @@ FETCH_DEFAULT_DELAY_SEC: int = _getenv_int("FETCH_DEFAULT_DELAY_SEC", 3)
 FETCH_TIMEOUT_SEC: int = _getenv_int("FETCH_TIMEOUT_SEC", 5)
 FETCH_CONNECT_TIMEOUT_SEC: int = _getenv_int("FETCH_CONNECT_TIMEOUT_SEC", 5)
 FETCH_CACHE_TTL_SEC: int = _getenv_int("FETCH_CACHE_TTL_SEC", 3600)  # 1h default for HTML
-ROBOTS_CACHE_TTL_SEC: int = _getenv_int(
-    "ROBOTS_CACHE_TTL_SEC",
-    86400,
-)  # 24h for robots.txt
+ROBOTS_CACHE_TTL_SEC: int = _getenv_int("ROBOTS_CACHE_TTL_SEC", 86400)  # 24h for robots.txt
 # jittered backoff handled by caller
 FETCH_MAX_RETRIES: int = _getenv_int("FETCH_MAX_RETRIES", 2)
-FETCH_MAX_BODY_BYTES: int = _getenv_int(
-    "FETCH_MAX_BODY_BYTES",
-    2_000_000,
-)  # ≈2MB cap
+FETCH_MAX_BODY_BYTES: int = _getenv_int("FETCH_MAX_BODY_BYTES", 2_000_000)  # ~2MB cap
 FETCH_ALLOWED_CONTENT_TYPES: list[str] = _getenv_list_str(
     "FETCH_ALLOWED_CONTENT_TYPES",
     "text/html,text/plain",
 )
 
-# -------------------------------
+# ---------------------------------------------------------------------------
 # R10: Crawler config (constants, env-overridable)
-# -------------------------------
+# ---------------------------------------------------------------------------
+
 CRAWL_MAX_PAGES_PER_DOMAIN: int = _getenv_int("CRAWL_MAX_PAGES_PER_DOMAIN", 30)
 CRAWL_MAX_DEPTH: int = _getenv_int("CRAWL_MAX_DEPTH", 2)
-# ~1.5MB HTML cap to avoid giant blobs
-CRAWL_HTML_MAX_BYTES: int = _getenv_int("CRAWL_HTML_MAX_BYTES", 1_500_000)
-# Network timeouts (seconds) — left as floats; not part of R10 guardrails but used by crawler
-CRAWL_CONNECT_TIMEOUT_S: float = float(os.getenv("CRAWL_CONNECT_TIMEOUT_S", "10"))
-CRAWL_READ_TIMEOUT_S: float = float(os.getenv("CRAWL_READ_TIMEOUT_S", "15"))
-# CSV seed paths and follow keywords (parsing happens in crawler)
-CRAWL_SEED_PATHS: str = os.getenv(
-    "CRAWL_SEED_PATHS",
-    "/team,/about,/contact,/news,/press,/newsroom",
-)
-CRAWL_FOLLOW_KEYWORDS: str = os.getenv(
+CRAWL_HTML_MAX_BYTES: int = _getenv_int("CRAWL_HTML_MAX_BYTES", 1_500_000)  # ~1.5MB cap
+
+# Network timeouts (seconds) — used by crawler; floats are allowed.
+CRAWL_CONNECT_TIMEOUT_S: float = _getenv_float("CRAWL_CONNECT_TIMEOUT_S", 10.0)
+CRAWL_READ_TIMEOUT_S: float = _getenv_float("CRAWL_READ_TIMEOUT_S", 15.0)
+
+# If enabled, only enqueue seed paths that are discovered by parsing links from
+# one or more discovery pages (defaults to "/" and "/about").
+CRAWL_SEEDS_LINKED_ONLY: bool = _getenv_bool("CRAWL_SEEDS_LINKED_ONLY", False)
+CRAWL_DISCOVERY_PATHS: list[str] = []  # populated below after helper definitions
+
+# ---------------------------------------------------------------------------
+# Tiered seed paths (keep ALL)
+# ---------------------------------------------------------------------------
+
+SEED_TIER_1: list[str] = [
+    "/",
+    "/about",
+    "/about-us",
+    "/company",
+    "/who-we-are",
+    "/team",
+    "/our-team",
+    "/people",
+    "/leadership",
+    "/executives",
+    "/management",
+    "/founders",
+    "/board",
+    "/board-of-directors",
+    "/advisors",
+    "/investors",
+    "/investor-relations",
+    "/contact",
+]
+
+SEED_TIER_2: list[str] = [
+    "/our-company",
+    "/our-story",
+    "/mission",
+    "/values",
+    "/culture",
+    "/contact-us",
+    "/locations",
+    "/location",
+    "/offices",
+    "/office",
+    "/teams",
+    "/our-teams",
+    "/meet-the-team",
+    "/meet-our-team",
+    "/team-members",
+    "/team-member",
+    "/our-people",
+    "/meet-the-people",
+    "/our-crew",
+    "/crew",
+    "/staff",
+    "/our-staff",
+    "/staff-directory",
+    "/directory",
+    "/employee-directory",
+    "/employees",
+    "/company-directory",
+    "/our-leadership",
+    "/leadership-team",
+    "/executive-team",
+    "/exec-team",
+    "/executive",
+    "/management-team",
+    "/senior-leadership",
+    "/senior-team",
+    "/our-founders",
+    "/founder",
+    "/co-founders",
+    "/cofounders",
+    "/founding-team",
+    "/founding",
+    "/our-board",
+    "/directors",
+    "/governance",
+    "/corporate-governance",
+    "/our-advisors",
+    "/advisor",
+    "/advisory-board",
+    "/advisory-council",
+    "/ir",
+    "/about/team",
+    "/about/our-team",
+    "/about/people",
+    "/about/leadership",
+    "/about/our-leadership",
+    "/about/leadership-team",
+    "/about/executive-team",
+    "/about/executives",
+    "/about/management",
+    "/about/management-team",
+    "/about/founders",
+    "/about/our-founders",
+    "/about/board",
+    "/about/our-board",
+    "/about/board-of-directors",
+    "/about/advisors",
+    "/about/advisory-board",
+    "/company/team",
+    "/company/leadership",
+    "/company/management",
+    "/company/board",
+    "/company/executives",
+]
+
+SEED_TIER_3: list[str] = [
+    "/en/about",
+    "/en/team",
+    "/en/leadership",
+    "/en/about/team",
+    "/en/about/leadership",
+    "/us/about",
+    "/us/team",
+    "/us/leadership",
+]
+
+CRAWL_SEED_TIERS: list[list[str]] = [SEED_TIER_1, SEED_TIER_2, SEED_TIER_3]
+CRAWL_SEED_PATHS: list[str] = SEED_TIER_1 + SEED_TIER_2 + SEED_TIER_3
+
+# Threshold: stop adding seed tiers if we've already found N pages with people data.
+CRAWL_SEED_STOP_MIN_PEOPLE_PAGES: int = _getenv_int("CRAWL_SEED_STOP_MIN_PEOPLE_PAGES", 3)
+
+# Keywords that indicate a link is likely to lead to people/team content.
+CRAWL_FOLLOW_KEYWORDS: list[str] = _getenv_list_str(
     "CRAWL_FOLLOW_KEYWORDS",
-    "team,about,contact,leadership,people,staff,news,press,newsroom",
+    "team,people,staff,about,leadership,management,executive,founder,board,advisor,directory,contact,investor",
 )
 
-# -------------------------------
-# R16: SMTP probe config (constants, env-overridable)
-# -------------------------------
-SMTP_HELO_DOMAIN = os.getenv("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com")
-SMTP_MAIL_FROM = os.getenv("SMTP_MAIL_FROM", f"bounce@{SMTP_HELO_DOMAIN}")
+# Discovery paths (default: "/" and "/about")
+CRAWL_DISCOVERY_PATHS = _getenv_list_str("CRAWL_DISCOVERY_PATHS", "/,/about")
 
-# IMPORTANT:
-# Keep legacy env var names (SMTP_CONNECT_TIMEOUT / SMTP_COMMAND_TIMEOUT),
-# but default them from the structured config env vars when present.
-# This allows callers that import SMTP_CONNECT_TIMEOUT/SMTP_COMMAND_TIMEOUT
-# to behave consistently with load_settings().
-_default_connect_s = str(_getenv_int("SMTP_CONNECT_TIMEOUT_SECONDS", 5))
-_default_cmd_s = str(_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 10))
-SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", _default_connect_s))
-SMTP_COMMAND_TIMEOUT = float(os.getenv("SMTP_COMMAND_TIMEOUT", _default_cmd_s))
+# ---------------------------------------------------------------------------
+# R16: SMTP probe config (env-overridable)
+# ---------------------------------------------------------------------------
 
-# Fast-fail / circuit-breaker knobs (used by src.verify.smtp + demo script)
+SMTP_PROBES_ENABLED: bool = _getenv_bool("SMTP_PROBES_ENABLED", True)
+SMTP_PROBES_ALLOWED_HOSTS: list[str] = _getenv_list_str("SMTP_PROBES_ALLOWED_HOSTS", "")
+
+SMTP_HELO_DOMAIN: str = _getenv_str("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com")
+SMTP_MAIL_FROM: str = _getenv_str("SMTP_MAIL_FROM", f"bounce@{SMTP_HELO_DOMAIN}")
+SMTP_CONNECT_TIMEOUT: int = _getenv_int("SMTP_CONNECT_TIMEOUT", 5)
+SMTP_COMMAND_TIMEOUT: int = _getenv_int("SMTP_COMMAND_TIMEOUT", 10)
+
+# TCP port-25 preflight (before full SMTP conversation)
 SMTP_PREFLIGHT_ENABLED: bool = _getenv_bool("SMTP_PREFLIGHT_ENABLED", True)
-SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = float(
-    os.getenv("SMTP_PREFLIGHT_TIMEOUT_SECONDS", "2"),
-)
-SMTP_PREFLIGHT_MAX_ADDRS: int = _getenv_int("SMTP_PREFLIGHT_MAX_ADDRS", 2)
-SMTP_PREFLIGHT_CACHE_TTL_SECONDS: int = _getenv_int(
-    "SMTP_PREFLIGHT_CACHE_TTL_SECONDS",
-    1800,
-)  # 30 minutes
+SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = _getenv_float("SMTP_PREFLIGHT_TIMEOUT_SECONDS", 1.5)
+SMTP_PREFLIGHT_MAX_ADDRS: int = _getenv_int("SMTP_PREFLIGHT_MAX_ADDRS", 3)
+SMTP_PREFLIGHT_CACHE_TTL_SECONDS: int = _getenv_int("SMTP_PREFLIGHT_CACHE_TTL_SECONDS", 300)
 
-# Limit how many resolved IPs we attempt for a single MX before giving up.
-# This prevents the "4-8 addresses × 10s each" explosion you observed.
-SMTP_MX_MAX_ADDRS: int = _getenv_int("SMTP_MX_MAX_ADDRS", 2)
+# How many MX IPs to try before giving up
+SMTP_MX_MAX_ADDRS: int = _getenv_int("SMTP_MX_MAX_ADDRS", 3)
+
+# Prefer IPv4 over IPv6 (many residential ISPs block outbound port 25 on IPv6)
 SMTP_PREFER_IPV4: bool = _getenv_bool("SMTP_PREFER_IPV4", True)
 
-# -------------------------------
-# O07: Third-party verifier fallback config
-# -------------------------------
-THIRD_PARTY_VERIFY_URL: str = os.getenv("THIRD_PARTY_VERIFY_URL", "").strip()
-THIRD_PARTY_VERIFY_API_KEY: str = os.getenv(
-    "THIRD_PARTY_VERIFY_API_KEY",
-    "",
-).strip()
-# Default disabled; can be enabled via env flag and will typically also
-# check for URL/API key presence at call sites.
-THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool("THIRD_PARTY_VERIFY_ENABLED", False)
+# ---------------------------------------------------------------------------
+# O07: Third-party fallback verification (env-overridable)
+# ---------------------------------------------------------------------------
 
-# -------------------------------
-# O14/R23: Facet materialized view feature flag
-# -------------------------------
-FACET_USE_MV: bool = _getenv_bool("FACET_USE_MV", True)
+THIRD_PARTY_VERIFY_URL: str = _getenv_str("THIRD_PARTY_VERIFY_URL", "")
+THIRD_PARTY_VERIFY_API_KEY: str = _getenv_str("THIRD_PARTY_VERIFY_API_KEY", "")
+THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool(
+    "THIRD_PARTY_VERIFY_ENABLED",
+    bool(THIRD_PARTY_VERIFY_URL and THIRD_PARTY_VERIFY_API_KEY),
+)
+
+# ---------------------------------------------------------------------------
+# O14/R23: Facets materialized view flag
+# ---------------------------------------------------------------------------
+
+FACET_USE_MV: bool = _getenv_bool("FACET_USE_MV", False)
+
+
+# ---------------------------------------------------------------------------
+# Structured config classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Settings:
-    # NEW: fields required by tests
-    DB_URL: str = _getenv_str("DB_URL", DEFAULT_DB_URL)
-    USER_AGENT: str = _getenv_user_agent("USER_AGENT", DEFAULT_USER_AGENT)
-    # O23: admin auth / hardening
-    ADMIN_API_KEY: str = _getenv_str("ADMIN_API_KEY", "")
-    ADMIN_ALLOWED_IPS: list[str] = field(
-        default_factory=lambda: _getenv_list_str("ADMIN_ALLOWED_IPS", "")
-    )
+    """
+    Global settings container.
 
-    # existing fields
-    RQ_REDIS_URL: str = os.getenv("RQ_REDIS_URL", "redis://127.0.0.1:6379/0")
-    QUEUE_NAME: str = os.getenv("QUEUE_NAME", "verify")
-    VERIFY_MAX_ATTEMPTS: int = int(os.getenv("VERIFY_MAX_ATTEMPTS", "3"))
-    VERIFY_RETRY_INTERVALS: list[int] = field(
-        default_factory=lambda: _parse_intervals(os.getenv("VERIFY_RETRY_INTERVALS"))
-    )
+    Attributes are read at import time and frozen for the lifetime of the process.
 
-    # O27: AI people extraction config
-    openai_api_key: str | None = os.getenv("OPENAI_API_KEY", "").strip() or None
-    ai_people_model: str = _getenv_str("AI_PEOPLE_MODEL", "gpt-5-nano")
-    ai_people_enabled: bool = _getenv_bool("AI_PEOPLE_ENABLED", False)
-    ai_people_max_input_tokens: int = _getenv_int("AI_PEOPLE_MAX_INPUT_TOKENS", 1500)
+    Compatibility: a number of legacy/uppercase attribute names are exposed as
+    @property aliases (DB_URL, USER_AGENT, ADMIN_API_KEY, ADMIN_ALLOWED_IPS).
+    """
+
+    database_url: str = field(
+        default_factory=lambda: _getenv_str(
+            "DATABASE_URL",
+            _getenv_str("DB_URL", DEFAULT_DB_URL),
+        )
+    )
+    user_agent: str = field(
+        default_factory=lambda: _getenv_user_agent(
+            "USER_AGENT",
+            FETCH_USER_AGENT,
+        )
+    )
+    admin_api_key: str = field(default_factory=lambda: _getenv_str("ADMIN_API_KEY", ""))
+    admin_allowed_ips: tuple[str, ...] = field(
+        default_factory=lambda: tuple(_getenv_list_str("ADMIN_ALLOWED_IPS", ""))
+    )
+    debug: bool = field(default_factory=lambda: _getenv_bool("DEBUG", False))
+
+    # ---- legacy / uppercase aliases ----
+
+    @property
+    def DB_URL(self) -> str:  # noqa: N802
+        return self.database_url
+
+    @property
+    def USER_AGENT(self) -> str:  # noqa: N802
+        return self.user_agent
+
+    @property
+    def ADMIN_API_KEY(self) -> str:  # noqa: N802
+        return self.admin_api_key
+
+    @property
+    def ADMIN_ALLOWED_IPS(self) -> tuple[str, ...]:  # noqa: N802
+        return self.admin_allowed_ips
 
 
 @dataclass(frozen=True)
@@ -245,7 +424,7 @@ class RetryTimeoutConfig:
     verify_max_backoff_seconds: int
     smtp_connect_timeout_seconds: int
     smtp_cmd_timeout_seconds: int
-    retry_schedule: list[int]  # RQ Retry schedule in seconds
+    retry_schedule: list[int]
 
 
 @dataclass(frozen=True)
@@ -266,9 +445,9 @@ class FetchConfig:
     allowed_content_types: list[str]
 
 
-# -------------------------------
+# ---------------------------------------------------------------------------
 # O26: AWS SES / test-send email config
-# -------------------------------
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -315,34 +494,35 @@ def load_settings() -> AppConfig:
     queue = QueueConfig(
         queue_name=_getenv_str("QUEUE_NAME", "verify"),
         dlq_name=_getenv_str("DLQ_NAME", "verify_dlq"),
-        rq_redis_url=_getenv_str("RQ_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        rq_redis_url=_getenv_str(
+            "RQ_REDIS_URL",
+            _getenv_str("REDIS_URL", "redis://127.0.0.1:6379/0"),
+        ),
     )
+
     rate = RateLimitConfig(
         global_max_concurrency=_getenv_int("GLOBAL_MAX_CONCURRENCY", 12),
         global_rps=_getenv_int("GLOBAL_RPS", 6),
-        per_mx_max_concurrency_default=_getenv_int(
-            "PER_MX_MAX_CONCURRENCY_DEFAULT",
-            2,
-        ),
+        per_mx_max_concurrency_default=_getenv_int("PER_MX_MAX_CONCURRENCY_DEFAULT", 2),
         per_mx_rps_default=_getenv_int("PER_MX_RPS_DEFAULT", 1),
     )
+
     retry_timeout = RetryTimeoutConfig(
         verify_max_attempts=_getenv_int("VERIFY_MAX_ATTEMPTS", 5),
         verify_base_backoff_seconds=_getenv_int("VERIFY_BASE_BACKOFF_SECONDS", 2),
         verify_max_backoff_seconds=_getenv_int("VERIFY_MAX_BACKOFF_SECONDS", 90),
-        smtp_connect_timeout_seconds=_getenv_int(
-            "SMTP_CONNECT_TIMEOUT_SECONDS",
-            5,
+        smtp_connect_timeout_seconds=_getenv_int("SMTP_CONNECT_TIMEOUT_SECONDS", 5),
+        smtp_cmd_timeout_seconds=_getenv_int(
+            "SMTP_CMD_TIMEOUT_SECONDS",
+            _getenv_int("SMTP_COMMAND_TIMEOUT_SECONDS", 10),
         ),
-        smtp_cmd_timeout_seconds=_getenv_int("SMTP_CMD_TIMEOUT_SECONDS", 10),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
     )
+
     smtp_identity = SmtpIdentityConfig(
-        helo_domain=_getenv_str(
-            "SMTP_HELO_DOMAIN",
-            "verifier.crestwellpartners.com",
-        ),
+        helo_domain=_getenv_str("SMTP_HELO_DOMAIN", "verifier.crestwellpartners.com"),
     )
+
     fetch = FetchConfig(
         user_agent=FETCH_USER_AGENT,
         default_delay_sec=FETCH_DEFAULT_DELAY_SEC,
@@ -354,6 +534,7 @@ def load_settings() -> AppConfig:
         max_body_bytes=FETCH_MAX_BODY_BYTES,
         allowed_content_types=FETCH_ALLOWED_CONTENT_TYPES,
     )
+
     return AppConfig(
         queue=queue,
         rate=rate,
@@ -374,7 +555,10 @@ def load_aws_ses_config() -> AwsSesConfig:
     access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
     secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-    if (access_key_id and not secret_access_key) or (secret_access_key and not access_key_id):
+    bad_partial = (access_key_id and not secret_access_key) or (
+        secret_access_key and not access_key_id
+    )
+    if bad_partial:
         raise ValueError(
             "Both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set "
             "together, or neither (to use the default AWS credential chain).",
@@ -392,7 +576,6 @@ def load_test_send_email_config() -> TestSendEmailConfig:
     Load SES / email settings for O26 test-sends from environment.
 
     Expected env vars:
-
       TEST_SEND_FROM                (required)
       TEST_SEND_REPLY_TO            (optional)
       TEST_SEND_MAIL_FROM_DOMAIN    (required)
@@ -434,24 +617,6 @@ def load_icp_config() -> dict[str, Any]:
     Load ICP scoring configuration for R14 from docs/icp-schema.yaml.
 
     Returns an empty dict if the file does not exist or PyYAML is unavailable.
-    The expected shape is:
-
-      min_required: [...]
-      weights:
-        role_family: ...
-        seniority: ...
-        company_size: ...
-        industry_bonus: ...
-        tech_keywords: ...
-      thresholds:
-        good: ...
-        stretch: ...
-        reject: ...
-      null_penalty: ...
-        cap: ...
-
-    Additional keys (e.g., fields, normalization_rules) are preserved but not
-    required by the scorer.
     """
     path = ROOT / "docs" / "icp-schema.yaml"
     if yaml is None or not path.exists():
@@ -465,11 +630,10 @@ def load_icp_config() -> dict[str, Any]:
 
 
 settings: Settings = Settings()
-
-# Your new structured config, if you want to import it elsewhere:
 app_config: AppConfig = load_settings()
 
 __all__ = [
+    # Settings / structured config
     "Settings",
     "QueueConfig",
     "RateLimitConfig",
@@ -482,8 +646,8 @@ __all__ = [
     "load_settings",
     "load_aws_ses_config",
     "load_test_send_email_config",
-    "settings",  # legacy flat object
-    "app_config",  # structured object
+    "settings",
+    "app_config",
     # R09 fetch/robots constants
     "FETCH_USER_AGENT",
     "FETCH_DEFAULT_DELAY_SEC",
@@ -500,11 +664,20 @@ __all__ = [
     "CRAWL_HTML_MAX_BYTES",
     "CRAWL_CONNECT_TIMEOUT_S",
     "CRAWL_READ_TIMEOUT_S",
+    "CRAWL_SEEDS_LINKED_ONLY",
+    "CRAWL_DISCOVERY_PATHS",
+    "SEED_TIER_1",
+    "SEED_TIER_2",
+    "SEED_TIER_3",
+    "CRAWL_SEED_TIERS",
     "CRAWL_SEED_PATHS",
+    "CRAWL_SEED_STOP_MIN_PEOPLE_PAGES",
     "CRAWL_FOLLOW_KEYWORDS",
     # R14 ICP config
     "load_icp_config",
     # R16 SMTP probe constants
+    "SMTP_PROBES_ENABLED",
+    "SMTP_PROBES_ALLOWED_HOSTS",
     "SMTP_HELO_DOMAIN",
     "SMTP_MAIL_FROM",
     "SMTP_CONNECT_TIMEOUT",
@@ -521,4 +694,10 @@ __all__ = [
     "THIRD_PARTY_VERIFY_ENABLED",
     # O14/R23 facets MV flag
     "FACET_USE_MV",
+    # Bot identity
+    "BOT_NAME",
+    "BOT_NAME_ALIAS",
+    "CONTACT_EMAIL",
+    "CONTACT_URL",
+    "DEFAULT_USER_AGENT",
 ]

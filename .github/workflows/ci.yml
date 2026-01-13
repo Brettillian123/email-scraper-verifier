@@ -5,9 +5,43 @@ on:
   push:
     branches: [main]
 
+env:
+  # Test DB/Redis URLs for CI jobs. Credentials are supplied via the service env below.
+  DATABASE_URL: postgresql://postgres@localhost:5432/email_scraper_test
+  DB_URL: postgresql://postgres@localhost:5432/email_scraper_test
+  REDIS_URL: redis://localhost:6379/0
+  RQ_REDIS_URL: redis://localhost:6379/0
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+
+    services:
+      # PostgreSQL service container
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: email_scraper_test
+        ports:
+          - 5432:5432
+        # Health check to ensure Postgres is ready before tests
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      # Redis service container (for RQ tests)
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout
@@ -49,16 +83,34 @@ jobs:
           python -m pip install -r requirements.txt
           # Install test deps from the file in the repo
           python -m pip install -r tests/requirements-test.txt
-          # Belt-and-suspenders: ensure respx is present even if the file didn’t include it
-          python -m pip install "respx>=0.21"
+          # Belt-and-suspenders: ensure respx and psycopg2-binary are present
+          python -m pip install "respx>=0.21" "psycopg2-binary>=2.9.9"
           # Install your project so imports like "src.fetch" resolve
           python -m pip install -e .
 
       - name: Verify test deps
         run: |
           python -c "import respx, httpx; print('respx', respx.__version__, 'httpx', httpx.__version__)"
-          python -m pip show respx || true
-          python -m pip freeze | grep -E '^(httpx|respx|pytest)=='
+          python -c "import psycopg2; print('psycopg2 version:', psycopg2.__version__)"
+          python -m pip show respx psycopg2-binary || true
+          python -m pip freeze | grep -E '^(httpx|respx|pytest|psycopg2)=='
+
+      # Verify PostgreSQL connection
+      - name: Verify PostgreSQL connection
+        run: |
+          python -c "
+          import psycopg2
+          conn = psycopg2.connect('${{ env.DATABASE_URL }}')
+          cur = conn.cursor()
+          cur.execute('SELECT version();')
+          print('PostgreSQL:', cur.fetchone()[0])
+          conn.close()
+          "
+
+      # Apply database schema
+      - name: Apply database schema
+        run: |
+          python scripts/apply_schema.py --db "${{ env.DATABASE_URL }}"
 
       # Linting (checks only; no formatting in CI)
       - name: Ruff (lint)
@@ -80,4 +132,26 @@ jobs:
 
       - name: Run tests
         # DO NOT set PYTHONPATH=src; it can shadow stdlib 'queue'
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          DB_URL: ${{ env.DB_URL }}
+          REDIS_URL: ${{ env.REDIS_URL }}
+          RQ_REDIS_URL: ${{ env.RQ_REDIS_URL }}
         run: pytest -q
+
+      # Optional: Run specific acceptance tests
+      - name: Schema verification
+        run: |
+          python -c "
+          from src.db import get_conn
+          with get_conn() as conn:
+              # Check key tables exist
+              for table in ['tenants', 'companies', 'people', 'emails', 'verification_results']:
+                  cur = conn.execute('''
+                      SELECT 1 FROM information_schema.tables
+                      WHERE table_schema = 'public' AND table_name = %s
+                  ''', (table,))
+                  if not cur.fetchone():
+                      raise AssertionError(f'Table {table} not found')
+              print('Schema verification passed: all core tables present')
+          "

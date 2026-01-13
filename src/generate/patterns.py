@@ -20,29 +20,39 @@ PATTERNS: dict[str, LPFn] = {
     "first-last": lambda fn, ln: f"{fn}-{ln}",
     "firstlast": lambda fn, ln: f"{fn}{ln}",
     "lastfirst": lambda fn, ln: f"{ln}{fn}",
+    # Additional (supported) patterns referenced by PATTERN_RANKS
+    "first.l": lambda fn, ln: f"{fn}.{ln[:1]}",
+    "first_l": lambda fn, ln: f"{fn}_{ln[:1]}",
+    "f_last": lambda fn, ln: f"{fn[:1]}_{ln}",
 }
 
+# Pattern priority (lower = more common/preferred)
+PATTERN_RANKS: dict[str, int] = {
+    "first.last": 1,
+    "first_last": 2,
+    "firstlast": 3,
+    "first": 4,
+    "flast": 5,
+    "firstl": 6,
+    "f.last": 7,
+    "first.l": 8,
+    # ... less common patterns get higher ranks
+    "first-last": 10,
+    "first_l": 11,
+    "f_last": 12,
+}
+
+DEFAULT_MAX_PERMUTATIONS_PER_PERSON = 6
+
+
+def _pattern_rank(key: str) -> int:
+    return int(PATTERN_RANKS.get(key, 999))
+
+
 # Default priority order for generation / inference (most common first).
-# Top 5 based on your empirical distribution:
-#   {f}{last}        -> "flast"       (41.76%)
-#   {first}.{last}   -> "first.last"  (30.45%)
-#   {first}          -> "first"       (16.99%)
-#   {first}{l}       -> "firstl"      (3.56%)
-#   {first}{last}    -> "firstlast"   (1.83%)
-#
-# All remaining patterns are tried after those.
-PATTERN_PRIORITY: tuple[str, ...] = (
-    "flast",  # b + anderson      -> banderson
-    "first.last",  # brett.anderson
-    "first",  # brett
-    "firstl",  # brettl
-    "firstlast",  # brettanderson
-    # "other permutations" tried after the top-5:
-    "f.last",  # b.anderson
-    "last",  # anderson
-    "first_last",  # brett_anderson
-    "first-last",  # brett-anderson
-    "lastfirst",  # andersonbrett
+# Derived from PATTERN_RANKS, with unranked patterns appended after ranked ones.
+PATTERN_PRIORITY: tuple[str, ...] = tuple(
+    sorted(PATTERNS.keys(), key=lambda k: (_pattern_rank(k), k))
 )
 
 ROLE_ALIASES = {"info", "sales", "support", "hello", "marketing", "press", "admin"}
@@ -99,6 +109,9 @@ def build_localpart(pattern: str, first: str, last: str) -> str | None:
         "first-last",
         "firstlast",
         "lastfirst",
+        "first.l",
+        "first_l",
+        "f_last",
     }
 
     if pattern in both_required:
@@ -120,6 +133,8 @@ def generate_localparts_for_person(
     first_name: str,
     last_name: str,
     preferred_pattern: str | None = None,
+    *,
+    max_permutations: int = DEFAULT_MAX_PERMUTATIONS_PER_PERSON,
 ) -> list[str]:
     """
     Generate a deduplicated, prioritized list of candidate local-parts for a
@@ -134,12 +149,17 @@ def generate_localparts_for_person(
     preferred_pattern:
         A pattern key (see PATTERNS) to try first, typically sourced from
         companies.attrs["email_pattern"].
+    max_permutations:
+        Maximum number of local-parts to return (after dedupe).
 
     Returns
     -------
     list[str]
         Local-parts like ["banderson", "brett.anderson", "brett", ...].
     """
+    if max_permutations <= 0:
+        return []
+
     patterns: list[str] = list(PATTERN_PRIORITY)
 
     if preferred_pattern and preferred_pattern in PATTERNS:
@@ -159,6 +179,8 @@ def generate_localparts_for_person(
             continue
         seen.add(lp)
         result.append(lp)
+        if len(result) >= max_permutations:
+            break
 
     return result
 
@@ -168,6 +190,8 @@ def generate_candidate_emails_for_person(
     last_name: str,
     domain: str,
     company_pattern: str | None = None,
+    *,
+    max_permutations: int = DEFAULT_MAX_PERMUTATIONS_PER_PERSON,
 ) -> list[str]:
     """
     Generate full candidate email addresses for a person at a given domain.
@@ -182,6 +206,8 @@ def generate_candidate_emails_for_person(
         Email domain (e.g. "crestwellpartners.com").
     company_pattern:
         Optional stored pattern to prioritize (e.g. from companies.attrs).
+    max_permutations:
+        Maximum number of emails to return (after dedupe of local-parts).
 
     Returns
     -------
@@ -196,6 +222,7 @@ def generate_candidate_emails_for_person(
         first_name=first_name,
         last_name=last_name,
         preferred_pattern=company_pattern,
+        max_permutations=max_permutations,
     )
     return [f"{lp}@{domain}" for lp in locals_]
 
@@ -241,7 +268,8 @@ def infer_domain_pattern(examples: Iterable[tuple[str, str, str]]) -> Inference:
             if candidate == lp:
                 scores[key] += 1
 
-    best, hits = max(scores.items(), key=lambda kv: kv[1])
+    # Tie-break by rank (prefer lower rank when hit counts are equal).
+    best, hits = max(scores.items(), key=lambda kv: (kv[1], -_pattern_rank(kv[0])))
     conf = (hits / n) if n else 0.0
     if hits >= 2 and conf >= 0.80:
         return Inference(best, conf, n)
@@ -359,7 +387,7 @@ def infer_pattern_for_company(
            vr.verify_status = 'valid' for any email belonging to people
            at this company.
         2. Extracts (localpart, first_name, last_name).
-        3. Tries all PATTERN_PRIORITY values in order via build_localpart().
+        3. Tries patterns in PATTERN_PRIORITY order via build_localpart().
         4. When a pattern reproduces the observed localpart exactly, it is
            written to companies.attrs["email_pattern"] and returned.
     - If no matching pattern is found or no valid emails exist yet, the

@@ -41,20 +41,7 @@ if str(_REPO_ROOT) not in sys.path:
 import src.extract.candidates as _extract_mod  # noqa: E402
 from src.emails.classify import is_role_or_placeholder_email  # noqa: E402
 from src.extract import Candidate, extract_candidates  # noqa: E402
-
-# URL path hints that usually correspond to people/leadership/team pages
-PEOPLE_URL_HINTS = (
-    "team",
-    "our-team",
-    "our_team",
-    "leadership",
-    "people",
-    "staff",
-    "associates",
-    "partners",
-    "who-we-are",
-    "who_we_are",
-)
+from src.extract.url_filters import is_people_page_url
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -505,17 +492,6 @@ def _record_provenance(con: sqlite3.Connection, email_id: int, source_url: str) 
 # ----------------------- People from headings (no email) ---------------------
 
 
-def _is_people_page_url(url: str) -> bool:
-    """
-    Heuristic: return True if the URL path suggests this is a people/leadership/team page.
-    """
-    try:
-        path = (urlparse(url).path or "").lower()
-    except Exception:
-        return False
-    return any(hint in path for hint in PEOPLE_URL_HINTS)
-
-
 def _iter_name_only_people_from_html(
     source_url: str,
     html: str,
@@ -525,7 +501,7 @@ def _iter_name_only_people_from_html(
 
     Returns a list of (first_name, last_name, raw_label) tuples.
     """
-    if not _is_people_page_url(source_url):
+    if not is_people_page_url(source_url):
         return []
 
     soup = BeautifulSoup(html or "", "html.parser")

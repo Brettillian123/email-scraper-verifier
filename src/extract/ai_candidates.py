@@ -3,6 +3,11 @@ O27 — AI-assisted people extraction/refinement.
 
 Given a broad list of Candidate objects (from heuristic extraction),
 use an LLM to filter and normalize to real people only.
+
+IMPORTANT CONTRACT (for ai_candidates_wrapper.py):
+- If AI is enabled and the call succeeds but the model returns no people,
+  this function MUST return [] (do not fallback here).
+- Fallback and quality gates are handled exclusively by ai_candidates_wrapper.py.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
-from src.config import load_settings
+from src.config import settings
 from src.extract.candidates import Candidate
 
 try:
@@ -24,22 +29,36 @@ except ImportError:  # pragma: no cover - optional dependency
     OpenAI = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
-_cfg = load_settings()
 
-# Basic config / env wiring
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or getattr(_cfg, "OPENAI_API_KEY", None)
-OPENAI_MODEL = os.getenv("OPENAI_MODEL") or getattr(_cfg, "OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_API_BASE = os.getenv("OPENAI_API_BASE") or getattr(_cfg, "OPENAI_API_BASE", None)
+# -----------------------------------------------------------------------------
+# Config / env wiring
+# -----------------------------------------------------------------------------
 
-# Exported feature flag used by auto-discovery glue
-AI_PEOPLE_ENABLED: bool = bool(
-    OPENAI_API_KEY and os.getenv("AI_PEOPLE_ENABLED", "1").strip().lower() not in {"0", "false"}
+# Prefer src.config.settings (which already reads env), but keep env compatibility.
+OPENAI_API_KEY = (
+    os.getenv("OPENAI_API_KEY") or (getattr(settings, "openai_api_key", "") or "")
+).strip() or None
+
+# Prefer AI_PEOPLE_MODEL; support legacy OPENAI_MODEL.
+OPENAI_MODEL = (
+    os.getenv("AI_PEOPLE_MODEL")
+    or os.getenv("OPENAI_MODEL")
+    or (getattr(settings, "ai_people_model", None) or "").strip()
+    or "gpt-5-nano"
+)
+
+# Optional base URL override (compatible with both new and legacy libraries).
+OPENAI_API_BASE = (os.getenv("OPENAI_API_BASE") or "").strip() or None
+
+# Exported feature flag used by wrapper glue.
+AI_PEOPLE_ENABLED: bool = bool(OPENAI_API_KEY) and bool(
+    getattr(settings, "ai_people_enabled", False)
 )
 
 _HAS_NEW_OPENAI = OpenAI is not None
 
 # =============================================================================
-# ROLE EMAIL DETECTION (for fallback filtering)
+# ROLE EMAIL DETECTION (used only for prompt context / candidate fields)
 # =============================================================================
 
 _ROLE_PREFIXES = frozenset(
@@ -95,24 +114,34 @@ def _is_role_email(email: str | None) -> bool:
     return local in _ROLE_PREFIXES
 
 
-def _has_real_name(cand: Candidate) -> bool:
-    """Check if candidate has a plausible human name."""
-    raw_name = getattr(cand, "raw_name", None)
-    first_name = getattr(cand, "first_name", None)
-    last_name = getattr(cand, "last_name", None)
+def _get_client():
+    """
+    Build an OpenAI client compatible with either the new or legacy library.
 
-    # Check raw_name: must be at least 3 chars and contain a space (two parts)
-    if raw_name:
-        name = raw_name.strip()
-        if len(name) >= 3 and " " in name:
-            return True
+    Returns None when API key is missing or OpenAI is not installed.
+    """
+    if not OPENAI_API_KEY:
+        return None
 
-    # Check first + last name
-    if first_name and last_name:
-        if len(first_name.strip()) >= 2 and len(last_name.strip()) >= 2:
-            return True
+    if _HAS_NEW_OPENAI:
+        return OpenAI(  # type: ignore[misc]
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_API_BASE or None,
+        )
 
-    return False
+    # Legacy openai<1.0 client (import lazily to avoid hard dependency)
+    try:
+        legacy = importlib.import_module("openai")
+    except Exception:  # pragma: no cover
+        return None
+
+    legacy.api_key = OPENAI_API_KEY  # type: ignore[attr-defined]
+    if OPENAI_API_BASE:
+        try:
+            legacy.api_base = OPENAI_API_BASE  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover
+            pass
+    return legacy
 
 
 # =============================================================================
@@ -143,18 +172,6 @@ CRITICAL RULE FOR ROLE/SHARED EMAILS:
 - If a candidate has a personal-looking email (first.last@, flast@, firstl@, jsmith@, etc.):
   → Return the person WITH that email
 
-EXAMPLES:
-Input: {raw_name: "Abbey Shenberg", email: "office@company.com", is_role_address_guess: true}
-CORRECT: {full_name: "Abbey Shenberg", first_name: "Abbey", last_name: "Shenberg", email: null}
-WRONG: {full_name: "Abbey Shenberg", email: "office@company.com"}
-
-Input: {raw_name: "Abbey Shenberg", email: "abbey.shenberg@company.com",
-        is_role_address_guess: false}
-CORRECT: {full_name: "Abbey Shenberg", email: "abbey.shenberg@company.com"}
-
-Input: {raw_name: null, email: "info@company.com", is_role_address_guess: true}
-CORRECT: (do not include in output - no person identified)
-
 OUTPUT FORMAT:
 For each real person, return:
 - id: MUST match the input candidate's id (integer)
@@ -173,47 +190,18 @@ If multiple candidates describe the SAME person (same normalized full_name), mer
 ONE output entry. When merging:
 - Choose the best PERSONAL email (ignore role emails)
 - Choose the most specific title
-- Use the most relevant page_url"""
-
-
-def _get_client():
-    """Build an OpenAI client compatible with either the new or legacy library.
-
-    Returns None when API key is missing or OpenAI is not installed.
-    """
-    if not OPENAI_API_KEY:
-        return None
-
-    if _HAS_NEW_OPENAI:
-        return OpenAI(  # type: ignore[misc]
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_API_BASE or None,
-        )
-
-    # Legacy openai<1.0 client (import lazily to avoid hard dependency)
-    try:
-        legacy = importlib.import_module("openai")
-    except Exception:  # pragma: no cover
-        return None
-
-    legacy.api_key = OPENAI_API_KEY  # type: ignore[attr-defined]
-    if OPENAI_API_BASE:
-        try:
-            legacy.api_base = OPENAI_API_BASE  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover
-            pass
-    return legacy
+- Use the most relevant page_url
+"""
 
 
 def _dedup_and_compact_candidates(
     candidates: Sequence[Candidate],
 ) -> tuple[list[dict[str, Any]], int]:
-    """Convert Candidate objects into a compact, de-duplicated JSON structure for the model.
+    """
+    Convert Candidate objects into a compact, de-duplicated JSON structure for the model.
 
     Returns:
         (json_candidates, original_len)
-        - json_candidates: list of dicts suitable for payload["candidates"]
-        - original_len: len(candidates) before dedup
     """
     json_candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, bool]] = set()
@@ -227,7 +215,11 @@ def _dedup_and_compact_candidates(
         source_url = getattr(c, "source_url", None)
         source_type = getattr(c, "source_type", None)
         context_snippet = getattr(c, "context_snippet", None)
+
+        # Compute role guess deterministically if not provided by upstream.
         is_role_address_guess = bool(getattr(c, "is_role_address_guess", False))
+        if not is_role_address_guess:
+            is_role_address_guess = _is_role_email(email)
 
         # If no explicit raw_name, synthesize from first/last.
         if not raw_name and (first_name or last_name):
@@ -250,8 +242,7 @@ def _dedup_and_compact_candidates(
 
         json_candidates.append(
             {
-                # IMPORTANT: id is the index into the *original* candidates list
-                # so we can map back when applying AI refinements.
+                # IMPORTANT: id maps back to the original candidates index.
                 "id": idx,
                 "page_url": source_url,
                 "source_type": source_type,
@@ -271,17 +262,10 @@ def _build_payload(
     domain: str,
     candidates: Sequence[Candidate],
 ) -> dict[str, Any]:
-    """Convert Candidate objects into a compact JSON structure for the model.
-
-    Includes candidates that have no email but do have a plausible name.
-    """
     json_candidates, original_len = _dedup_and_compact_candidates(candidates)
 
     if not json_candidates:
-        log.info(
-            "AI candidate payload is empty after compaction (original_len=%s)",
-            original_len,
-        )
+        log.info("AI candidate payload empty after compaction (original_len=%s)", original_len)
 
     return {
         "company_name": company_name,
@@ -290,12 +274,7 @@ def _build_payload(
     }
 
 
-def _make_messages(
-    company_name: str,
-    domain: str,
-    payload: dict[str, Any],
-) -> list[dict[str, str]]:
-    """Build the chat messages for the AI refinement call."""
+def _make_messages(company_name: str, domain: str, payload: dict[str, Any]) -> list[dict[str, str]]:
     user_content = (
         f"Company name: {company_name}\n"
         f"Domain: {domain}\n\n"
@@ -334,10 +313,7 @@ def _parse_people_list(data: dict[str, Any]) -> list[dict[str, Any]] | None:
     return [p for p in people if isinstance(p, dict)]
 
 
-def _apply_ai_people(
-    candidates: list[Candidate],
-    people: list[dict[str, Any]],
-) -> list[Candidate]:
+def _apply_ai_people(candidates: list[Candidate], people: list[dict[str, Any]]) -> list[Candidate]:
     refined: list[Candidate] = []
 
     for person in people:
@@ -359,33 +335,27 @@ def _apply_ai_people(
             email = None
 
         if first_name:
-            base.first_name = first_name
+            base.first_name = str(first_name)
         if last_name:
-            base.last_name = last_name
+            base.last_name = str(last_name)
         if full_name:
-            base.raw_name = full_name
+            base.raw_name = str(full_name)
             if hasattr(base, "full_name"):
                 try:
-                    base.full_name = full_name  # type: ignore[attr-defined]
+                    base.full_name = str(full_name)  # type: ignore[attr-defined]
                 except Exception:
                     pass
 
-        base.email = email
+        base.email = str(email) if isinstance(email, str) else None
 
         if title:
-            base.title = title
+            base.title = str(title)
         if page_url and hasattr(base, "source_url"):
-            base.source_url = page_url
+            base.source_url = str(page_url)
 
         refined.append(base)
 
     return refined
-
-
-def _fallback_filter_role_only(candidates: list[Candidate]) -> list[Candidate]:
-    return [
-        c for c in candidates if _has_real_name(c) or not _is_role_email(getattr(c, "email", None))
-    ]
 
 
 def extract_ai_candidates(
@@ -395,40 +365,30 @@ def extract_ai_candidates(
     raw_candidates: Sequence[Candidate],
     source_url: str | None = None,  # kept for backwards-compat logging, unused
 ) -> list[Candidate]:
-    """AI refiner for person candidates.
+    """
+    AI refiner for person candidates.
 
-    Input:
-        - A broad, heuristically generated list of Candidate objects (raw_candidates)
-        - Company name + domain for context
-
-    Output:
-        - A filtered + normalized list of Candidate objects representing
-          real people associated with this company.
-
-    Behavior:
-        - If AI is disabled or unavailable, returns raw_candidates unchanged.
-        - Uses the model to DROP non-person entries (teams, products, nav labels, etc.)
-          and CLEANUP names/titles for the remaining ones.
-        - Role emails (info@, office@, etc.) are stripped from person output;
-          only personal emails are preserved.
-        - If AI returns nothing, filters out role-only emails before falling back.
+    CONTRACT:
+      - If AI is disabled/unavailable, returns raw_candidates unchanged.
+      - If AI call succeeds but returns 0 people, returns [] (no fallback here).
+        Fallback + quality gates happen in ai_candidates_wrapper.py.
     """
     candidates = list(raw_candidates)
     if not candidates:
         return candidates
 
     if not AI_PEOPLE_ENABLED:
-        log.info("AI people refiner disabled via AI_PEOPLE_ENABLED flag; returning raw candidates")
+        log.info("AI people refiner disabled; returning raw candidates unchanged")
         return candidates
 
     client = _get_client()
     if client is None:
-        log.warning("OpenAI client unavailable (missing key or import); returning raw candidates")
-        return candidates
+        raise RuntimeError("OpenAI client unavailable (missing key/import/base_url config)")
 
     payload = _build_payload(company_name, domain, candidates)
     if not payload.get("candidates"):
-        return candidates
+        # No usable inputs for the model; wrapper owns fallback/quality gates.
+        return []
 
     messages = _make_messages(company_name, domain, payload)
 
@@ -437,39 +397,22 @@ def extract_ai_candidates(
         data = json.loads(content)
         if not isinstance(data, dict):
             raise ValueError("AI response JSON is not an object")
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         log.exception(
-            "AI refinement call failed; returning raw candidates",
+            "AI refinement call failed",
             extra={"company_name": company_name, "domain": domain, "exc": str(exc)},
         )
-        return candidates
+        raise
 
     people = _parse_people_list(data)
     if people is None:
-        log.warning("AI response missing 'people' list; returning raw candidates")
-        return candidates
+        raise ValueError("AI response missing 'people' list")
 
     refined = _apply_ai_people(candidates, people)
-    if refined:
-        log.info("AI refinement complete: %d raw → %d people", len(candidates), len(refined))
-        return refined
+    log.info("AI refinement complete: %d raw → %d people", len(candidates), len(refined))
 
-    filtered = _fallback_filter_role_only(candidates)
-    if filtered:
-        removed_count = len(candidates) - len(filtered)
-        log.info(
-            "AI refinement returned no people; falling back to %d filtered candidates "
-            "(removed %d role-only emails)",
-            len(filtered),
-            removed_count,
-        )
-        return filtered
+    # CRITICAL: do NOT fallback here. Wrapper will apply quality gates & fallback.
+    return refined
 
-    log.info(
-        (
-            "AI refinement returned no people and all %d candidates were role-only; "
-            "returning empty list"
-        ),
-        len(candidates),
-    )
-    return []
+
+__all__ = ["AI_PEOPLE_ENABLED", "extract_ai_candidates"]

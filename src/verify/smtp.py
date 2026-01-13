@@ -51,8 +51,17 @@ from src.config import (
 )
 
 try:  # pragma: no cover
-    from src.verify.preflight import check_port25
+    from src.verify.preflight import (
+        SmtpProbingDisabledError,
+        assert_smtp_probing_allowed,
+        check_port25,
+    )
 except Exception:  # pragma: no cover
+    SmtpProbingDisabledError = RuntimeError  # type: ignore
+
+    def assert_smtp_probing_allowed() -> None:  # type: ignore
+        raise RuntimeError("SMTP preflight module unavailable; refusing to run SMTP probing.")
+
     check_port25 = None  # type: ignore
 
 # --- Optional deps / helpers -------------------------------------------------
@@ -316,6 +325,8 @@ def _preflight_port25(mx_host: str) -> tuple[bool, str | None]:
     """
     Returns (ok, error_str). Uses a small TTL cache to avoid repeating
     the same doomed connect attempts within a single run.
+
+    Note: check_port25() itself is guarded by assert_smtp_probing_allowed().
     """
     if not SMTP_PREFLIGHT_ENABLED or check_port25 is None:
         return True, None
@@ -392,6 +403,10 @@ def probe_rcpt(  # noqa: C901
 
     if not (mx_host or "").strip():
         raise ValueError("mx_host_required")
+
+    # HARD GUARDRAIL: refuse to run TCP/25 probing unless explicitly allowed.
+    # This must happen before any port-25 connect attempt (preflight or SMTP).
+    assert_smtp_probing_allowed()
 
     # Normalize email (preserve local case; normalize domain with IDNA)
     try:
@@ -608,4 +623,4 @@ class socket_timeout_guard:
         return False
 
 
-__all__ = ["probe_rcpt", "record_behavior"]
+__all__ = ["probe_rcpt", "record_behavior", "SmtpProbingDisabledError"]

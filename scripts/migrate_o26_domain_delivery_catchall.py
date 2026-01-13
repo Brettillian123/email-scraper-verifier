@@ -1,3 +1,4 @@
+# scripts/migrate_o26_domain_delivery_catchall.py
 from __future__ import annotations
 
 """
@@ -25,33 +26,49 @@ valid/no_bounce_after_test_send, while keeping everything idempotent.
 """
 
 import argparse
-import sqlite3
-from pathlib import Path
+import os
+import sys
+from typing import Any
+
+from src.db import get_conn
 
 
-def _ensure_db_exists(db_path: str) -> None:
-    p = Path(db_path)
-    if not p.exists():
-        raise SystemExit(f"Database not found: {db_path}")
-
-
-def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+def _apply_dsn_override(dsn: str | None) -> None:
     """
-    Return True if the given table has a column named `column`.
+    Allow overriding the Postgres DSN for this run while still routing all DB
+    access through src.db.get_conn().
 
-    Uses PRAGMA table_info and is safe here because `table` is a constant
-    string defined in code (not user input).
+    We set both DATABASE_URL and PG_DSN to maximize compatibility with different
+    existing get_conn() implementations.
     """
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    for row in cur.fetchall():
-        # PRAGMA table_info columns:
-        # (cid, name, type, notnull, dflt_value, pk)
-        if row[1] == column:
-            return True
-    return False
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
+    os.environ["PG_DSN"] = dsn
 
 
-def migrate(conn: sqlite3.Connection) -> None:
+def _table_exists(cur: Any, *, schema: str, table: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+    row = cur.fetchone()
+    return row is not None and row[0] is not None
+
+
+def _has_column(cur: Any, *, schema: str, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = %s
+           AND table_name = %s
+           AND column_name = %s
+         LIMIT 1
+        """,
+        (schema, table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def migrate(cur: Any, *, schema: str) -> None:
     """
     Apply the O26 delivery catch-all migration in an idempotent way.
 
@@ -61,41 +78,71 @@ def migrate(conn: sqlite3.Connection) -> None:
     We do not backfill any values here; the O26 helper code will populate
     these fields based on observed test-send outcomes per domain.
     """
-    # Ensure the base table exists; if not, this will raise a clear error.
-    conn.execute("SELECT 1 FROM domain_resolutions LIMIT 1")
+    table = "domain_resolutions"
 
-    if not _has_column(conn, "domain_resolutions", "delivery_catchall_status"):
-        conn.execute("ALTER TABLE domain_resolutions ADD COLUMN delivery_catchall_status TEXT")
+    if not _table_exists(cur, schema=schema, table=table):
+        raise RuntimeError(f'Table "{schema}.{table}" does not exist.')
 
-    if not _has_column(conn, "domain_resolutions", "delivery_catchall_checked_at"):
-        conn.execute("ALTER TABLE domain_resolutions ADD COLUMN delivery_catchall_checked_at TEXT")
+    fq = f'{schema}."{table}"'
 
-    conn.commit()
+    if not _has_column(cur, schema=schema, table=table, column="delivery_catchall_status"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN delivery_catchall_status TEXT")
+
+    if not _has_column(cur, schema=schema, table=table, column="delivery_catchall_checked_at"):
+        cur.execute(f"ALTER TABLE {fq} ADD COLUMN delivery_catchall_checked_at TEXT")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "O26 migration: add delivery_catchall_status and "
-            "delivery_catchall_checked_at to domain_resolutions."
+            "delivery_catchall_checked_at to domain_resolutions (PostgreSQL)."
         )
     )
     parser.add_argument(
+        "--dsn",
         "--db",
-        dest="db_path",
-        default="data/dev.db",
-        help="Path to the SQLite database (default: data/dev.db).",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL/PG_DSN for this run).",
+    )
+    parser.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target schema (default: public, or PGSCHEMA env var).",
     )
     args = parser.parse_args()
+    _apply_dsn_override(args.dsn)
 
-    _ensure_db_exists(args.db_path)
-
-    conn = sqlite3.connect(args.db_path)
+    conn = get_conn()
     try:
-        migrate(conn)
+        cur = conn.cursor()
+        try:
+            migrate(cur, schema=args.schema)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    print("O26 delivery catch-all migration complete.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise

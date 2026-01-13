@@ -120,7 +120,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--db",
         default="data/dev.db",
-        help="SQLite DB path used by migrators (default: data/dev.db)",
+        help=(
+            "Database path passed to post-ingest migrators (legacy SQLite workflows). "
+            "For PostgreSQL, set DATABASE_URL environment variable instead. "
+            "Default: data/dev.db"
+        ),
     )
     ap.add_argument(
         "--no-score",

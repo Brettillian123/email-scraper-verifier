@@ -22,7 +22,7 @@ __all__ = [
 ]
 
 # Bump when resolver logic meaningfully changes
-RESOLVER_VERSION = "r08.4"
+RESOLVER_VERSION = "r08.5"
 
 # Tight, test-friendly timeouts (kept tiny by design)
 _HTTP_TIMEOUT = httpx.Timeout(3.0)
@@ -316,10 +316,25 @@ def decide(cands: Iterable[Candidate]) -> Decision:
     if not by_domain:
         return Decision(chosen=None, method="none", confidence=0, reason="no_viable_candidate")
 
-    best_domain = None
+    best_domain: str | None = None
     best_score = -1
     best_method = "fallback"
     best_reason = "scored_best"
+    best_key: tuple[int, int, int, str] | None = None
+
+    # Deterministic tie-breakers:
+    # 1) higher score
+    # 2) candidate whose reason started from hint
+    # 3) .com bias (already in score via _TLD_BONUS, but if still tied)
+    # 4) lexicographic domain
+    #
+    # IMPORTANT: picked_domain may be a redirect apex (loc) that is not present in by_domain.
+    # Therefore we must not look up by_domain[picked_domain] when comparing the running best.
+    def tiebreak_key(d: str, cand: Candidate, sc: int) -> tuple[int, int, int, str]:
+        ext = _EXTRACT(d)
+        is_hint = 1 if cand.reason.startswith("hint") else 0
+        is_com = 1 if (ext.suffix or "") == "com" else 0
+        return (sc, is_hint, is_com, f"{d}")
 
     # Deterministic iteration order to make ties stable
     for domain in sorted(by_domain.keys()):
@@ -359,28 +374,9 @@ def decide(cands: Iterable[Candidate]) -> Decision:
                 picked_method = "http_redirect"
                 picked_reason = f"redirect->{loc}"
 
-        # Deterministic tie-breakers:
-        # 1) higher score
-        # 2) candidate whose reason started from hint
-        # 3) .com bias (already in score via _TLD_BONUS, but if still tied)
-        # 4) lexicographic domain
-        def tiebreak_key(d: str, cand: Candidate, sc: int) -> tuple[int, int, int, str]:
-            ext = _EXTRACT(d)
-            is_hint = 1 if cand.reason.startswith("hint") else 0
-            is_com = 1 if (ext.suffix or "") == "com" else 0
-            return (sc, is_hint, is_com, f"{d}")
-
         new_key = tiebreak_key(picked_domain, c, score)
-        best_key = (
-            None
-            if best_domain is None
-            else tiebreak_key(best_domain, by_domain[best_domain], best_score)
-        )
-        if (
-            best_domain is None
-            or score > best_score
-            or (score == best_score and new_key > best_key)
-        ):
+        if best_key is None or new_key > best_key:
+            best_key = new_key
             best_domain = picked_domain
             best_score = score
             best_method = picked_method

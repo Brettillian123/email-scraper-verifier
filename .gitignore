@@ -22,3 +22,32 @@ data/
 .env
 
 --db
+
+# Local-only artifacts
+.cache/
+local_backups/
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.swp
+*.swo
+*.bak
+*.bak.*
+*.save
+
+# Local-only artifacts (do not commit)
+.env
+.cache/
+local_backups/
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.swp
+*.swo
+*.bak
+*.bak.*
+*.save

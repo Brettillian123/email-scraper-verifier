@@ -12,80 +12,121 @@ New nullable columns on verification_results:
 
 Usage:
 
-    python scripts/migrate_o07_fallback.py --db data\dev.db
+    python scripts/migrate_o07_fallback.py
+    python scripts/migrate_o07_fallback.py --dsn "postgresql://..."
 """
 
 import argparse
-import contextlib
-import pathlib
-import sqlite3
+import os
+import sys
+from typing import Any
+
+from src.db import get_conn
 
 
-def col_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(r[1] == col for r in cur.fetchall())
+def apply_dsn_override(dsn: str | None) -> None:
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
 
 
-def ensure_columns(cur: sqlite3.Cursor) -> None:
+def table_exists(cur: Any, *, schema: str, table: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+    row = cur.fetchone()
+    return row is not None and row[0] is not None
+
+
+def col_exists(cur: Any, *, schema: str, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s AND column_name = %s
+        LIMIT 1
+        """,
+        (schema, table, col),
+    )
+    return cur.fetchone() is not None
+
+
+def ensure_columns(cur: Any, *, schema: str) -> None:
     """
     Idempotently add fallback_* columns to verification_results if missing.
     """
     table = "verification_results"
+    fq_table = f'{schema}."{table}"'
 
-    if not col_exists(cur, table, "fallback_status"):
+    if not col_exists(cur, schema=schema, table=table, col="fallback_status"):
         print(f"· Adding {table}.fallback_status (TEXT)")
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN fallback_status TEXT")
+        cur.execute(f"ALTER TABLE {fq_table} ADD COLUMN fallback_status TEXT")
     else:
         print(f"· {table}.fallback_status already present; skipping")
 
-    if not col_exists(cur, table, "fallback_raw"):
+    if not col_exists(cur, schema=schema, table=table, col="fallback_raw"):
         print(f"· Adding {table}.fallback_raw (TEXT)")
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN fallback_raw TEXT")
+        cur.execute(f"ALTER TABLE {fq_table} ADD COLUMN fallback_raw TEXT")
     else:
         print(f"· {table}.fallback_raw already present; skipping")
 
-    if not col_exists(cur, table, "fallback_checked_at"):
+    if not col_exists(cur, schema=schema, table=table, col="fallback_checked_at"):
         print(f"· Adding {table}.fallback_checked_at (TEXT)")
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN fallback_checked_at TEXT")
+        cur.execute(f"ALTER TABLE {fq_table} ADD COLUMN fallback_checked_at TEXT")
     else:
         print(f"· {table}.fallback_checked_at already present; skipping")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="O07 migration: add fallback_* columns to verification_results"
+        description="O07 migration: add fallback_* columns to verification_results (PostgreSQL)"
     )
     parser.add_argument(
+        "--dsn",
         "--db",
-        dest="db_path",
-        default="data/dev.db",
-        help="Path to SQLite DB (default: data/dev.db)",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL for this run).",
+    )
+    parser.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target schema (default: public, or PGSCHEMA env var).",
     )
     args = parser.parse_args()
+    apply_dsn_override(args.dsn)
 
-    db_path = pathlib.Path(args.db_path).resolve()
-    print(f"→ Using SQLite at: {db_path}")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        try:
+            if not table_exists(cur, schema=args.schema, table="verification_results"):
+                print("! Table verification_results does not exist; nothing to migrate.")
+                return
 
-    if not db_path.exists():
-        print(f"! WARNING: DB file does not exist yet at {db_path} (will be created on write)")
-
-    con = sqlite3.connect(str(db_path))
-    with contextlib.closing(con):
-        cur = con.cursor()
-        # Basic sanity: ensure verification_results exists
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='verification_results'"
-        )
-        row = cur.fetchone()
-        if not row:
-            print("! Table verification_results does not exist; nothing to migrate.")
-            return
-
-        ensure_columns(cur)
-        con.commit()
+            ensure_columns(cur, schema=args.schema)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     print("✔ O07 migration completed (verification_results fallback_* columns ensured).")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

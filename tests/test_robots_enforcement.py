@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import types
 from collections.abc import Iterator
 
@@ -14,6 +16,36 @@ robots = pytest.importorskip("src.fetch.robots")
 
 
 # ------------------------------- test utilities ---------------------------------------
+
+
+def _current_ua_token() -> str:
+    """
+    Return the product token used for robots UA matching, e.g.:
+      "EmailVerifierBot/0.9 (...)" -> "EmailVerifierBot"
+
+    This keeps tests aligned with the project's configured UA and avoids
+    brittle hardcoding (e.g., "Email-Scraper").
+    """
+    candidates = [
+        getattr(robots, "FETCH_USER_AGENT", None),
+        getattr(robots, "DEFAULT_USER_AGENT", None),
+        os.environ.get("EMAIL_SCRAPER_USER_AGENT"),
+        os.environ.get("USER_AGENT"),
+    ]
+    for ua in candidates:
+        if isinstance(ua, str) and ua.strip():
+            first = ua.strip().split()[0]  # "Product/1.0"
+            return first.split("/")[0]  # "Product"
+    return "Email-Scraper"
+
+
+def _stable_host(prefix: str, text: str, path: str) -> str:
+    """
+    Produce a stable, deterministic host per (text,path) to avoid any possible
+    cross-test/cross-param interference, even if cache clearing is imperfect.
+    """
+    digest = hashlib.md5(f"{text}|{path}".encode()).hexdigest()[:10]  # noqa: S324
+    return f"{prefix}-{digest}.test"
 
 
 @contextlib.contextmanager
@@ -51,7 +83,7 @@ def _reset_between_tests():
     [
         # UA-specific group should win over '*'
         (
-            """User-agent: Email-Scraper
+            """User-agent: {UA_TOKEN}
 Disallow: /private
 Allow: /
 Crawl-delay: 3
@@ -65,7 +97,7 @@ Crawl-delay: 10
             3.0,
         ),
         (
-            """User-agent: Email-Scraper
+            """User-agent: {UA_TOKEN}
 Disallow: /private
 Allow: /
 Crawl-delay: 3
@@ -95,10 +127,12 @@ def test_allow_deny_and_crawl_delay(monkeypatch, text, path, expect_allowed, exp
     # Make default delay deterministic for the "None" case in the table
     monkeypatch.setattr(robots, "ROBOTS_DEFAULT_DELAY_SECONDS", 1.25, raising=False)
 
-    host = "example.test"
+    # Make the robots.txt fixture match the project's configured UA token.
+    text = text.replace("{UA_TOKEN}", _current_ua_token())
+
+    host = _stable_host("example", text, path)
     respx.get(f"https://{host}/robots.txt").mock(return_value=Response(200, text=text))
 
-    # Our client UA string starts with "Email-Scraper", so UA matching works for the first cases.
     allowed = robots.is_allowed(host, path)
     assert allowed is expect_allowed
 

@@ -2,26 +2,49 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime as dt
 import json
-import pathlib
-import sqlite3
+import os
+import sys
 from typing import Any
 
-
-def col_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(r[1] == col for r in cur.fetchall())
+from src.db import get_conn
 
 
-def ensure_columns(cur: sqlite3.Cursor) -> None:
-    if not col_exists(cur, "people", "icp_score"):
-        cur.execute("ALTER TABLE people ADD COLUMN icp_score INTEGER")
-    if not col_exists(cur, "people", "icp_reasons"):
-        cur.execute("ALTER TABLE people ADD COLUMN icp_reasons TEXT")  # JSON list
-    if not col_exists(cur, "people", "last_scored_at"):
-        cur.execute("ALTER TABLE people ADD COLUMN last_scored_at TEXT")  # ISO8601 UTC
+def _apply_dsn_override(dsn: str | None) -> None:
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
+    os.environ["PG_DSN"] = dsn
+
+
+def _qi(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def col_exists(cur: Any, *, schema: str, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = %s
+           AND table_name = %s
+           AND column_name = %s
+         LIMIT 1
+        """,
+        (schema, table, col),
+    )
+    return cur.fetchone() is not None
+
+
+def ensure_columns(cur: Any, *, schema: str) -> None:
+    people = f"{_qi(schema)}.{_qi('people')}"
+    if not col_exists(cur, schema=schema, table="people", col="icp_score"):
+        cur.execute(f"ALTER TABLE {people} ADD COLUMN icp_score INTEGER")
+    if not col_exists(cur, schema=schema, table="people", col="icp_reasons"):
+        cur.execute(f"ALTER TABLE {people} ADD COLUMN icp_reasons TEXT")  # JSON list
+    if not col_exists(cur, schema=schema, table="people", col="last_scored_at"):
+        cur.execute(f"ALTER TABLE {people} ADD COLUMN last_scored_at TEXT")  # ISO8601 UTC
 
 
 def load_cfg() -> dict[str, Any]:
@@ -67,42 +90,79 @@ def score_row(rf: str | None, sn: str | None, cfg: dict[str, Any]) -> tuple[int,
     return score, reasons
 
 
-def backfill(conn: sqlite3.Connection, cfg: dict[str, Any], verbose: bool = False) -> int:
-    cur = conn.cursor()
-    cur.execute("SELECT id, role_family, seniority FROM people")
+def backfill(cur: Any, *, schema: str, cfg: dict[str, Any], verbose: bool = False) -> int:
+    people = f"{_qi(schema)}.{_qi('people')}"
+    cur.execute(f"SELECT id, role_family, seniority FROM {people}")
     rows = cur.fetchall()
     now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     updated = 0
     for pid, rf, sn in rows:
         s, rs = score_row(rf, sn, cfg)
         cur.execute(
-            "UPDATE people SET icp_score=?, icp_reasons=?, last_scored_at=? WHERE id=?",
+            f"""
+            UPDATE {people}
+               SET icp_score = %s,
+                   icp_reasons = %s,
+                   last_scored_at = %s
+             WHERE id = %s
+            """,
             (s, json.dumps(rs), now, pid),
         )
-        updated += cur.rowcount
-    conn.commit()
+        updated += int(cur.rowcount or 0)
     if verbose:
         print(f"Backfilled ICP for {updated} people")
     return updated
 
 
-def main(db: str, no_backfill: bool = False, verbose: bool = False) -> None:
-    p = pathlib.Path(db)
-    if not p.exists():
-        raise SystemExit(f"Database not found: {db}")
-    with contextlib.closing(sqlite3.connect(db)) as conn:
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--dsn",
+        "--db",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL for this run).",
+    )
+    ap.add_argument("--no-backfill", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target Postgres schema (default: public, or PGSCHEMA env var).",
+    )
+    args = ap.parse_args()
+    _apply_dsn_override(args.dsn)
+
+    conn = get_conn()
+    try:
         cur = conn.cursor()
-        ensure_columns(cur)
+        try:
+            ensure_columns(cur, schema=args.schema)
+            if not args.no_backfill:
+                cfg = load_cfg()
+                backfill(cur, schema=args.schema, cfg=cfg, verbose=args.verbose)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
         conn.commit()
-        if not no_backfill:
-            cfg = load_cfg()
-            backfill(conn, cfg, verbose=verbose)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/dev.db")
-    ap.add_argument("--no-backfill", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-    main(args.db, no_backfill=args.no_backfill, verbose=args.verbose)
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise

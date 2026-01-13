@@ -1,32 +1,42 @@
 # src/fetch/robots.py
+"""
+Robots.txt enforcement layer (R10 compliance).
+
+This module:
+  - Fetches and caches robots.txt per host.
+  - Applies Allow/Disallow rules for our configured user-agent.
+  - Respects Crawl-delay.
+  - Provides explainability for blocked URLs (Task A).
+
+Status handling:
+  - 200 → parse and enforce rules; cache for ROBOTS_TTL_SECONDS
+  - 404/401/403 → treat as no robots (allow_all); cache for ROBOTS_TTL_SECONDS
+  - >=500 or timeout → deny_all for ROBOTS_DENY_TTL_SECONDS
+"""
+
 from __future__ import annotations
 
-import os
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
+from src.config import FETCH_USER_AGENT
+
+log = logging.getLogger(__name__)
+
 # --------------------------------------------------------------------------------------
-# Configuration (env-overridable)
+# Configuration
 # --------------------------------------------------------------------------------------
 
-FETCH_USER_AGENT = os.getenv(
-    "FETCH_USER_AGENT",
-    "Email-Scraper/0.1 (+contact: verifier@crestwellpartners.com)",
-)
+ROBOTS_TTL_SECONDS: float = 3600.0  # 1 hour cache for successful fetches
+ROBOTS_DENY_TTL_SECONDS: float = 300.0  # 5 min cache for server errors (be conservative)
+ROBOTS_TIMEOUT_SECONDS: float = 10.0
+ROBOTS_DEFAULT_DELAY_SECONDS: float = 1.25  # polite default when no crawl-delay
 
-# Cache a successful robots fetch/parse for 24h by default
-ROBOTS_TTL_SECONDS = float(os.getenv("ROBOTS_TTL_SECONDS", "86400"))
-# If origin is down (>=500 or timeout), deny by default for this window
-ROBOTS_DENY_TTL_SECONDS = float(os.getenv("ROBOTS_DENY_TTL_SECONDS", "600"))
-# Network timeout for fetching robots.txt
-ROBOTS_TIMEOUT_SECONDS = float(os.getenv("ROBOTS_TIMEOUT_SECONDS", "10"))
-# Default crawl delay when none specified
-ROBOTS_DEFAULT_DELAY_SECONDS = float(os.getenv("ROBOTS_DEFAULT_DELAY_SECONDS", "1"))
-
-# Enforce HTTPS per spec here; if you later want to probe HTTP fallback, make it configurable
 _ROBOTS_SCHEME = "https"
 
 # --------------------------------------------------------------------------------------
@@ -37,13 +47,11 @@ _ROBOTS_SCHEME = "https"
 @dataclass
 class _Rule:
     allow: bool
-    path: str  # stored as-is, evaluated with simple prefix match
+    path: str
 
 
 @dataclass
 class _Policy:
-    """The resolved policy for *our* UA (or *) on a host."""
-
     kind: str  # "allow_all" | "deny_all" | "rules"
     rules: list[_Rule] = field(default_factory=list)
     crawl_delay: float | None = None
@@ -52,13 +60,43 @@ class _Policy:
     # monotonic-based expiry; tests can fake time.monotonic()
     expires_at: float = 0.0
     fetched_at: float = 0.0
+    # For explainability: the URL we fetched robots.txt from
+    robots_url: str = ""
+
+
+@dataclass
+class RobotsBlockInfo:
+    """
+    Structured explanation of why a URL was blocked by robots.txt.
+
+    Used for logging, diagnostics, and queue result payloads.
+    """
+
+    blocked_url: str
+    robots_url: str
+    user_agent: str
+    allowed: bool
+    reason: str  # "disallow_rule", "deny_all", "allow_all", etc.
+    matched_rule: str | None  # The Disallow/Allow directive path, or None if unavailable
+    notes: str | None = None  # Additional context
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict for queue payloads."""
+        return {
+            "blocked_url": self.blocked_url,
+            "robots_url": self.robots_url,
+            "user_agent": self.user_agent,
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "matched_rule": self.matched_rule,
+            "notes": self.notes,
+        }
 
 
 # host → _Policy (for our UA)
 _MEMO: dict[str, _Policy] = {}
 _LOCKS: dict[str, threading.Lock] = {}
 _GLOBAL_LOCK = threading.Lock()
-
 
 # --------------------------------------------------------------------------------------
 # Helpers
@@ -133,7 +171,6 @@ def _parse_robots(text: str) -> _ParsedRobots:
             if not current.uas and not seen_any_directive:
                 # first UA for this (yet-empty) group
                 current.uas.append(val_lc)
-                # keep collecting UAs until a directive appears
                 continue
             if current.uas and not seen_any_directive:
                 # additional UA for the same group
@@ -146,7 +183,7 @@ def _parse_robots(text: str) -> _ParsedRobots:
             seen_any_directive = False
             continue
 
-        # From here, we’re in directive territory
+        # From here, we're in directive territory
         seen_any_directive = True
 
         if key == "allow":
@@ -165,10 +202,9 @@ def _parse_robots(text: str) -> _ParsedRobots:
                 if cd >= 0:
                     current.crawl_delay = cd
             except ValueError:
-                # ignore invalid values
                 pass
         else:
-            # ignore Sitemap and any other directives for this MVP
+            # ignore other directives for this MVP
             pass
 
     # flush last group
@@ -178,15 +214,63 @@ def _parse_robots(text: str) -> _ParsedRobots:
     return _ParsedRobots(groups=groups)
 
 
+def _ua_product_tokens(ua: str) -> list[str]:
+    """
+    Extract likely product tokens from a User-Agent string.
+
+    RFC 9309 matching is defined against the UA string prefix, but in practice
+    UA strings may include multiple product tokens and/or leading branding.
+    To avoid incorrectly falling back to '*' groups, we consider *product tokens*
+    separated by whitespace and ignore parenthetical comment chunks.
+
+    Example:
+      "Email-Scraper/1.0 (+https://x; mailto:y)" -> ["email-scraper/1.0"]
+      "CrestwellPartners Email-Scraper/1.0 (+...)" -> ["crestwellpartners", "email-scraper/1.0"]
+    """
+    out: list[str] = []
+    for raw in (ua or "").strip().lower().split():
+        if not raw:
+            continue
+        if raw.startswith("("):
+            # parenthetical comments; ignore entirely
+            continue
+        tok = raw.strip(" \t\r\n;,)\"'")
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _ua_token_matches(ua: str, tok: str) -> bool:
+    """
+    Match a robots UA token against our UA string.
+
+    We accept:
+      - strict prefix match against full UA string
+      - OR prefix match against any extracted product token
+    """
+    ua_lc = (ua or "").strip().lower()
+    tok_lc = (tok or "").strip().lower()
+    if not tok_lc:
+        return False
+    if tok_lc == "*":
+        return True
+
+    if ua_lc.startswith(tok_lc):
+        return True
+
+    for p in _ua_product_tokens(ua_lc):
+        if p.startswith(tok_lc):
+            return True
+
+    return False
+
+
 def _best_group_for_ua(parsed: _ParsedRobots, ua: str) -> _Group | None:
     """
-    RFC-ish matching:
-      - UA tokens are matched case-insensitively against the *prefix* of our UA string.
-      - Choose the group with the longest matching token (most specific).
-      - If none match, fall back to a group whose UA is '*'.
-      - If multiple '*' groups exist, take the first encountered.
+    Choose the best matching group for our UA:
+      - Prefer the group with the longest matching UA token (most specific).
+      - If none match, fall back to the first '*' group if present.
     """
-    ua_lc = ua.lower()
     best: _Group | None = None
     best_len = -1
     star_fallback: _Group | None = None
@@ -197,7 +281,7 @@ def _best_group_for_ua(parsed: _ParsedRobots, ua: str) -> _Group | None:
                 if star_fallback is None:
                     star_fallback = g
                 continue
-            if ua_lc.startswith(tok) and len(tok) > best_len:
+            if _ua_token_matches(ua, tok) and len(tok) > best_len:
                 best = g
                 best_len = len(tok)
 
@@ -206,18 +290,16 @@ def _best_group_for_ua(parsed: _ParsedRobots, ua: str) -> _Group | None:
     return star_fallback
 
 
-def _evaluate_rules(path: str, rules: list[_Rule]) -> bool:
+def _evaluate_rules(path: str, rules: list[_Rule]) -> tuple[bool, _Rule | None]:
     """
     Apply longest-prefix rule wins.
     Tie-breaker: if equal length, 'Allow' beats 'Disallow'.
     If no rule matches, allow.
+
+    Returns (allowed, matched_rule) where matched_rule is the rule that determined
+    the outcome, or None if no rule matched (default allow).
     """
-    # normalize to path-only (strip query/fragment)
     if not path.startswith("/"):
-        # defensive: ensure we evaluate a path
-        # accept full URLs but only use their path component
-        # very small, dependency-free parse:
-        # find first '/', then take until '?' or '#'
         idx = path.find("/")
         path = path[idx:] if idx >= 0 else "/"
     q = path.split("?", 1)[0].split("#", 1)[0]
@@ -226,32 +308,30 @@ def _evaluate_rules(path: str, rules: list[_Rule]) -> bool:
     best_len = -1
 
     for r in rules:
-        # simple prefix match
         if q.startswith(r.path):
             plen = len(r.path)
             if plen > best_len or (
-                plen == best_len and (best_rule is None or r.allow and not best_rule.allow)
+                plen == best_len and (best_rule is None or (r.allow and not best_rule.allow))
             ):
                 best_rule = r
                 best_len = plen
 
     if best_rule is None:
-        return True
-    return best_rule.allow
+        return True, None
+    return best_rule.allow, best_rule
 
 
 def _build_policy_from_text(text: str) -> _Policy:
     parsed = _parse_robots(text)
     grp = _best_group_for_ua(parsed, FETCH_USER_AGENT)
     if grp is None:
-        # no applicable group → allow all with default delay
         return _Policy(
             kind="allow_all",
             crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
             reason="no-applicable-group",
             status_code=200,
         )
-    # rules present for chosen group
+
     return _Policy(
         kind="rules",
         rules=grp.rules[:],
@@ -266,10 +346,6 @@ def _build_policy_from_text(text: str) -> _Policy:
 def _fetch_and_resolve(host: str) -> _Policy:
     """
     Fetch https://{host}/robots.txt and return a resolved policy for our UA.
-    Status handling:
-      - 200 → parse and enforce rules; cache for ROBOTS_TTL_SECONDS
-      - 404/401/403 → treat as no robots (allow_all); cache for ROBOTS_TTL_SECONDS
-      - >=500 or timeout → deny_all for ROBOTS_DENY_TTL_SECONDS
     """
     url = f"{_ROBOTS_SCHEME}://{host}/robots.txt"
     try:
@@ -280,15 +356,16 @@ def _fetch_and_resolve(host: str) -> _Policy:
         ) as client:
             resp = client.get(url)
     except (httpx.RequestError, httpx.TimeoutException):
+        now = _now()
         pol = _Policy(
             kind="deny_all",
             crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
             reason="timeout",
             status_code=None,
+            robots_url=url,
+            fetched_at=now,
+            expires_at=now + ROBOTS_DENY_TTL_SECONDS,
         )
-        now = _now()
-        pol.fetched_at = now
-        pol.expires_at = now + ROBOTS_DENY_TTL_SECONDS
         return pol
 
     status = resp.status_code
@@ -300,6 +377,7 @@ def _fetch_and_resolve(host: str) -> _Policy:
         pol.reason = "ok"
         pol.fetched_at = now
         pol.expires_at = now + ROBOTS_TTL_SECONDS
+        pol.robots_url = url
         return pol
 
     if status in (401, 403, 404):
@@ -308,9 +386,10 @@ def _fetch_and_resolve(host: str) -> _Policy:
             crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
             reason=f"{status}-treat-as-no-robots",
             status_code=status,
+            robots_url=url,
+            fetched_at=now,
+            expires_at=now + ROBOTS_TTL_SECONDS,
         )
-        pol.fetched_at = now
-        pol.expires_at = now + ROBOTS_TTL_SECONDS
         return pol
 
     if status >= 500:
@@ -319,45 +398,56 @@ def _fetch_and_resolve(host: str) -> _Policy:
             crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
             reason=f"{status}-server-error",
             status_code=status,
+            robots_url=url,
+            fetched_at=now,
+            expires_at=now + ROBOTS_DENY_TTL_SECONDS,
         )
-        pol.fetched_at = now
-        pol.expires_at = now + ROBOTS_DENY_TTL_SECONDS
         return pol
 
-    # Other odd statuses: be conservative but not punitive → allow_all
     pol = _Policy(
         kind="allow_all",
         crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
         reason=f"{status}-treated-as-allow",
         status_code=status,
+        robots_url=url,
+        fetched_at=now,
+        expires_at=now + ROBOTS_TTL_SECONDS,
     )
-    pol.fetched_at = now
-    pol.expires_at = now + ROBOTS_TTL_SECONDS
     return pol
 
 
 def _get_policy(host: str, *, force_refresh: bool = False) -> _Policy:
     host = host.strip().lower()
     if not host:
-        # Defensive: empty host → allow all with default delay (non-caching)
         return _Policy(
-            kind="allow_all", crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS, reason="empty-host"
+            kind="allow_all",
+            crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
+            reason="empty-host",
         )
 
-    with _host_lock(host):
-        pol = _MEMO.get(host)
-        now = _now()
-        if force_refresh or pol is None or pol.expires_at <= now:
-            pol = _fetch_and_resolve(host)
-            # stamp expiry/fetched times if missing (shouldn’t be)
-            if pol.fetched_at == 0.0:
-                pol.fetched_at = now
-            if pol.expires_at == 0.0:
-                # default to TTL if not set
-                ttl = ROBOTS_TTL_SECONDS if pol.kind != "deny_all" else ROBOTS_DENY_TTL_SECONDS
-                pol.expires_at = now + ttl
-            _MEMO[host] = pol
+    lock = _host_lock(host)
+    with lock:
+        cached = _MEMO.get(host)
+        if cached is not None and not force_refresh:
+            if _now() < cached.expires_at:
+                return cached
+
+        pol = _fetch_and_resolve(host)
+        _MEMO[host] = pol
         return pol
+
+
+def _extract_path(url_or_path: str) -> str:
+    """Extract just the path from a URL or path string."""
+    if url_or_path.startswith("/"):
+        return url_or_path.split("?", 1)[0].split("#", 1)[0]
+    if "://" in url_or_path:
+        idx = url_or_path.find("/", url_or_path.find("://") + 3)
+        if idx >= 0:
+            path = url_or_path[idx:]
+            return path.split("?", 1)[0].split("#", 1)[0]
+        return "/"
+    return "/" + url_or_path.lstrip("/")
 
 
 # --------------------------------------------------------------------------------------
@@ -365,52 +455,95 @@ def _get_policy(host: str, *, force_refresh: bool = False) -> _Policy:
 # --------------------------------------------------------------------------------------
 
 
-def get_crawl_delay(host: str, *, refresh: bool = False) -> float:
+def is_allowed(host: str, path: str) -> bool:
     """
-    Return crawl-delay (seconds) for this host resolved for our UA.
-    Falls back to ROBOTS_DEFAULT_DELAY_SECONDS if unspecified.
+    Return True if fetching the given path on host is allowed per robots.txt.
     """
-    pol = _get_policy(host, force_refresh=refresh)
-    # Always return a non-negative delay
-    cd = pol.crawl_delay if pol.crawl_delay is not None else ROBOTS_DEFAULT_DELAY_SECONDS
-    try:
-        # guard against NaN/negatives sneaking in
-        return max(0.0, float(cd))
-    except Exception:
-        return ROBOTS_DEFAULT_DELAY_SECONDS
+    pol = _get_policy(host)
 
-
-def is_allowed(host: str, url_path: str, *, refresh: bool = False) -> bool:
-    """
-    Check if path is allowed to be fetched for our UA on this host.
-    During outage windows (deny_all policy), this returns False.
-    """
-    pol = _get_policy(host, force_refresh=refresh)
-
-    if pol.kind == "deny_all":
-        return False
     if pol.kind == "allow_all":
         return True
-    # rules
-    return _evaluate_rules(url_path, pol.rules)
+    if pol.kind == "deny_all":
+        return False
+
+    allowed, _ = _evaluate_rules(path, pol.rules)
+    return allowed
 
 
-# --------------------------------------------------------------------------------------
-# Test/ops helpers (safe to use in tests)
-# --------------------------------------------------------------------------------------
+def explain_block(host: str, path: str) -> RobotsBlockInfo:
+    """
+    Return a structured explanation of whether a URL is blocked and why.
+    """
+    pol = _get_policy(host)
+
+    normalized_path = _extract_path(path)
+    full_url = f"https://{host}{normalized_path}"
+    robots_url = pol.robots_url or f"https://{host}/robots.txt"
+
+    if pol.kind == "allow_all":
+        return RobotsBlockInfo(
+            blocked_url=full_url,
+            robots_url=robots_url,
+            user_agent=FETCH_USER_AGENT,
+            allowed=True,
+            reason=f"allow_all ({pol.reason})",
+            matched_rule=None,
+            notes=None,
+        )
+
+    if pol.kind == "deny_all":
+        return RobotsBlockInfo(
+            blocked_url=full_url,
+            robots_url=robots_url,
+            user_agent=FETCH_USER_AGENT,
+            allowed=False,
+            reason=f"deny_all ({pol.reason})",
+            matched_rule=None,
+            notes="All paths blocked due to server error or timeout fetching robots.txt",
+        )
+
+    allowed, matched_rule = _evaluate_rules(normalized_path, pol.rules)
+
+    if matched_rule is None:
+        return RobotsBlockInfo(
+            blocked_url=full_url,
+            robots_url=robots_url,
+            user_agent=FETCH_USER_AGENT,
+            allowed=True,
+            reason="no_matching_rule",
+            matched_rule=None,
+            notes="No Disallow/Allow rule matched this path; default is allow",
+        )
+
+    rule_type = "Allow" if matched_rule.allow else "Disallow"
+    rule_str = f"{rule_type}: {matched_rule.path}"
+
+    return RobotsBlockInfo(
+        blocked_url=full_url,
+        robots_url=robots_url,
+        user_agent=FETCH_USER_AGENT,
+        allowed=allowed,
+        reason="disallow_rule" if not allowed else "allow_rule",
+        matched_rule=rule_str,
+        notes=None,
+    )
 
 
-def _debug_peek_policy(host: str) -> _Policy | None:
-    """Return the cached policy for inspection (or None)."""
-    return _MEMO.get(host.strip().lower())
+def get_crawl_delay(host: str) -> float:
+    """
+    Return the crawl-delay for host, or default if not specified.
+    """
+    pol = _get_policy(host)
+    return pol.crawl_delay if pol.crawl_delay is not None else ROBOTS_DEFAULT_DELAY_SECONDS
 
 
-def clear_cache(host: str | None = None) -> None:
-    """Clear robots memoization cache (all or one host)."""
+def clear_cache() -> None:
+    """Clear the in-memory robots cache (useful for testing)."""
     with _GLOBAL_LOCK:
-        if host is None:
-            _MEMO.clear()
-            _LOCKS.clear()
-        else:
-            _MEMO.pop(host.strip().lower(), None)
-            _LOCKS.pop(host.strip().lower(), None)
+        _MEMO.clear()
+        _LOCKS.clear()
+
+
+def force_refresh(host: str) -> None:
+    """Force a re-fetch of robots.txt for the given host."""
+    _get_policy(host, force_refresh=True)

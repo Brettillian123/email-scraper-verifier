@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import sqlite3
 from pathlib import Path
 
+from src.db import get_conn
 from src.db_suppression import upsert_suppression
 
 
-def import_csv(db_path: str, csv_path: str, source: str) -> None:
+def import_csv(csv_path: str, source: str) -> None:
     """
     Import CRM suppression data from a CSV file into the suppression table.
 
@@ -30,34 +30,33 @@ def import_csv(db_path: str, csv_path: str, source: str) -> None:
         o11test@example.com,bounced
         unsub@example.com,unsubscribed
     """
-    db_path_resolved = Path(db_path).resolve()
     csv_path_resolved = Path(csv_path).resolve()
 
-    conn = sqlite3.connect(str(db_path_resolved))
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
 
-    with csv_path_resolved.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw_email = (row.get("email") or "").strip()
-            if not raw_email:
-                # Skip rows without an email.
-                continue
+    try:
+        with csv_path_resolved.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                raw_email = (row.get("email") or "").strip()
+                if not raw_email:
+                    # Skip rows without an email.
+                    continue
 
-            reason = (row.get("reason") or "").strip() or "crm_sync"
-            upsert_suppression(conn, email=raw_email, reason=reason, source=source)
+                reason = (row.get("reason") or "").strip() or "crm_sync"
+                upsert_suppression(conn, email=raw_email, reason=reason, source=source)
 
-    conn.commit()
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Import CRM suppression CSV into the local suppression table."
-    )
-    parser.add_argument(
-        "--db",
-        default="data/dev.db",
-        help="Path to SQLite database (default: data/dev.db)",
     )
     parser.add_argument(
         "--source",
@@ -70,7 +69,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    import_csv(args.db, args.csv_path, args.source)
+    import_csv(args.csv_path, args.source)
 
 
 if __name__ == "__main__":

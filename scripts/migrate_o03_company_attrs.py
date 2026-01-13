@@ -8,52 +8,65 @@ Adds (if absent):
 
 Notes
 -----
-- Stored as TEXT for broad SQLite compatibility (json1 not required).
+- Stored as TEXT to preserve existing application logic and broad compatibility.
 - Writers should json.dumps(...) with ensure_ascii=False.
 - Readers should treat missing/empty as {}.
-- Idempotent: checks for column before adding.
+- Postgres-only migration; all DB access routed through src.db.get_conn().
 
 Usage:
-  python scripts/migrate_o03_company_attrs.py --db dev.db
+  python scripts/migrate_o03_company_attrs.py
+  python scripts/migrate_o03_company_attrs.py --dsn "postgresql://..."
 """
 
 from __future__ import annotations
 
 import argparse
-import sqlite3
-from pathlib import Path
+import os
+import sys
+from typing import Any
+
+from src.db import get_conn
 
 
-def table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
+def apply_dsn_override(dsn: str | None) -> None:
+    if not dsn:
+        return
+    os.environ["DATABASE_URL"] = dsn
+
+
+def table_exists(cur: Any, *, schema: str, table: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+    row = cur.fetchone()
+    return row is not None and row[0] is not None
+
+
+def column_exists(cur: Any, *, schema: str, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s AND column_name = %s
+        LIMIT 1
+        """,
+        (schema, table, column),
     )
     return cur.fetchone() is not None
 
 
-def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    cur = conn.execute(f'PRAGMA table_info("{table}")')
-    for _, name, *_ in cur.fetchall():
-        if name == column:
-            return True
-    return False
-
-
-def add_column(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> bool:
-    if not table_exists(conn, table):
-        raise RuntimeError(f'Table "{table}" does not exist.')
-    if column_exists(conn, table, column):
+def add_column(cur: Any, *, schema: str, table: str, column: str, ddl_type: str) -> bool:
+    if not table_exists(cur, schema=schema, table=table):
+        raise RuntimeError(f'Table "{schema}.{table}" does not exist.')
+    if column_exists(cur, schema=schema, table=table, column=column):
         return False
-    conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl_type}')
+    cur.execute(f'ALTER TABLE {schema}."{table}" ADD COLUMN "{column}" {ddl_type}')
     return True
 
 
-def run(conn: sqlite3.Connection) -> list[str]:
+def run(cur: Any, *, schema: str) -> list[str]:
     actions: list[str] = []
 
     # -- companies.attrs (TEXT for JSON) --
-    if add_column(conn, "companies", "attrs", "TEXT"):
+    if add_column(cur, schema=schema, table="companies", column="attrs", ddl_type="TEXT"):
         actions.append("Added column companies.attrs (TEXT for JSON)")
     else:
         actions.append("companies.attrs already present; skipping")
@@ -63,22 +76,43 @@ def run(conn: sqlite3.Connection) -> list[str]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="O03 DB migration (companies.attrs JSON field)")
-    p.add_argument("--db", default="dev.db", help="Path to SQLite database file (default: dev.db)")
+    p.add_argument(
+        "--dsn",
+        "--db",
+        dest="dsn",
+        default=None,
+        help="Postgres DSN/URL (optional; overrides DATABASE_URL for this run).",
+    )
+    p.add_argument(
+        "--schema",
+        default=os.getenv("PGSCHEMA", "public"),
+        help="Target schema (default: public, or PGSCHEMA env var).",
+    )
     args = p.parse_args()
+    apply_dsn_override(args.dsn)
 
-    db_path = Path(args.db)
-    if not db_path.exists():
-        raise SystemExit(f'Error: database file "{db_path}" not found.')
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.isolation_level = None
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
         try:
-            conn.execute("BEGIN")
-            actions = run(conn)
-            conn.execute("COMMIT")
+            actions = run(cur, schema=args.schema)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
         except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     print("✔ O03 migration completed.")
     for a in actions:
@@ -86,4 +120,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise

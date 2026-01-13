@@ -6,7 +6,7 @@ import json
 import sqlite3
 from typing import Any
 
-from src.db import get_connection
+from src.db import get_conn
 
 
 def log_admin_action(
@@ -31,7 +31,7 @@ def log_admin_action(
         swallowed so admin endpoints do not break.
     """
     if conn is None:
-        conn = get_connection()
+        conn = get_conn()
 
     payload = metadata or {}
     try:
@@ -70,7 +70,7 @@ def get_recent_admin_actions(
         limit = 1
 
     if conn is None:
-        conn = get_connection()
+        conn = get_conn()
 
     try:
         cur = conn.execute(

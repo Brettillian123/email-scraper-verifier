@@ -1,13 +1,14 @@
+# src/queueing/tasks.py
 from __future__ import annotations
 
 import json
 import logging
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from src.autodiscovery_result import AutodiscoveryResult
 from src.config import (
     SMTP_COMMAND_TIMEOUT,
     SMTP_CONNECT_TIMEOUT,
@@ -44,15 +46,36 @@ from src.extract.candidates import ROLE_ALIASES
 from src.extract.candidates import Candidate as ExtractCandidate
 from src.extract.candidates import extract_candidates as extract_html_candidates
 
-# O27 AI extractor (with optional global enable flag)
+# Task A: Robots explainability imports
 try:
-    from src.extract.ai_candidates import (
-        AI_PEOPLE_ENABLED,
-        extract_ai_candidates,
-    )
-except ImportError:
-    from src.extract.ai_candidates import extract_ai_candidates  # type: ignore
+    from src.fetch.robots import RobotsBlockInfo, explain_block
+    from src.fetch.robots import is_allowed as robots_is_allowed
 
+    _HAS_ROBOTS_EXPLAINABILITY = True
+except ImportError:
+    _HAS_ROBOTS_EXPLAINABILITY = False
+    RobotsBlockInfo = None  # type: ignore[assignment,misc]
+    explain_block = None  # type: ignore[assignment]
+    robots_is_allowed = None  # type: ignore[assignment]
+
+# O27 AI wrapper (preferred) + metrics plumb-back
+try:
+    from src.extract.ai_candidates_wrapper import (
+        refine_candidates_with_ai,
+        update_result_from_metrics,
+    )
+
+    _HAS_AI_WRAPPER = True
+except Exception:  # pragma: hidden
+    refine_candidates_with_ai = None  # type: ignore[assignment]
+    update_result_from_metrics = None  # type: ignore[assignment]
+    _HAS_AI_WRAPPER = False
+
+# Keep AI_PEOPLE_ENABLED as a lightweight "global enable" hint (best-effort).
+# The wrapper enforces the real contract and handles optional OpenAI deps.
+try:
+    from src.extract.ai_candidates import AI_PEOPLE_ENABLED  # type: ignore
+except Exception:  # pragma: no cover
     AI_PEOPLE_ENABLED = True  # type: ignore[assignment]
 
 # O26: role/placeholder handling
@@ -99,14 +122,31 @@ log = logging.getLogger(__name__)
 _cfg = load_settings()
 
 
-def _conn() -> sqlite3.Connection:
+def _conn() -> Any:
     """
-    Lightweight SQLite connection helper for tasks that need direct DB access.
+    Lightweight connection helper for tasks that need direct DB access.
 
-    Delegate to src.db.get_conn() so we always use the same DB_URL / schema
+    Delegate to src.db.get_conn() so we always use the same DATABASE_URL / schema
     as the rest of the application (including domain_resolutions, R17, etc.).
+
+    Returns a CompatConnection (works with both SQLite and PostgreSQL).
     """
     return get_conn()
+
+
+def _store_result_in_job_meta(result: AutodiscoveryResult) -> None:
+    """
+    Task E: Store autodiscovery result in RQ job meta if running inside a worker.
+
+    This enables inspection of results via job.meta["autodiscovery_result"].
+    """
+    try:
+        job = get_current_job()
+        if job is not None:
+            job.meta["autodiscovery_result"] = result.to_dict()
+            job.save_meta()
+    except Exception as e:
+        log.debug("Could not store result in job meta: %s", e)
 
 
 def _enqueue_company_task(task_name: str, company_id: int) -> None:
@@ -165,9 +205,18 @@ def resolve_company_domain(
         getattr(dec, "method", "unknown"),
         getattr(dec, "confidence", 0),
     )
-    with _conn() as con:
+    with _conn():
         # write_domain_resolution already expects a hint-like string in the last param.
-        write_domain_resolution(con, company_id, company_name, dec, hint)
+        write_domain_resolution(
+            company_id=company_id,
+            company_name=company_name,
+            user_hint=hint,
+            chosen_domain=getattr(dec, "chosen", None),
+            method=getattr(dec, "method", None),
+            confidence=getattr(dec, "confidence", None),
+            reason=getattr(dec, "reason", None),
+            resolver_version=getattr(dec, "resolver_version", None) or "1.0",
+        )
 
     # After we have a chosen canonical domain, kick off the crawl as a follow-up
     # task. We keep this best-effort; failures to enqueue should not break R08.
@@ -453,25 +502,26 @@ def verify_email_task(  # noqa: C901
             # Never block semaphore release on DB issues
             log.exception(
                 "upsert_verification_result failed",
-                extra={
-                    "email": email,
-                    "status": status,
-                    "reason": reason,
-                    "mx": mx_host,
-                },
+                extra={"email": email, "status": status, "reason": reason, "mx": mx_host},
             )
 
         # Only release what we actually acquired
-        redis = get_redis()
-        if redis:
-            try:
-                release(redis, MX_SEM.format(mx=mx_host))
-            except Exception:
-                pass
-            try:
-                release(redis, GLOBAL_SEM)
-            except Exception:
-                pass
+        try:
+            redis2 = get_redis()
+        except Exception:
+            redis2 = None  # type: ignore[assignment]
+
+        if redis2 is not None:
+            if got_mx:
+                try:
+                    release(redis2, MX_SEM.format(mx=mx_host))
+                except Exception:
+                    pass
+            if got_global:
+                try:
+                    release(redis2, GLOBAL_SEM)
+                except Exception:
+                    pass
 
 
 # -------------------------------#
@@ -870,10 +920,7 @@ def _maybe_run_fallback(email_str: str, category: str) -> tuple[str | None, Any 
             raw = getattr(fb_res, "raw", None)
             return status, raw
     except Exception as e:
-        log.exception(
-            "O07 verify_with_fallback failed",
-            extra={"email": email_str, "exc": str(e)},
-        )
+        log.exception("O07 verify_with_fallback failed", extra={"email": email_str, "exc": str(e)})
     return None, None
 
 
@@ -894,8 +941,7 @@ def _load_catchall_status_for_domain(db_path: str, domain: str) -> str | None:
         return None
 
     try:
-        con = sqlite3.connect(db_path)
-        con.row_factory = sqlite3.Row
+        con = get_conn()
         try:
             row = con.execute(
                 """
@@ -909,15 +955,19 @@ def _load_catchall_status_for_domain(db_path: str, domain: str) -> str | None:
             ).fetchone()
             if not row:
                 return None
-            val = row["catch_all_status"]
+            # Handle both dict-like (DictCursor) and tuple-like rows
+            if hasattr(row, "get"):
+                val = row.get("catch_all_status")
+            elif hasattr(row, "__getitem__"):
+                val = row[0] if isinstance(row, (list, tuple)) else row["catch_all_status"]
+            else:
+                val = row[0]
             return str(val) if val is not None else None
         finally:
             con.close()
     except Exception:
         log.debug(
-            "R18: failed to load catch_all_status for domain",
-            exc_info=True,
-            extra={"domain": dom},
+            "R18: failed to load catch_all_status for domain", exc_info=True, extra={"domain": dom}
         )
         return None
 
@@ -983,6 +1033,8 @@ def _persist_probe_result_r18(
     Adjustment:
       - Prefer cached catch-all status from DB.
       - Skip *active* catch-all probing when tcp25_ok is False to avoid long hangs.
+      - Persist email/domain when columns exist.
+      - Use src.db.get_conn() for consistency with the rest of the app.
     """
     dom = (domain or "").strip().lower()
     try:
@@ -1036,45 +1088,114 @@ def _persist_probe_result_r18(
             except Exception:
                 fallback_raw_text = str(fallback_raw)
 
-        con = sqlite3.connect(db_path)
+        # Normalize email_id: store NULL instead of 0.
+        email_id_val: int | None = int(email_id) if int(email_id or 0) > 0 else None
+
+        # Build a flexible insert that adapts to schema drift.
+        desired_order = [
+            "email_id",
+            "email",
+            "domain",
+            "mx_host",
+            "status",
+            "reason",
+            "checked_at",
+            "fallback_status",
+            "fallback_raw",
+            "fallback_checked_at",
+            "verify_status",
+            "verify_reason",
+            "verified_mx",
+            "verified_at",
+            "test_send_status",
+        ]
+        values: dict[str, Any] = {
+            "email_id": email_id_val,
+            "email": (email or "").strip() or None,
+            "domain": dom or None,
+            "mx_host": (mx_host or "").strip().lower() or None,
+            "status": raw_status,
+            "reason": raw_reason,
+            "checked_at": ts_iso,
+            "fallback_status": fallback_status,
+            "fallback_raw": fallback_raw_text,
+            "fallback_checked_at": ts_iso if fallback_status is not None else None,
+            "verify_status": verify_status,
+            "verify_reason": verify_reason,
+            "verified_mx": (mx_host or "").strip().lower() or None,
+            "verified_at": ts_iso,
+            "test_send_status": "not_requested",
+        }
+
+        con = get_conn()
         try:
-            cur = con.execute(
-                """
-                INSERT INTO verification_results (
-                  email_id,
-                  mx_host,
-                  status,
-                  reason,
-                  checked_at,
-                  fallback_status,
-                  fallback_raw,
-                  fallback_checked_at,
-                  verify_status,
-                  verify_reason,
-                  verified_mx,
-                  verified_at
+            # Figure out available columns via PRAGMA emulation (works on both SQLite and Postgres)
+            cols: set[str] = set()
+            try:
+                rows = con.execute("PRAGMA table_info(verification_results)").fetchall()
+                cols = {r[1] for r in rows if len(r) > 1}
+            except Exception:
+                cols = set()
+
+            attempts: list[list[str]] = []
+            if cols:
+                attempts.append([c for c in desired_order if c in cols])
+                # If email/domain are absent in schema, the above automatically drops them.
+            else:
+                # Unknown schema: try full, then reduced.
+                attempts.append(desired_order)
+                attempts.append(
+                    [
+                        "email_id",
+                        "mx_host",
+                        "status",
+                        "reason",
+                        "checked_at",
+                        "fallback_status",
+                        "fallback_raw",
+                        "fallback_checked_at",
+                        "verify_status",
+                        "verify_reason",
+                        "verified_mx",
+                        "verified_at",
+                    ]
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(email_id),
-                    mx_host,
-                    raw_status,
-                    raw_reason,
-                    ts_iso,
-                    fallback_status,
-                    fallback_raw_text,
-                    ts_iso if fallback_status is not None else None,
-                    verify_status,
-                    verify_reason,
-                    mx_host,
-                    ts_iso,
-                ),
-            )
-            verification_result_id = int(cur.lastrowid)
-            con.commit()
+
+            last_exc: Exception | None = None
+            verification_result_id: int | None = None
+
+            for cols_try in attempts:
+                cols_try = [c for c in cols_try if c in values]
+                if not cols_try:
+                    continue
+                placeholders = ", ".join(["?"] * len(cols_try))
+                cols_sql = ", ".join(cols_try)
+                params = [values[c] for c in cols_try]
+                try:
+                    cur = con.execute(
+                        f"INSERT INTO verification_results ({cols_sql}) VALUES ({placeholders})",
+                        params,
+                    )
+                    try:
+                        verification_result_id = int(cur.lastrowid)  # type: ignore[attr-defined]
+                    except Exception:
+                        verification_result_id = None
+                    con.commit()
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+
+            if last_exc is not None:
+                raise last_exc
+
         finally:
-            con.close()
+            try:
+                con.close()
+            except Exception:
+                pass
+
     except Exception:
         log.exception(
             "R18: failed to persist verification_results row",
@@ -1210,12 +1331,7 @@ def _enqueue_test_send_email(
     try:
         q = Queue(name="test_send", connection=get_redis())
         q.enqueue(
-            task_send_test_email,
-            verification_result_id,
-            email,
-            token,
-            job_timeout=30,
-            retry=None,
+            task_send_test_email, verification_result_id, email, token, job_timeout=30, retry=None
         )
     except Exception as exc:
         log.warning(
@@ -1289,9 +1405,7 @@ def _maybe_escalate_to_test_send(
 
     try:
         token = request_test_send(
-            db_path=db_path,
-            verification_result_id=verification_result_id,
-            email=email,
+            db_path=db_path, verification_result_id=verification_result_id, email=email
         )
     except Exception as exc:
         log.exception(
@@ -1323,8 +1437,7 @@ def _maybe_escalate_to_test_send(
     )
 
 
-@job("verify", timeout=20)
-def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
+def _task_probe_email_impl(email_id: int, email: str, domain: str, force: bool = False) -> dict:
     """
     Adjustments:
       - Add fast TCP/25 preflight (cached) and short-circuit when blocked (unless force=True).
@@ -1442,7 +1555,6 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
 
         category = result.get("category", "unknown")
         code = result.get("code")
-        elapsed_res = result.get("elapsed_ms")
         error_val = result.get("error")
 
         fallback_status, fallback_raw = _maybe_run_fallback(email_str, category)
@@ -1451,11 +1563,11 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             "ok": bool(result.get("ok", True)),
             "category": category,
             "code": code,
-            "mx_host": result.get("mx_host", mx_host),
+            "mx_host": mx_host,
             "domain": dom,
             "email_id": int(email_id),
             "email": email_str,
-            "elapsed_ms": int(elapsed_res or int((time.perf_counter() - start) * 1000)),
+            "elapsed_ms": int((time.perf_counter() - start) * 1000),
             "error": error_val,
         }
 
@@ -1468,7 +1580,7 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             email_id=int(email_id),
             email=email_str,
             domain=dom,
-            mx_host=base["mx_host"],
+            mx_host=mx_host,
             category=category,
             code=code,
             error=error_val,
@@ -1482,38 +1594,38 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             base["verified_mx"] = v_mx
             base["verified_at"] = v_at
 
-            try:
-                _maybe_escalate_to_test_send(
-                    db_path=db_path,
-                    email_id=int(email_id),
-                    email=email_str,
-                    domain=dom,
-                    mx_host=base["mx_host"],
-                    category=category,
-                    code=code,
-                    fallback_status=fallback_status,
-                    behavior_hint=behavior_hint,
-                    verify_status=v_status,
-                    verify_reason=v_reason,
-                    verified_at=v_at,
-                    verification_result_id=vr_id,
-                )
-            except Exception:
-                log.exception(
-                    "O26 test_send escalation failed",
-                    extra={
-                        "email_id": int(email_id),
-                        "email": email_str,
-                        "domain": dom,
-                        "mx_host": base["mx_host"],
-                    },
-                )
+        _maybe_escalate_to_test_send(
+            db_path=db_path,
+            email_id=int(email_id),
+            email=email_str,
+            domain=dom,
+            mx_host=mx_host,
+            category=category,
+            code=code,
+            fallback_status=fallback_status,
+            behavior_hint=behavior_hint,
+            verify_status=v_status,
+            verify_reason=v_reason,
+            verified_at=v_at,
+            verification_result_id=vr_id,
+        )
 
         return base
 
-    except Exception as e:
-        error_payload: dict[str, Any] = {
+    except Exception as exc:
+        log.exception(
+            "R16 task_probe_email failed",
+            extra={
+                "email_id": email_id,
+                "email": email_str,
+                "domain": dom,
+                "mx_host": mx_host,
+                "exc": str(exc),
+            },
+        )
+        return {
             "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
             "category": "unknown",
             "code": None,
             "mx_host": mx_host,
@@ -1521,29 +1633,7 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
             "email_id": int(email_id),
             "email": email_str,
             "elapsed_ms": int((time.perf_counter() - start) * 1000),
-            "error": f"{type(e).__name__}: {e}",
         }
-
-        v_status, v_reason, v_mx, v_at, _vr_id = _persist_probe_result_r18(
-            db_path=db_path,
-            email_id=int(email_id),
-            email=email_str,
-            domain=dom,
-            mx_host=mx_host,
-            category=error_payload["category"],
-            code=error_payload["code"],
-            error=error_payload["error"],
-            fallback_status=None,
-            fallback_raw=None,
-            tcp25_ok=tcp25_ok,
-        )
-        if v_status is not None:
-            error_payload["verify_status"] = v_status
-            error_payload["verify_reason"] = v_reason
-            error_payload["verified_mx"] = v_mx
-            error_payload["verified_at"] = v_at
-
-        return error_payload
     finally:
         if redis_ok and redis_obj is not None:
             if got_mx:
@@ -1558,23 +1648,39 @@ def task_probe_email(email_id: int, email: str, domain: str, force: bool = False
                     pass
 
 
+@job("verify", timeout=20)
+def task_probe_email(email_id: int, email: str, domain: str, force: bool = False) -> dict:
+    """RQ entrypoint for R16/R18 probes.
+
+    This thin wrapper exists so we can expose a stable synchronous callable for
+    local debugging/tests via ``task_probe_email.__wrapped__(...)``.
+    """
+    return _task_probe_email_impl(email_id=email_id, email=email, domain=domain, force=force)
+
+
+# Expose core implementation for direct synchronous invocation (pytest/CLI)
+task_probe_email.__wrapped__ = _task_probe_email_impl  # type: ignore[attr-defined]
+
+
 # ---------------------------------------------
 # Helpers for O01 domain pattern inference/cache
 # ---------------------------------------------
 
 
-def _has_table(con: sqlite3.Connection, name: str) -> bool:
+def _has_table(con: Any, name: str) -> bool:
+    """
+    Check if a table exists in the database.
+    Works with both SQLite (via compat layer emulation) and PostgreSQL.
+    """
     try:
-        cur = con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-            (name,),
-        )
+        # The compat layer emulates sqlite_master queries for Postgres
+        cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (name,))
         return cur.fetchone() is not None
     except Exception:
         return False
 
 
-def _examples_for_domain(con: sqlite3.Connection, domain: str) -> list[tuple[str, str, str]]:
+def _examples_for_domain(con: Any, domain: str) -> list[tuple[str, str, str]]:
     """
     Build [(first, last, localpart)] examples for a domain using 'published' emails.
 
@@ -1661,14 +1767,13 @@ def _examples_for_domain(con: sqlite3.Connection, domain: str) -> list[tuple[str
     return examples
 
 
-def _load_cached_pattern(con: sqlite3.Connection, domain: str) -> str | None:
+def _load_cached_pattern(con: Any, domain: str) -> str | None:
     """Read a cached canonical pattern key for a domain if the table exists."""
     if not _has_table(con, "domain_patterns"):
         return None
     try:
         row = con.execute(
-            "SELECT pattern FROM domain_patterns WHERE domain = ?",
-            (domain,),
+            "SELECT pattern FROM domain_patterns WHERE domain = ?", (domain,)
         ).fetchone()
         pat = row[0] if row and row[0] else None
         if pat in CANON_PATTERNS:
@@ -1679,16 +1784,13 @@ def _load_cached_pattern(con: sqlite3.Connection, domain: str) -> str | None:
 
 
 def _save_inferred_pattern(
-    con: sqlite3.Connection,
-    domain: str,
-    pattern: str,
-    confidence: float,
-    samples: int,
+    con: Any, domain: str, pattern: str, confidence: float, samples: int
 ) -> None:
     """Upsert the inferred pattern if the table exists."""
     if not _has_table(con, "domain_patterns"):
         return
     try:
+        # Use CURRENT_TIMESTAMP for cross-database compatibility
         con.execute(
             """
             INSERT INTO domain_patterns (domain, pattern, confidence, samples)
@@ -1697,44 +1799,35 @@ def _save_inferred_pattern(
               pattern=excluded.pattern,
               confidence=excluded.confidence,
               samples=excluded.samples,
-              inferred_at=datetime('now')
+              inferred_at=CURRENT_TIMESTAMP
             """,
             (domain, pattern, float(confidence), int(samples)),
         )
     except Exception:
         # Non-fatal; skip caching errors
         log.exception(
-            "failed to upsert domain_patterns",
-            extra={"domain": domain, "pattern": pattern},
+            "failed to upsert domain_patterns", extra={"domain": domain, "pattern": pattern}
         )
 
 
-def _company_id_for_person(con: sqlite3.Connection, person_id: int) -> int | None:
+def _company_id_for_person(con: Any, person_id: int) -> int | None:
     """
     Helper: resolve company_id for a person, if available.
     """
     try:
-        row = con.execute(
-            "SELECT company_id FROM people WHERE id = ?",
-            (person_id,),
-        ).fetchone()
+        row = con.execute("SELECT company_id FROM people WHERE id = ?", (person_id,)).fetchone()
         if not row:
             return None
         val = row[0]
         return int(val) if val is not None else None
     except Exception:
         log.debug(
-            "failed to load company_id for person",
-            exc_info=True,
-            extra={"person_id": person_id},
+            "failed to load company_id for person", exc_info=True, extra={"person_id": person_id}
         )
         return None
 
 
-def _load_company_email_pattern(
-    con: sqlite3.Connection,
-    company_id: int | None,
-) -> str | None:
+def _load_company_email_pattern(con: Any, company_id: int | None) -> str | None:
     """
     O26: read a per-company email pattern from companies.attrs["email_pattern"]
     when present and valid.
@@ -1747,11 +1840,7 @@ def _load_company_email_pattern(
         # Guard against schemas without attrs.
         if not _has_table(con, "companies"):
             return None
-        # PRAGMA may not expose attrs ordering; rely on exceptions to keep this best-effort.
-        row = con.execute(
-            "SELECT attrs FROM companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
+        row = con.execute("SELECT attrs FROM companies WHERE id = ?", (company_id,)).fetchone()
         if not row:
             return None
         raw = row[0]
@@ -1788,10 +1877,10 @@ def _load_company_email_pattern(
 # ---------------------------------------------
 
 
-def _email_row_id(con: sqlite3.Connection, email: str) -> int | None:
+def _email_row_id(con: Any, email: str) -> int | None:
     """
     Try to fetch the primary key for an email row.
-    Falls back to rowid if 'id' column is absent.
+    Falls back to rowid if 'id' column is absent (SQLite only).
     """
     email = (email or "").strip().lower()
     if not email:
@@ -1801,7 +1890,7 @@ def _email_row_id(con: sqlite3.Connection, email: str) -> int | None:
         if "id" in cols:
             row = con.execute("SELECT id FROM emails WHERE email = ?", (email,)).fetchone()
             return int(row[0]) if row else None
-        # fallback: rowid (works unless WITHOUT ROWID)
+        # rowid fallback only works for SQLite
         row = con.execute("SELECT rowid FROM emails WHERE email = ?", (email,)).fetchone()
         return int(row[0]) if row else None
     except Exception:
@@ -1830,14 +1919,26 @@ def _enqueue_r16_probe(email_id: int | None, email: str, domain: str) -> None:
 def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> dict:
     """
     Adjustment:
-      - Still persists all generated candidates
-      - BUT only enqueues up to MAX_PROBES_PER_PERSON probes (default 6) so
-        you don’t burn minutes per person when many permutations exist.
+      - Persists generated candidates (now capped to MAX_PROBES_PER_PERSON, default 6)
+      - Enqueues up to MAX_PROBES_PER_PERSON probes
+      - Stores pattern_used + pattern_rank with each generated email
     """
     con = get_conn()
     dom = (domain or "").lower().strip()
     if not dom:
-        return {"count": 0, "only_pattern": None, "domain": dom, "person_id": person_id}
+        return {
+            "count": 0,
+            "enqueued": 0,
+            "max_probes_per_person": 0,
+            "only_pattern": None,
+            "domain": dom,
+            "person_id": person_id,
+        }
+
+    try:
+        max_probes = max(0, int(os.getenv("MAX_PROBES_PER_PERSON", "6")))
+    except Exception:
+        max_probes = 6
 
     company_id = _company_id_for_person(con, person_id)
     company_pattern = _load_company_email_pattern(con, company_id)
@@ -1855,95 +1956,90 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
                 "company_pattern": company_pattern,
             },
         )
-        return {"count": 0, "only_pattern": None, "domain": dom, "person_id": person_id}
+        return {
+            "count": 0,
+            "enqueued": 0,
+            "max_probes_per_person": max_probes,
+            "only_pattern": None,
+            "domain": dom,
+            "person_id": person_id,
+        }
 
     cached_pattern = _load_cached_pattern(con, dom)
     examples = _examples_for_domain(con, dom)
 
     domain_pattern: str | None = None
-    inf_conf = 0.0
-    inf_samples = 0
+    inf_conf: float = 0.0
+    inf_samples: int = 0
 
-    if cached_pattern:
+    if cached_pattern in CANON_PATTERNS:
         domain_pattern = cached_pattern
-    else:
-        inf = infer_domain_pattern(examples)
-        domain_pattern = inf.pattern
-        inf_conf = float(inf.confidence)
-        inf_samples = int(inf.samples)
-        if domain_pattern:
-            _save_inferred_pattern(con, dom, domain_pattern, inf_conf, inf_samples)
+    elif examples:
+        inf_result = infer_domain_pattern(examples)
+        if inf_result.pattern in CANON_PATTERNS and inf_result.confidence >= 0.5:
+            domain_pattern = inf_result.pattern
+            inf_conf = inf_result.confidence
+            inf_samples = inf_result.sample_count
+            _save_inferred_pattern(con, dom, inf_result.pattern, inf_conf, inf_samples)
 
     effective_pattern = company_pattern or domain_pattern
 
-    canonical_emails: list[str] = (
-        generate_candidate_emails_for_person(
-            first_name=nf,
-            last_name=nl,
-            domain=dom,
-            company_pattern=effective_pattern,
-        )
-        or []
+    ranked_candidates = generate_candidate_emails_for_person(
+        first=nf,
+        last=nl,
+        domain=dom,
+        only_pattern=effective_pattern,
     )
 
-    legacy_emails: list[str] = []
-    try:
-        from src.generate.permutations import PATTERNS as LEGACY_TEMPLATES  # type: ignore
-        from src.generate.permutations import normalize_name_parts as _legacy_norm  # type: ignore
+    if max_probes > 0:
+        ranked_candidates = ranked_candidates[:max_probes]
 
-        first_n, last_n, f_initial, l_initial = _legacy_norm(nf, nl)
-        ctx = {"first": first_n, "last": last_n, "f": f_initial, "l": l_initial}
-
-        for pattern in LEGACY_TEMPLATES:
-            try:
-                local = pattern.format(**ctx)
-            except Exception:
-                continue
-            if not local:
-                continue
-            legacy_emails.append(f"{local}@{dom}")
-    except Exception:
-        legacy_emails = []
-
-    seen: set[str] = set()
-    ordered_candidates: list[str] = []
-    for email in canonical_emails + legacy_emails:
-        if not email or "@" not in email:
-            continue
-        local = email.split("@", 1)[0].lower()
-        if not local or local in ROLE_ALIASES:
-            continue
-        if email in seen:
-            continue
-        seen.add(email)
-        ordered_candidates.append(email)
-
-    max_probes = int(os.getenv("MAX_PROBES_PER_PERSON", "6"))
     inserted = 0
     enqueued = 0
+    for rank, (email_addr, pattern_key) in enumerate(ranked_candidates, 1):
+        try:
+            upsert_generated_email(
+                conn=con,
+                person_id=person_id,
+                email=email_addr,
+                pattern_used=pattern_key,
+                pattern_rank=rank,
+            )
+            inserted += 1
+        except Exception:
+            log.debug(
+                "R12 upsert_generated_email failed",
+                exc_info=True,
+                extra={
+                    "person_id": person_id,
+                    "email": email_addr,
+                    "pattern": pattern_key,
+                    "rank": rank,
+                },
+            )
+            continue
 
-    for e in ordered_candidates:
-        upsert_generated_email(con, person_id, e, dom, source_note="r12")
-        inserted += 1
+        email_id = _email_row_id(con, email_addr)
+        try:
+            _enqueue_r16_probe(email_id, email_addr, dom)
+            enqueued += 1
+        except Exception:
+            log.debug(
+                "R12 enqueue probe failed",
+                exc_info=True,
+                extra={"person_id": person_id, "email": email_addr, "email_id": email_id},
+            )
 
-        if enqueued < max_probes:
-            try:
-                email_id = _email_row_id(con, e)
-                _enqueue_r16_probe(email_id, e, dom)
-                enqueued += 1
-            except Exception as ee:
-                log.debug("R16 enqueue failed (best-effort): %s", ee)
-
-    con.commit()
+    try:
+        con.commit()
+    except Exception:
+        pass
 
     log.info(
         "R12 generated emails",
         extra={
             "person_id": person_id,
-            "company_id": company_id,
             "domain": dom,
-            "first": first,
-            "last": last,
             "first_norm": nf,
             "last_norm": nl,
             "only_pattern": effective_pattern,
@@ -1973,13 +2069,12 @@ def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> 
 # ---------------------------
 
 
-def _sources_has_company_id(con: sqlite3.Connection) -> bool:
+def _sources_has_company_id(con: Any) -> bool:
     try:
         rows = con.execute("PRAGMA table_info(sources)").fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         return False
     for r in rows:
-        # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
         if len(r) > 1 and r[1] == "company_id":
             return True
     return False
@@ -1992,20 +2087,27 @@ def crawl_company_site(company_id: int) -> dict:
     This is the core "company → crawl" building block used by auto-discovery.
     It is side-effectful (DB writes) but does not itself depend on RQ; callers
     may invoke it directly or via handle_task().
+
+    Task E: Now tracks metrics via AutodiscoveryResult and stores in job.meta.
     """
     con = _conn()
     pages: list[Any] = []
+
+    result_obj = AutodiscoveryResult(company_id=company_id)
+
     try:
         cur = con.execute(
-            "SELECT name, official_domain, domain FROM companies WHERE id = ?",
-            (company_id,),
+            "SELECT name, official_domain, domain FROM companies WHERE id = ?", (company_id,)
         )
         row = cur.fetchone()
         if not row:
+            result_obj.add_error("company_not_found")
+            _store_result_in_job_meta(result_obj)
             return {
                 "ok": False,
                 "error": "company_not_found",
                 "company_id": company_id,
+                "autodiscovery_result": result_obj.to_dict(),
             }
 
         company_name = row[0]
@@ -2013,22 +2115,29 @@ def crawl_company_site(company_id: int) -> dict:
         fallback = (row[2] or "").strip() if row[2] is not None else ""
         dom = official or fallback
         if not dom:
+            result_obj.add_error("no_domain_for_company")
+            _store_result_in_job_meta(result_obj)
             return {
                 "ok": False,
                 "error": "no_domain_for_company",
                 "company_id": company_id,
                 "company_name": company_name,
+                "autodiscovery_result": result_obj.to_dict(),
             }
 
-        pages = crawl_domain(dom)
+        result_obj.domain = dom
+
+        pages = crawl_domain(dom, result=result_obj)
+        result_obj.pages_fetched = len(pages)
+
         if pages:
             try:
-                # New schema: save_pages(conn, pages, company_id=...)
                 save_pages(con, pages, company_id=company_id)  # type: ignore[call-arg]
             except TypeError:
-                # Back-compat with older save_pages(conn, pages) signature.
                 save_pages(con, pages)  # type: ignore[call-arg]
             con.commit()
+
+        _store_result_in_job_meta(result_obj)
 
         result: dict[str, Any] = {
             "ok": True,
@@ -2036,25 +2145,101 @@ def crawl_company_site(company_id: int) -> dict:
             "company_name": company_name,
             "domain": dom,
             "page_count": len(pages),
+            "autodiscovery_result": result_obj.to_dict(),
         }
 
-        # Chain: once crawl completes, enqueue extraction for this company.
         _enqueue_company_task("extract_candidates_for_company", company_id=company_id)
 
         return result
     except Exception as exc:
         log.exception(
-            "crawl_company_site failed",
-            extra={"company_id": company_id, "exc": str(exc)},
+            "crawl_company_site failed", extra={"company_id": company_id, "exc": str(exc)}
         )
+        result_obj.add_error(f"{type(exc).__name__}: {exc}")
+        _store_result_in_job_meta(result_obj)
         return {
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
             "company_id": company_id,
+            "autodiscovery_result": result_obj.to_dict(),
         }
 
 
-def _get_company_attrs(con: sqlite3.Connection, company_id: int) -> dict[str, Any]:
+def autodiscover_company(company_id: int) -> dict:
+    """
+    Auto-discover a company in one pass:
+      - crawl domain (robots-aware; records robots blocks into result if enabled in runner)
+      - persist pages into sources
+      - extract candidates for company (includes optional AI refinement path already inside)
+      - store AutodiscoveryResult in RQ job meta (if running under RQ)
+      - return result.to_dict() for queue propagation
+
+    Task E: Full metrics tracking with AutodiscoveryResult.
+    """
+    con = _conn()
+    result_obj = AutodiscoveryResult(company_id=company_id)
+
+    try:
+        company = _load_company_name_and_domain(con, company_id)
+        if company is None:
+            result_obj.add_error("company_not_found")
+            _store_result_in_job_meta(result_obj)
+            return result_obj.to_dict()
+
+        company_name, dom, _fallback_domain = company
+        result_obj.domain = dom
+        # Best-effort global hint; wrapper provides the true per-run metrics later.
+        result_obj.ai_enabled = bool(AI_PEOPLE_ENABLED)
+
+        pages = crawl_domain(dom, result=result_obj)
+        result_obj.pages_fetched = len(pages)
+
+        if pages:
+            try:
+                save_pages(con, pages, company_id=company_id)  # type: ignore[call-arg]
+            except TypeError:
+                save_pages(con, pages)  # type: ignore[call-arg]
+            con.commit()
+
+        # Pass result through so AI wrapper metrics are recorded on the same object.
+        extract_payload = extract_candidates_for_company(company_id, result=result_obj)
+
+        # Update extraction counters (best-effort; tolerate schema drift)
+        try:
+            if hasattr(result_obj, "candidates_with_email"):
+                result_obj.candidates_with_email = int(
+                    extract_payload.get("found_candidates_email") or 0
+                )
+            if hasattr(result_obj, "candidates_no_email"):
+                result_obj.candidates_no_email = int(
+                    extract_payload.get("found_candidates_no_email") or 0
+                )
+            if hasattr(result_obj, "people_upserted"):
+                result_obj.people_upserted = int(extract_payload.get("inserted_people") or 0)
+            if hasattr(result_obj, "emails_upserted"):
+                result_obj.emails_upserted = int(extract_payload.get("inserted_emails") or 0)
+        except Exception:
+            pass
+
+        _store_result_in_job_meta(result_obj)
+        return result_obj.to_dict()
+
+    except Exception as exc:
+        log.exception(
+            "autodiscover_company failed", extra={"company_id": company_id, "exc": str(exc)}
+        )
+        result_obj.add_error(f"{type(exc).__name__}: {exc}")
+        _store_result_in_job_meta(result_obj)
+        return result_obj.to_dict()
+
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _get_company_attrs(con: Any, company_id: int) -> dict[str, Any]:
     """
     Best-effort loader for companies.attrs (JSON); returns {} on any error.
     """
@@ -2062,10 +2247,7 @@ def _get_company_attrs(con: sqlite3.Connection, company_id: int) -> dict[str, An
     try:
         if not _has_table(con, "companies"):
             return attrs
-        row = con.execute(
-            "SELECT attrs FROM companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
+        row = con.execute("SELECT attrs FROM companies WHERE id = ?", (company_id,)).fetchone()
         if not row:
             return attrs
         raw = row[0]
@@ -2079,39 +2261,25 @@ def _get_company_attrs(con: sqlite3.Connection, company_id: int) -> dict[str, An
                 attrs = obj
     except Exception:
         log.debug(
-            "O27: failed to load companies.attrs",
-            exc_info=True,
-            extra={"company_id": company_id},
+            "O27: failed to load companies.attrs", exc_info=True, extra={"company_id": company_id}
         )
     return attrs
 
 
-def _set_company_attrs(
-    con: sqlite3.Connection,
-    company_id: int,
-    attrs: dict[str, Any],
-) -> None:
+def _set_company_attrs(con: Any, company_id: int, attrs: dict[str, Any]) -> None:
     """
     Best-effort writer for companies.attrs (JSON). Does not commit.
     """
     try:
         raw = json.dumps(attrs, separators=(",", ":"), sort_keys=True)
-        con.execute(
-            "UPDATE companies SET attrs = ? WHERE id = ?",
-            (raw, int(company_id)),
-        )
+        con.execute("UPDATE companies SET attrs = ? WHERE id = ?", (raw, int(company_id)))
     except Exception:
         log.debug(
-            "O27: failed to update companies.attrs",
-            exc_info=True,
-            extra={"company_id": company_id},
+            "O27: failed to update companies.attrs", exc_info=True, extra={"company_id": company_id}
         )
 
 
-def _should_run_ai_for_company(
-    con: sqlite3.Connection,
-    company_id: int,
-) -> bool:
+def _should_run_ai_for_company(con: Any, company_id: int) -> bool:
     """
     Return True if AI people extraction should run for this company.
 
@@ -2119,14 +2287,10 @@ def _should_run_ai_for_company(
     """
     attrs = _get_company_attrs(con, company_id)
     flag = attrs.get("ai_people_extracted")
-    # Treat missing/False/0 as "not yet run".
     return not bool(flag)
 
 
-def _mark_ai_people_extracted(
-    con: sqlite3.Connection,
-    company_id: int,
-) -> None:
+def _mark_ai_people_extracted(con: Any, company_id: int) -> None:
     """
     Mark that AI people extraction has been attempted for this company.
     """
@@ -2144,16 +2308,12 @@ def _mark_ai_people_extracted(
         )
 
 
-def _load_company_name_and_domain(
-    con: sqlite3.Connection,
-    company_id: int,
-) -> tuple[str, str, str] | None:
+def _load_company_name_and_domain(con: Any, company_id: int) -> tuple[str, str, str] | None:
     """
     Return (company_name, dom, fallback_domain) or None if company is missing.
     """
     row = con.execute(
-        "SELECT name, official_domain, domain FROM companies WHERE id = ?",
-        (company_id,),
+        "SELECT name, official_domain, domain FROM companies WHERE id = ?", (company_id,)
     ).fetchone()
     if not row:
         return None
@@ -2165,11 +2325,7 @@ def _load_company_name_and_domain(
     return company_name, dom, fallback
 
 
-def _load_company_sources(
-    con: sqlite3.Connection,
-    company_id: int,
-    dom: str,
-) -> list[tuple[str, bytes | str]]:
+def _load_company_sources(con: Any, company_id: int, dom: str) -> list[tuple[str, bytes | str]]:
     """
     Load (source_url, html) rows from sources, scoping by company_id if supported,
     otherwise filtering by domain match against source_url host.
@@ -2179,8 +2335,7 @@ def _load_company_sources(
     has_company_id = _sources_has_company_id(con)
     if has_company_id:
         cur_src = con.execute(
-            "SELECT source_url, html FROM sources WHERE company_id = ?",
-            (company_id,),
+            "SELECT source_url, html FROM sources WHERE company_id = ?", (company_id,)
         )
         return [(r[0], r[1]) for r in cur_src.fetchall()]
 
@@ -2206,21 +2361,47 @@ def _extract_raw_candidates_from_pages(
 ) -> list[ExtractCandidate]:
     """
     Run the HTML-level extractor over all pages and return a flat list of candidates.
+
+    P1/P2 polish (page classifier gate):
+      - Skip extraction entirely on pages that are very likely to mention
+        third-party people (job boards, press releases, testimonials, etc.).
     """
+    try:
+        from src.extract.page_classifier import classify_page_type
+    except Exception:  # pragma: no cover
+        classify_page_type = None  # type: ignore[assignment]
+
     raw_candidates: list[ExtractCandidate] = []
 
-    for source_url, html_blob in pages_rows:
-        if isinstance(html_blob, (bytes, bytearray)):
-            html_str = html_blob.decode("utf-8", "ignore")
+    for src_url, html_raw in pages_rows:
+        if isinstance(html_raw, bytes):
+            try:
+                html_str = html_raw.decode("utf-8", "ignore")
+            except Exception:
+                continue
         else:
-            html_str = str(html_blob or "")
+            html_str = str(html_raw or "")
 
-        for cand in extract_html_candidates(
-            html_str,
-            source_url=source_url,
-            official_domain=dom or None,
-        ):
-            raw_candidates.append(cand)
+        # Page classifier gate: skip extraction on pages unlikely to have employees.
+        if classify_page_type is not None:
+            try:
+                page_type = classify_page_type(html_str, url=src_url)  # type: ignore[misc]
+                if page_type in {"job_board", "press_release", "testimonial", "news", "careers"}:
+                    log.debug(
+                        "P1/P2 skipping extraction for page_type=%s url=%s",
+                        page_type,
+                        src_url,
+                    )
+                    continue
+            except Exception:
+                pass
+
+        try:
+            cands = extract_html_candidates(html_str, source_url=src_url, domain=dom)
+            raw_candidates.extend(cands)
+        except Exception:
+            log.debug("extract_candidates failed for %s", src_url, exc_info=True)
+            continue
 
     return raw_candidates
 
@@ -2231,7 +2412,8 @@ def _split_role_and_personish_candidates(
     """
     Split candidates into (role_candidates, personish_candidates).
 
-    Note: this path currently only handles candidates that have an email.
+    - Role: role/placeholder emails (info@, support@, etc.)
+    - Personish: non-role emails + no-email candidates (people-cards, etc.)
     """
     role_candidates: list[ExtractCandidate] = []
     personish_candidates: list[ExtractCandidate] = []
@@ -2239,6 +2421,8 @@ def _split_role_and_personish_candidates(
     for cand in raw_candidates:
         email_norm = (getattr(cand, "email", "") or "").strip().lower()
         if not email_norm:
+            # Future-proof: allow no-email candidates to be refined/persisted as people.
+            personish_candidates.append(cand)
             continue
         if is_role_or_placeholder_email(email_norm):
             role_candidates.append(cand)
@@ -2248,7 +2432,7 @@ def _split_role_and_personish_candidates(
     return role_candidates, personish_candidates
 
 
-def _decide_ai_allowed_for_company(con: sqlite3.Connection, company_id: int) -> bool:
+def _decide_ai_allowed_for_company(con: Any, company_id: int) -> bool:
     """
     Determine whether AI refinement is permitted for this company.
     """
@@ -2266,6 +2450,46 @@ def _decide_ai_allowed_for_company(con: sqlite3.Connection, company_id: int) -> 
         return True
 
 
+def _ai_attempted_from_metrics(metrics: Any) -> bool:
+    """
+    Best-effort detection of whether an AI call was actually attempted.
+    Supports dict-like metrics or dataclass-like objects.
+    """
+    if metrics is None:
+        return False
+
+    # Dict-like
+    if isinstance(metrics, dict):
+        for k in ("ai_called", "attempted", "ai_attempted", "called"):
+            if k in metrics:
+                try:
+                    return bool(metrics[k])
+                except Exception:
+                    pass
+        # Some wrappers track status strings (e.g., "ok_nonempty", "ok_empty", "failed")
+        st = str(metrics.get("status") or metrics.get("ai_status") or "").strip().lower()
+        if st in {"ok_nonempty", "ok_empty", "failed"}:
+            return True
+        return False
+
+    # Attribute-like
+    for attr in ("ai_called", "attempted", "ai_attempted", "called"):
+        if hasattr(metrics, attr):
+            try:
+                return bool(getattr(metrics, attr))
+            except Exception:
+                pass
+    st = ""
+    for attr in ("status", "ai_status"):
+        if hasattr(metrics, attr):
+            try:
+                st = str(getattr(metrics, attr) or "").strip().lower()
+            except Exception:
+                st = ""
+            break
+    return st in {"ok_nonempty", "ok_empty", "failed"}
+
+
 def _maybe_refine_people_with_ai(
     *,
     company_name: str,
@@ -2273,25 +2497,41 @@ def _maybe_refine_people_with_ai(
     fallback_domain: str,
     personish_candidates: list[ExtractCandidate],
     ai_allowed_for_company: bool,
+    result: AutodiscoveryResult | None = None,
 ) -> tuple[list[ExtractCandidate], bool]:
     """
     Optionally run AI refinement once per company.
+
+    Uses the O27 wrapper (src.extract.ai_candidates_wrapper) to enforce:
+      - AI enabled + call succeeds but returns 0 => return [] (NO fallback)
+      - AI disabled => smart fallback
+      - AI failed => smart fallback
 
     Returns (refined_people, ai_attempted).
     """
     if not personish_candidates or not ai_allowed_for_company:
         return personish_candidates, False
 
+    if not _HAS_AI_WRAPPER or refine_candidates_with_ai is None:
+        # Wrapper missing: keep legacy behavior (no AI), but consider this "not attempted"
+        return personish_candidates, False
+
     try:
-        refined = extract_ai_candidates(
+        refined, metrics = refine_candidates_with_ai(
             company_name=company_name,
-            domain=dom or fallback_domain,
+            domain=(dom or fallback_domain),
             raw_candidates=personish_candidates,
         )
-        return refined, True
+        if result is not None and update_result_from_metrics is not None:
+            try:
+                update_result_from_metrics(result, metrics)
+            except Exception:
+                pass
+        return list(refined), _ai_attempted_from_metrics(metrics)
     except Exception as exc:
+        # If the wrapper itself fails unexpectedly, do not block extraction.
         log.debug(
-            "AI people refinement failed; continuing with heuristic-only candidates",
+            "AI wrapper failed; continuing with heuristic-only candidates",
             exc_info=True,
             extra={"domain": dom, "exc": str(exc)},
         )
@@ -2347,7 +2587,7 @@ def _candidate_full_name(cand: ExtractCandidate) -> str | None:
 
 
 def _upsert_person_from_candidate(
-    con: sqlite3.Connection,
+    con: Any,
     *,
     company_id: int,
     cand: ExtractCandidate,
@@ -2359,11 +2599,12 @@ def _upsert_person_from_candidate(
     Returns (person_id, inserted_new).
     """
     row_p = con.execute(
-        "SELECT id FROM people WHERE company_id = ? AND full_name = ?",
-        (company_id, full_name),
+        "SELECT id FROM people WHERE company_id = ? AND full_name = ?", (company_id, full_name)
     ).fetchone()
     if row_p:
         return int(row_p[0]), False
+
+    title_val = getattr(cand, "title", None) or "Auto-discovered"
 
     cur_p = con.execute(
         """
@@ -2382,7 +2623,7 @@ def _upsert_person_from_candidate(
             getattr(cand, "first_name", None),
             getattr(cand, "last_name", None),
             full_name,
-            "Auto-discovered",
+            title_val,
             getattr(cand, "source_url", None),
         ),
     )
@@ -2390,7 +2631,7 @@ def _upsert_person_from_candidate(
 
 
 def _upsert_email_from_candidate(
-    con: sqlite3.Connection,
+    con: Any,
     *,
     company_id: int,
     email_norm: str,
@@ -2402,10 +2643,7 @@ def _upsert_email_from_candidate(
 
     Returns (email_id, inserted_new).
     """
-    row_e = con.execute(
-        "SELECT id FROM emails WHERE email = ?",
-        (email_norm,),
-    ).fetchone()
+    row_e = con.execute("SELECT id FROM emails WHERE email = ?", (email_norm,)).fetchone()
     if row_e:
         email_id = int(row_e[0])
         con.execute(
@@ -2417,12 +2655,7 @@ def _upsert_email_from_candidate(
                    is_published = COALESCE(is_published, 1)
              WHERE id = ?
             """,
-            (
-                company_id,
-                person_id_for_email,
-                source_url,
-                email_id,
-            ),
+            (company_id, person_id_for_email, source_url, email_id),
         )
         return email_id, False
 
@@ -2431,30 +2664,134 @@ def _upsert_email_from_candidate(
         INSERT INTO emails (person_id, company_id, email, is_published, source_url)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (
-            person_id_for_email,
-            company_id,
-            email_norm,
-            1,
-            source_url,
-        ),
+        (person_id_for_email, company_id, email_norm, 1, source_url),
     )
     return int(cur_e.lastrowid), True
 
 
-def _persist_candidates_for_company(
-    con: sqlite3.Connection,
+def _persist_candidates_for_company(  # noqa: C901
+    con: Any,
     *,
     company_id: int,
     dom: str,
     candidates_by_email: dict[str, ExtractCandidate],
-) -> tuple[int, int]:
+    candidates_no_email: Sequence[ExtractCandidate] | None = None,
+) -> tuple[int, int, int, int]:
     """
-    Persist people + emails, and enqueue R16 probes. Returns (inserted_people, inserted_emails).
+    Persist people + emails, and enqueue R16 probes.
+
+    IMPORTANT:
+      - Email-bearing candidates are keyed by normalized email (existing behavior).
+      - No-email candidates MUST be persisted as people and MUST NOT be collapsed
+        by an email-keyed dict. We dedupe no-email candidates by a person signature.
+
+    Returns (inserted_people, updated_people, inserted_emails, updated_emails).
     """
     inserted_people = 0
+    updated_people = 0
     inserted_emails = 0
+    updated_emails = 0
 
+    def _norm_sig(s: str | None) -> str:
+        if not s:
+            return ""
+        s2 = str(s).replace("\u00a0", " ").strip().lower()
+        s2 = " ".join(s2.split())
+        return s2
+
+    def _looks_like_valid_person_name(name: str | None) -> bool:
+        if not name:
+            return False
+        n = name.strip()
+        if len(n) < 3:
+            return False
+        parts = [p for p in n.split() if p]
+        if len(parts) < 2 or len(parts) > 5:
+            return False
+
+        for p in parts:
+            clean = p.replace("-", "").replace("'", "").replace(".", "")
+            if not clean:
+                continue
+            if not clean[0].isupper():
+                return False
+            if not all(ch.isalpha() for ch in clean):
+                return False
+
+        try:
+            vp = globals().get("validate_person_name")
+            if callable(vp):
+                res = vp(n)
+                if hasattr(res, "is_valid"):
+                    return bool(res.is_valid)
+                if isinstance(res, tuple) and res:
+                    return bool(res[0])
+                if isinstance(res, bool):
+                    return res
+        except Exception:
+            pass
+
+        return True
+
+    def _clean_or_drop_title(title: str | None) -> str | None:
+        if not title:
+            return None
+        t = str(title).strip()
+        if not t:
+            return None
+
+        try:
+            ct = globals().get("clean_title_if_invalid")
+            if callable(ct):
+                cleaned = ct(t)
+                return cleaned.strip() if cleaned else None
+        except Exception:
+            pass
+
+        return t
+
+    # ----------------------------
+    # Bucket 1: NO-EMAIL people
+    # ----------------------------
+    approved_no_email = list(candidates_no_email or [])
+    no_email_deduped = 0
+    no_email_rejected = 0
+    seen_no_email_sigs: set[str] = set()
+
+    for cand in approved_no_email:
+        full_name = _candidate_full_name(cand)
+        if not _looks_like_valid_person_name(full_name):
+            no_email_rejected += 1
+            continue
+
+        title = _clean_or_drop_title(getattr(cand, "title", None))
+        try:
+            cand.title = title
+        except Exception:
+            pass
+
+        source_url = getattr(cand, "source_url", None)
+
+        sig = f"{_norm_sig(full_name)}|{_norm_sig(title)}|{_norm_sig(source_url)}"
+        if sig in seen_no_email_sigs:
+            no_email_deduped += 1
+            continue
+        seen_no_email_sigs.add(sig)
+
+        _person_id, inserted_new = _upsert_person_from_candidate(
+            con,
+            company_id=company_id,
+            cand=cand,
+            full_name=full_name,
+        )
+        if inserted_new:
+            inserted_people += 1
+        else:
+            updated_people += 1
+
+    # ----------------------------
+    # Bucket 2: EMAIL-bearing candidates
+    # ----------------------------
     for email_norm, cand in sorted(candidates_by_email.items()):
         email_norm = (email_norm or "").strip().lower()
         if not email_norm:
@@ -2464,7 +2801,7 @@ def _persist_candidates_for_company(
         full_name = _candidate_full_name(cand)
 
         person_id_for_person: int | None = None
-        if full_name:
+        if full_name and _looks_like_valid_person_name(full_name):
             person_id_for_person, inserted_new = _upsert_person_from_candidate(
                 con,
                 company_id=company_id,
@@ -2473,6 +2810,8 @@ def _persist_candidates_for_company(
             )
             if inserted_new:
                 inserted_people += 1
+            else:
+                updated_people += 1
 
         person_id_for_email: int | None = None
         if not is_placeholder and person_id_for_person is not None:
@@ -2487,6 +2826,8 @@ def _persist_candidates_for_company(
         )
         if inserted_new_email:
             inserted_emails += 1
+        else:
+            updated_emails += 1
 
         try:
             domain_for_email = email_norm.split("@", 1)[1].lower() if "@" in email_norm else dom
@@ -2498,7 +2839,28 @@ def _persist_candidates_for_company(
                 extra={"email": email_norm, "company_id": company_id, "exc": str(e)},
             )
 
-    return inserted_people, inserted_emails
+    try:
+        log.info(
+            "Persisted candidates for company_id=%s dom=%s "
+            "approved_email=%d approved_no_email=%d "
+            "no_email_rejected=%d no_email_deduped=%d "
+            "people_inserted=%d people_updated=%d "
+            "emails_inserted=%d emails_updated=%d",
+            company_id,
+            dom,
+            len(candidates_by_email),
+            len(approved_no_email),
+            no_email_rejected,
+            no_email_deduped,
+            inserted_people,
+            updated_people,
+            inserted_emails,
+            updated_emails,
+        )
+    except Exception:
+        pass
+
+    return inserted_people, updated_people, inserted_emails, updated_emails
 
 
 def _empty_extract_result(
@@ -2523,7 +2885,9 @@ def _empty_extract_result(
     }
 
 
-def extract_candidates_for_company(company_id: int) -> dict:
+def extract_candidates_for_company(  # noqa: C901
+    company_id: int, result: AutodiscoveryResult | None = None
+) -> dict:
     """
     R11+ glue: Pull HTML pages for a company from 'sources', run the HTML-level
     extractor, optionally refine those candidates with AI, and upsert people/emails
@@ -2537,19 +2901,57 @@ def extract_candidates_for_company(company_id: int) -> dict:
         person.
 
     O27 enhancement (refiner mode):
-      - First, run a broad heuristic HTML extractor (R11 + O05) across all pages
-        to collect raw Candidate objects.
-      - Split those into:
-          * person-ish candidates (non-role emails)
-          * role/placeholder candidates
-      - Run the AI refiner once per company on the person-ish candidates:
-          src.extract.ai_candidates.extract_ai_candidates
-      - Merge AI-refined people with role/placeholder emails and persist, preferring
-        candidates that include more complete name information.
+      - Broad heuristic extraction across pages.
+      - Split role vs personish.
+      - Run the AI refiner once per company (wrapper enforces no-fallback-on-ok-empty).
+      - Persist email-bearing + no-email buckets.
+      - AI runs at most once per company, controlled by companies.attrs["ai_people_extracted"].
 
-      - AI runs at most once per company, controlled by
-        companies.attrs["ai_people_extracted"].
+    P1/P2 polish:
+      - Block candidates originating from third-party/non-employee pages BEFORE AI/persist.
     """
+    try:
+        from src.extract.source_filters import is_blocked_source_url
+    except Exception:  # pragma: no cover
+        is_blocked_source_url = None  # type: ignore[assignment]
+
+    def _candidate_source_url(c: Any) -> str:
+        return (
+            (getattr(c, "source_url", None) or "")
+            or (getattr(c, "page_url", None) or "")
+            or (getattr(c, "url", None) or "")
+        ).strip()
+
+    def _filter_blocked_sources(cands: list[Any], *, label: str) -> tuple[list[Any], int]:
+        if not cands or is_blocked_source_url is None:
+            return cands, 0
+
+        out: list[Any] = []
+        blocked = 0
+        for cand in cands:
+            url = _candidate_source_url(cand)
+            if url:
+                try:
+                    blocked_flag, reason = is_blocked_source_url(url)  # type: ignore[misc]
+                except Exception:
+                    blocked_flag, reason = False, None
+                if blocked_flag:
+                    blocked += 1
+                    log.info(
+                        "Source-filter blocked %s candidate: name=%r email=%r url=%s reason=%s",
+                        label,
+                        getattr(cand, "raw_name", None),
+                        getattr(cand, "email", None),
+                        url,
+                        reason,
+                    )
+                    continue
+            out.append(cand)
+
+        if blocked:
+            log.info("Source-filter summary: blocked=%d kept=%d label=%s", blocked, len(out), label)
+        return out, blocked
+
     con = _conn()
     try:
         company = _load_company_name_and_domain(con, company_id)
@@ -2578,26 +2980,45 @@ def extract_candidates_for_company(company_id: int) -> dict:
 
         role_candidates, personish_candidates = _split_role_and_personish_candidates(raw_candidates)
 
+        role_candidates, blocked_role = _filter_blocked_sources(role_candidates, label="role")
+        personish_candidates, blocked_personish = _filter_blocked_sources(
+            personish_candidates, label="personish"
+        )
+
+        if not role_candidates and not personish_candidates:
+            return _empty_extract_result(company_id=company_id, company_name=company_name, dom=dom)
+
         refined_people, ai_attempted = _maybe_refine_people_with_ai(
             company_name=company_name,
             dom=dom,
             fallback_domain=fallback_domain,
             personish_candidates=personish_candidates,
             ai_allowed_for_company=ai_allowed_for_company,
+            result=result,
         )
 
         candidates_by_email = _merge_candidates_by_email(refined_people, role_candidates)
-        if not candidates_by_email:
+
+        candidates_no_email: list[ExtractCandidate] = []
+        for cand in refined_people:
+            email_val = getattr(cand, "email", None)
+            if email_val is None or not str(email_val).strip():
+                candidates_no_email.append(cand)
+
+        if not candidates_by_email and not candidates_no_email:
             if ai_allowed_for_company and ai_attempted:
                 _mark_ai_people_extracted(con, company_id)
                 con.commit()
             return _empty_extract_result(company_id=company_id, company_name=company_name, dom=dom)
 
-        inserted_people, inserted_emails = _persist_candidates_for_company(
-            con,
-            company_id=company_id,
-            dom=dom,
-            candidates_by_email=candidates_by_email,
+        inserted_people, updated_people, inserted_emails, updated_emails = (
+            _persist_candidates_for_company(
+                con,
+                company_id=company_id,
+                dom=dom,
+                candidates_by_email=candidates_by_email,
+                candidates_no_email=candidates_no_email,
+            )
         )
 
         if ai_allowed_for_company and ai_attempted:
@@ -2606,31 +3027,35 @@ def extract_candidates_for_company(company_id: int) -> dict:
         con.commit()
 
         emails_total_row = con.execute(
-            "SELECT COUNT(*) FROM emails WHERE company_id = ?",
-            (company_id,),
+            "SELECT COUNT(*) FROM emails WHERE company_id = ?", (company_id,)
         ).fetchone()
         emails_total = int(emails_total_row[0]) if emails_total_row else 0
+
+        found_email = len(candidates_by_email)
+        found_no_email = len(candidates_no_email)
 
         return {
             "ok": True,
             "company_id": company_id,
             "company_name": company_name,
             "domain": dom,
-            "found_candidates": len(candidates_by_email),
+            "found_candidates": found_email + found_no_email,
+            "found_candidates_email": found_email,
+            "found_candidates_no_email": found_no_email,
             "inserted_people": inserted_people,
+            "updated_people": updated_people,
             "inserted_emails": inserted_emails,
+            "updated_emails": updated_emails,
             "emails_total": emails_total,
+            "blocked_candidates_role": int(blocked_role),
+            "blocked_candidates_personish": int(blocked_personish),
         }
     except Exception as exc:
         log.exception(
             "extract_candidates_for_company failed",
             extra={"company_id": company_id, "exc": str(exc)},
         )
-        return {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "company_id": company_id,
-        }
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "company_id": company_id}
 
 
 # ---------------------------
@@ -2647,15 +3072,12 @@ def crawl_approved_domains(db: str | None = None, limit: int | None = None) -> i
     `scripts/crawl_domain.py <domain> --db <db>`
 
     Args:
-        db: Path to SQLite DB. Defaults to $DATABASE_PATH or 'dev.db'.
+        db: Path to database (legacy parameter, ignored for Postgres).
         limit: Optional cap on how many domains to process (useful for smoke runs).
     """
-    db_path = Path(db or os.getenv("DATABASE_PATH", "dev.db")).resolve()
-
-    # Pull distinct official domains discovered by R08
-    with sqlite3.connect(str(db_path)) as con:
-        cur = con.cursor()
-        cur.execute(
+    con = get_conn()
+    try:
+        cur = con.execute(
             """
             SELECT DISTINCT TRIM(official_domain)
             FROM companies
@@ -2665,32 +3087,31 @@ def crawl_approved_domains(db: str | None = None, limit: int | None = None) -> i
             """
         )
         domains = [row[0] for row in cur.fetchall()]
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
     if limit is not None:
         domains = domains[:limit]
 
     if not domains:
-        log.info(
-            "crawl_approved_domains: no official domains found in companies table",
-            extra={"db": str(db_path)},
-        )
+        log.info("crawl_approved_domains: no official domains found in companies table")
         return 0
 
-    # Invoke the same script used manually, to keep behavior identical
     script = Path(__file__).resolve().parents[2] / "scripts" / "crawl_domain.py"
     if not script.exists():
         raise FileNotFoundError(f"crawl_domain.py not found at {script}")
+
+    # Get db_path for CLI compatibility (falls back to DATABASE_PATH or default)
+    db_path = db or os.getenv("DATABASE_PATH", "data/dev.db")
 
     count = 0
     for domain in domains:
         cmd = [sys.executable, str(script), domain, "--db", str(db_path)]
         log.info(
-            "R10 crawl start",
-            extra={
-                "domain": domain,
-                "db": str(db_path),
-                "cmd": " ".join(cmd),
-            },
+            "R10 crawl start", extra={"domain": domain, "db": str(db_path), "cmd": " ".join(cmd)}
         )
         subprocess.run(cmd, check=True)
         count += 1
@@ -2718,7 +3139,6 @@ def upsert_person_task(row: dict) -> dict:
     """
     try:
         normalized, errors = normalize_row(row or {})
-        # Never drop provenance (normalize_row preserves source_url by design)
         persist_upsert_row(normalized)
         log.info(
             "R13 upsert_person_task persisted",
@@ -2747,6 +3167,337 @@ def upsert_person_task(row: dict) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ---------------------------------------------------------------------------
+# Control plane orchestration (Runs API fan-out)
+# ---------------------------------------------------------------------------
+
+
+def _utc_now_iso_z() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class _UserSuppliedDecision:
+    """Minimal Decision-like object for write_domain_resolution()."""
+
+    def __init__(self, chosen: str):
+        self.chosen = chosen
+        self.method = "user_supplied"
+        self.confidence = 100
+        self.reason = "pipeline_start"
+        self.resolver_version = "pipeline_start"
+
+
+def _table_cols(con: Any, table: str) -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall() or []
+        return {str(r[1]) for r in rows if len(r) > 1 and r[1]}
+    except Exception:
+        return set()
+
+
+def _update_run_row(
+    con: Any,
+    *,
+    tenant_id: str,
+    run_id: str,
+    status: str | None = None,
+    progress: dict[str, Any] | None = None,
+    error: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> None:
+    """Best-effort runs table update (works across schema drift)."""
+    if not _has_table(con, "runs"):
+        return
+
+    cols = _table_cols(con, "runs")
+    if not cols:
+        return
+
+    now = _utc_now_iso_z()
+
+    sets: list[str] = []
+    vals: list[Any] = []
+
+    def set_if(col: str, val: Any) -> None:
+        if col in cols:
+            sets.append(f"{col} = ?")
+            vals.append(val)
+
+    if status is not None:
+        set_if("status", status)
+    if error is not None:
+        set_if("error", error)
+    if started_at is not None:
+        set_if("started_at", started_at)
+    if finished_at is not None:
+        set_if("finished_at", finished_at)
+    if progress is not None and "progress_json" in cols:
+        set_if("progress_json", json.dumps(progress, separators=(",", ":")))
+
+    set_if("updated_at", now)
+
+    if not sets:
+        return
+
+    if "tenant_id" in cols:
+        vals.extend([tenant_id, run_id])
+        con.execute(
+            f"UPDATE runs SET {', '.join(sets)} WHERE tenant_id = ? AND id = ?", tuple(vals)
+        )
+    else:
+        vals.append(run_id)
+        con.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = ?", tuple(vals))
+
+    try:
+        con.commit()
+    except Exception:
+        pass
+
+
+def _ensure_company_for_domain(con: Any, *, tenant_id: str, domain: str) -> tuple[int, str]:  # noqa: C901
+    """Ensure a companies row exists for the tenant/domain and return (company_id, company_name)."""
+    dom = (domain or "").strip().lower()
+    if not dom:
+        raise ValueError("domain is empty")
+
+    if not _has_table(con, "companies"):
+        raise RuntimeError("companies table not found")
+
+    cols = _table_cols(con, "companies")
+
+    # Try to find an existing row for this domain.
+    where: list[str] = []
+    params: list[Any] = []
+
+    if "tenant_id" in cols:
+        where.append("tenant_id = ?")
+        params.append(tenant_id)
+
+    dom_conds: list[str] = []
+    for c in ("official_domain", "user_supplied_domain", "domain"):
+        if c in cols:
+            dom_conds.append(f"lower({c}) = ?")
+            params.append(dom)
+
+    if dom_conds:
+        where.append("(" + " OR ".join(dom_conds) + ")")
+
+    sql_sel = "SELECT id, name FROM companies"
+    if where:
+        sql_sel += " WHERE " + " AND ".join(where)
+    sql_sel += " ORDER BY id LIMIT 1"
+
+    try:
+        row = con.execute(sql_sel, tuple(params)).fetchone()
+    except Exception:
+        row = None
+
+    if row:
+        return int(row[0]), str(row[1] or dom)
+
+    # Insert new.
+    insert_cols: list[str] = []
+    insert_vals: list[Any] = []
+
+    def add(c: str, v: Any) -> None:
+        if c in cols:
+            insert_cols.append(c)
+            insert_vals.append(v)
+
+    add("tenant_id", tenant_id)
+    add("name", dom)
+    add("domain", dom)
+    add("user_supplied_domain", dom)
+
+    if not insert_cols:
+        raise RuntimeError("companies table has no insertable columns")
+
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    cols_sql = ", ".join(insert_cols)
+
+    is_pg = bool(getattr(con, "is_postgres", False))
+
+    if is_pg:
+        cur = con.execute(
+            f"INSERT INTO companies ({cols_sql}) VALUES ({placeholders}) RETURNING id",
+            tuple(insert_vals),
+        )
+        new_row = cur.fetchone()
+        company_id = int(new_row[0]) if new_row else 0
+    else:
+        cur = con.execute(
+            f"INSERT INTO companies ({cols_sql}) VALUES ({placeholders})", tuple(insert_vals)
+        )
+        # Best-effort: sqlite3 lastrowid lives on the underlying cursor
+        company_id = int(getattr(getattr(cur, "_cursor", None), "lastrowid", 0) or 0)
+
+    try:
+        con.commit()
+    except Exception:
+        pass
+
+    if not company_id:
+        # Fallback: re-select
+        try:
+            row2 = con.execute(sql_sel, tuple(params)).fetchone()
+            if row2:
+                company_id = int(row2[0])
+        except Exception:
+            pass
+
+    if not company_id:
+        raise RuntimeError("failed to insert company")
+
+    return company_id, dom
+
+
+def pipeline_start(*, run_id: str, tenant_id: str) -> dict[str, Any]:
+    """Orchestrator entrypoint for Runs API.
+
+    Responsibilities (MVP):
+      - Mark the run as running.
+      - Ensure a companies row exists per input domain (tenant-scoped when supported).
+      - Persist a 'user_supplied' domain resolution so downstream stages can treat
+        the domain as canonical.
+      - Enqueue autodiscovery jobs for each company on the discovery queue.
+
+    This function is intentionally conservative: it does not attempt to compute a
+    full DAG across crawl/extract/generate/smtp/finalize yet.
+    """
+
+    con = get_conn()
+    now = _utc_now_iso_z()
+
+    # Load run payload
+    try:
+        if not _has_table(con, "runs"):
+            raise RuntimeError("runs table not found")
+
+        cols = _table_cols(con, "runs")
+        if "tenant_id" in cols:
+            row = con.execute(
+                "SELECT domains_json, options_json FROM runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, run_id),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT domains_json, options_json FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+
+        if not row:
+            raise ValueError("run_not_found")
+
+        domains_json = row[0] or "[]"
+        options_json = row[1] or "{}"
+
+        domains = json.loads(domains_json) if isinstance(domains_json, str) else domains_json
+        if not isinstance(domains, list):
+            raise ValueError("runs.domains_json is not a list")
+
+        options = json.loads(options_json) if isinstance(options_json, str) else options_json
+        if not isinstance(options, dict):
+            options = {}
+
+        discovery_queue = str(
+            options.get("discovery_queue") or os.getenv("DISCOVERY_QUEUE_NAME", "crawl")
+        )
+        job_timeout = int(
+            options.get("discovery_job_timeout") or os.getenv("DISCOVERY_JOB_TIMEOUT", "1800")
+        )
+
+        progress: dict[str, Any] = {
+            "phase": "start",
+            "queued_at": now,
+            "discovery_queue": discovery_queue,
+            "domains": [],
+        }
+
+        _update_run_row(
+            con,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status="running",
+            started_at=now,
+            progress=progress,
+        )
+
+        # Enqueue per-domain autodiscovery
+        enqueued: list[dict[str, Any]] = []
+
+        try:
+            q = Queue(name=discovery_queue, connection=get_redis())
+        except Exception as exc:
+            msg = f"failed to init discovery queue {discovery_queue!r}: {exc}"
+            raise RuntimeError(msg) from exc
+        for d in domains:
+            dom = str(d or "").strip().lower()
+            if not dom:
+                continue
+
+            company_id, company_name = _ensure_company_for_domain(
+                con, tenant_id=tenant_id, domain=dom
+            )
+
+            # Persist a canonical resolution from the user input so autodiscovery uses
+            # official_domain.
+            try:
+                write_domain_resolution(
+                    con,
+                    company_id=company_id,
+                    company_name=company_name,
+                    decision=_UserSuppliedDecision(dom),
+                    user_hint=dom,
+                    tenant_id=tenant_id,
+                )
+                con.commit()
+            except Exception:
+                # Non-fatal; company row still exists.
+                log.debug(
+                    "pipeline_start: write_domain_resolution failed",
+                    exc_info=True,
+                    extra={"domain": dom},
+                )
+
+            job = q.enqueue(autodiscover_company, company_id=company_id, job_timeout=job_timeout)
+
+            enqueued.append(
+                {"domain": dom, "company_id": company_id, "job_id": getattr(job, "id", None)}
+            )
+
+            progress["domains"].append(
+                {"domain": dom, "company_id": company_id, "state": "enqueued"}
+            )
+            _update_run_row(con, tenant_id=tenant_id, run_id=run_id, progress=progress)
+
+        progress["phase"] = "fanout_enqueued"
+        progress["enqueued"] = len(enqueued)
+        progress["enqueued_items"] = enqueued
+        _update_run_row(con, tenant_id=tenant_id, run_id=run_id, progress=progress)
+
+        return {"ok": True, "run_id": run_id, "tenant_id": tenant_id, "enqueued": enqueued}
+
+    except Exception as exc:
+        try:
+            _update_run_row(
+                con,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                finished_at=_utc_now_iso_z(),
+            )
+        except Exception:
+            pass
+        raise
+
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def handle_task(envelope: Any) -> Any:
     """
     Backwards-compatible RQ entrypoint for R06-style task envelopes.
@@ -2763,11 +3514,10 @@ def handle_task(envelope: Any) -> Any:
     if envelope is None:
         raise ValueError("handle_task expected an envelope, got None")
 
-    # Some older callers may JSON-encode the envelope; support that for robustness.
     if isinstance(envelope, str):
         try:
             envelope_obj = json.loads(envelope)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover
             raise ValueError(f"handle_task could not decode JSON envelope: {exc}") from exc
     else:
         envelope_obj = envelope
@@ -2788,7 +3538,6 @@ def handle_task(envelope: Any) -> Any:
     if not isinstance(payload, dict):
         raise TypeError("handle_task envelope.payload must be a dict")
 
-    # Dispatch map. We support a few synonyms so older callers continue to work.
     base_task_resolve_mx = (
         task_resolve_mx.__wrapped__ if hasattr(task_resolve_mx, "__wrapped__") else task_resolve_mx
     )
@@ -2804,33 +3553,24 @@ def handle_task(envelope: Any) -> Any:
     )
 
     task_map: dict[str, Any] = {
-        # R08: company domain resolution
         "resolve_company_domain": resolve_company_domain,
-        # R06 legacy verification entrypoint
         "verify_email": verify_email_task,
         "verify_email_task": verify_email_task,
-        # R15 MX resolution
         "task_resolve_mx": base_task_resolve_mx,
         "resolve_mx": base_task_resolve_mx,
-        # R17 catch-all detection
         "task_check_catchall": base_task_check_catchall,
         "check_catchall": base_task_check_catchall,
-        # R16+R18+O26 probe + classification + escalation
         "task_probe_email": base_task_probe_email,
         "probe_email": base_task_probe_email,
-        # O26 test-send
         "task_send_test_email": task_send_test_email,
         "send_test_email": task_send_test_email,
-        # R12 generation
         "task_generate_emails": task_generate_emails,
         "generate_emails": task_generate_emails,
-        # R13 normalized ingest
         "upsert_person_task": upsert_person_task,
-        # R10 crawl helper (batch)
         "crawl_approved_domains": crawl_approved_domains,
-        # Auto-discovery: company-scoped crawl + extract
         "crawl_company_site": crawl_company_site,
         "extract_candidates_for_company": extract_candidates_for_company,
+        "autodiscover_company": autodiscover_company,
     }
 
     func = task_map.get(task_name)

@@ -17,15 +17,25 @@ obvious garbage (wrong domains, clearly non-email strings, etc.).
 # src/extract/candidates.py
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from html import unescape
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from src.extract.quality_gates import (
+    is_placeholder_localpart,
+    validate_person_name,
+    validate_title,
+)
+
 from .stopwords import NAME_STOPWORDS
+
+log = logging.getLogger(__name__)
 
 # --- Public data model -------------------------------------------------------
 
@@ -57,6 +67,68 @@ class Candidate:
     is_role_address_guess: bool = False
 
 
+def _qg_valid_reason(result: Any) -> tuple[bool, str | None]:
+    """
+    Normalize validate_* return types to (valid, reason).
+
+    Supports:
+      - (bool, reason)
+      - (bool,)
+      - objects with .is_valid and optional .rejection_reason/.reason
+      - bool
+    """
+    if result is None:
+        return False, None
+    if isinstance(result, tuple):
+        if not result:
+            return False, None
+        valid = bool(result[0])
+        reason = None
+        if len(result) >= 2:
+            reason = str(result[1]) if result[1] is not None else None
+        return valid, reason
+    if isinstance(result, bool):
+        return result, None
+    if hasattr(result, "is_valid"):
+        valid = bool(result.is_valid)
+        reason = None
+        if hasattr(result, "rejection_reason"):
+            rr = result.rejection_reason
+            reason = str(rr) if rr is not None else None
+        elif hasattr(result, "reason"):
+            rr = result.reason
+            reason = str(rr) if rr is not None else None
+        return valid, reason
+    return False, None
+
+
+def _should_keep_candidate(cand: Candidate) -> bool:
+    """Apply quality gates to filter obvious garbage."""
+
+    # Check placeholder email localparts (example@, test@, etc.)
+    if cand.email:
+        localpart = cand.email.split("@", 1)[0].lower()
+        if is_placeholder_localpart(localpart):
+            return False
+
+    # Check name quality (if we have one)
+    name = cand.raw_name or f"{cand.first_name or ''} {cand.last_name or ''}".strip()
+    if name:
+        valid, reason = _qg_valid_reason(validate_person_name(name))
+        if not valid:
+            log.debug("Rejecting candidate name=%r: %s", name, reason)
+            return False
+
+    # Check title quality (if present); clear bad title but keep candidate
+    if cand.title:
+        valid, reason = _qg_valid_reason(validate_title(cand.title))
+        if not valid:
+            log.debug("Rejecting candidate title=%r: %s", cand.title, reason)
+            cand.title = None
+
+    return True
+
+
 # --- Heuristics & regexes ----------------------------------------------------
 
 EMAIL_RE = re.compile(
@@ -64,7 +136,10 @@ EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-_OBFUSCATION_MARKERS: tuple[str, ...] = (" at ", "[at]", "(at)", " dot ", "[dot]", "(dot)")
+# Robust obfuscation detection (used to decide whether to attempt deobfuscation).
+# We intentionally require BOTH an at-marker and dot-marker to reduce false positives.
+_OBF_AT_RE = re.compile(r"(\b(at)\b|\[at\]|\(at\))", re.IGNORECASE)
+_OBF_DOT_RE = re.compile(r"(\b(dot)\b|\[dot\]|\(dot\))", re.IGNORECASE)
 
 # Very generic localparts that are almost always role/placeholder inboxes.
 ROLE_ALIASES: set[str] = {
@@ -387,10 +462,10 @@ def _deobfuscate_email_text(text: str) -> str:
 
     s = text
 
-    # Replace [at], (at), " at " with @
+    # Replace [at], (at), " at " with @ (allow no surrounding spaces)
     s = re.sub(r"\s*[\[\(]?\s*at\s*[\]\)]?\s*", "@", s, flags=re.IGNORECASE)
 
-    # Replace [dot], (dot), " dot " with .
+    # Replace [dot], (dot), " dot " with . (allow no surrounding spaces)
     s = re.sub(r"\s*[\[\(]?\s*dot\s*[\]\)]?\s*", ".", s, flags=re.IGNORECASE)
 
     # Clean up whitespace
@@ -569,13 +644,6 @@ def _split_first_last(full_name: str) -> tuple[str | None, str | None]:
 
     Handles middle initials: "John Q. Public" -> ("John", "Public")
     Strips trailing periods from tokens.
-
-    Examples:
-        "John Public" -> ("John", "Public")
-        "John Q. Public" -> ("John", "Public")
-        "John Q Public" -> ("John", "Public")
-        "John A. B. Public" -> ("John", "Public")
-        "Mary" -> ("Mary", None)
     """
     s = _normalize_space(full_name)
     if not s:
@@ -584,15 +652,11 @@ def _split_first_last(full_name: str) -> tuple[str | None, str | None]:
     if len(parts) == 1:
         return parts[0].rstrip("."), None
 
-    # First token is the first name
     first = parts[0].rstrip(".")
 
-    # Find last name by skipping middle initials
-    # A middle initial is a single character optionally followed by a period
     non_initials = []
     for p in parts[1:]:
         cleaned = p.rstrip(".")
-        # Skip if it's a single character (middle initial)
         if len(cleaned) == 1 and cleaned.isalpha():
             continue
         non_initials.append(cleaned)
@@ -600,37 +664,36 @@ def _split_first_last(full_name: str) -> tuple[str | None, str | None]:
     if non_initials:
         return first, " ".join(non_initials)
 
-    # All remaining parts were initials, return the last one
     return first, parts[-1].rstrip(".")
 
 
 def _name_from_local_part(local: str) -> tuple[str | None, str | None]:
     """
-    Extract first/last name from email local-part.
+    Extract first/last name from email local-part, but ONLY when we have
+    an explicit separator (., _, -). This avoids generating weak/incorrect
+    "names" from single-token locals like 'john' or 'jdoe'.
 
     Examples:
-        "jane" -> ("Jane", None)
         "jane.doe" -> ("Jane", "Doe")
-        "j.doe" -> ("J", "Doe")  # keep single initials
         "jane-doe" -> ("Jane", "Doe")
         "jane_doe" -> ("Jane", "Doe")
+        "jane" -> (None, None)
+        "jdoe" -> (None, None)
     """
     if not local:
         return None, None
 
-    # Split on common separators
-    parts = re.split(r"[._-]", local)
-    parts = [p.strip() for p in parts if p.strip()]
-
-    if not parts:
+    if not any(sep in local for sep in (".", "_", "-")):
         return None, None
 
-    if len(parts) == 1:
-        # Single token: title case it
-        return parts[0].title(), None
+    parts = re.split(r"[._-]", local)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) < 2:
+        return None, None
 
-    # Multiple tokens: title case first and last
-    return parts[0].title(), parts[-1].title()
+    first = parts[0].title()
+    last = parts[-1].title()
+    return first, last
 
 
 def _choose_name_piece(text: str) -> str:
@@ -665,7 +728,6 @@ def _choose_name_piece(text: str) -> str:
     candidates: list[str] = []
 
     for seg in segments:
-        # Within each segment, split on commas and dashes.
         pieces = re.split(r"[,;/]", seg)
         more: list[str] = []
         for p in pieces:
@@ -681,11 +743,8 @@ def _choose_name_piece(text: str) -> str:
                 candidates.append(piece)
 
     if candidates:
-        # Prefer the earliest name-y piece.
         return candidates[0]
 
-    # No strong candidate → as a last resort, if *entire* string looks like a
-    # name, take it; otherwise, return empty so callers can treat as "no name".
     if _looks_human_name(t):
         return t
 
@@ -707,13 +766,9 @@ def _normalize_email(raw: str) -> str | None:
     s = _decode_unicode_escapes(raw)
 
     s = unquote(s).strip()
-    # Strip mailto:
     if s.lower().startswith("mailto:"):
         s = s[7:]
-    # Drop query params
     s = s.split("?", 1)[0].strip()
-
-    # Strip any remaining < or > from edges
     s = s.strip("<>").strip()
 
     m = EMAIL_RE.search(s)
@@ -730,8 +785,6 @@ def _same_org(email_domain: str, official_domain: str | None, source_url: str) -
     - If official_domain is provided, require exact or subdomain match.
     - Otherwise, fall back to matching the source_url host.
     """
-    # When official_domain is explicitly None, caller intends to disable
-    # domain filtering entirely (used in tests and special cases).
     if official_domain is None:
         return True
 
@@ -754,8 +807,10 @@ def _same_org(email_domain: str, official_domain: str | None, source_url: str) -
 
 
 def _text_has_obfuscation(text: str) -> bool:
-    t = text.lower()
-    return any(marker in t for marker in _OBFUSCATION_MARKERS)
+    t = (text or "").lower()
+    if "@" in t:
+        return False
+    return bool(_OBF_AT_RE.search(t) and _OBF_DOT_RE.search(t))
 
 
 def _iter_mailto_and_href_emails(soup: BeautifulSoup, seen: set[str]) -> Iterator[tuple[str, Tag]]:
@@ -781,9 +836,11 @@ def _iter_attribute_emails(soup: BeautifulSoup, seen: set[str]) -> Iterator[tupl
         for attr_val in tag.attrs.values():
             if not isinstance(attr_val, str):
                 continue
-            if "@" not in attr_val:
+            if "@" not in attr_val and not _text_has_obfuscation(attr_val):
                 continue
             decoded_val = _decode_unicode_escapes(attr_val)
+            if _text_has_obfuscation(decoded_val):
+                decoded_val = _deobfuscate_email_text(decoded_val)
             for m in EMAIL_RE.finditer(decoded_val):
                 em = m.group(0).lower()
                 if em not in seen:
@@ -798,14 +855,14 @@ def _iter_text_node_emails(
         text = str(node)
 
         has_at = "@" in text
-        has_obfuscation = deobfuscate and (not has_at) and _text_has_obfuscation(text)
+        has_obf = deobfuscate and (not has_at) and _text_has_obfuscation(text)
 
-        if not has_at and not has_obfuscation:
+        if not has_at and not has_obf:
             continue
 
         decoded_text = _decode_unicode_escapes(text)
 
-        if deobfuscate and (has_obfuscation or _text_has_obfuscation(decoded_text)):
+        if deobfuscate and (has_obf or _text_has_obfuscation(decoded_text)):
             decoded_text = _deobfuscate_email_text(decoded_text)
 
         for m in EMAIL_RE.finditer(decoded_text):
@@ -822,7 +879,7 @@ def _iter_email_nodes(
     Yield (email, node) pairs from:
       - <a href="mailto:...">
       - any attribute containing an email
-      - plain text nodes
+      - plain text nodes (optionally deobfuscated)
     """
     seen: set[str] = set()
 
@@ -837,22 +894,21 @@ def _extract_name_near_node(node: Tag | NavigableString) -> str | None:
     a human-looking name.
 
     Priority:
-      1) Text of the parent element (minus the email itself).
-      2) Previous sibling text.
-      3) Previous heading in the same section.
+      1) Text of the node itself (minus the email).
+      2) Text of the parent element.
+      3) Previous sibling text.
+      4) Previous heading in the same section.
     """
 
     def clean(txt: str) -> str:
         return _normalize_space(EMAIL_RE.sub(" ", unescape(txt or "")))
 
-    # If <a> node or similar, use its text.
     if isinstance(node, Tag):
         text = clean(node.get_text(" ", strip=True))
         piece = _choose_name_piece(text)
         if piece:
             return piece
 
-        # Look at parent
         parent = node.parent
         if parent is not None and isinstance(parent, Tag):
             text = clean(parent.get_text(" ", strip=True))
@@ -860,7 +916,6 @@ def _extract_name_near_node(node: Tag | NavigableString) -> str | None:
             if piece:
                 return piece
 
-            # Previous sibling text
             prev = parent.previous_sibling
             while isinstance(prev, NavigableString) and not prev.strip():
                 prev = prev.previous_sibling
@@ -875,14 +930,12 @@ def _extract_name_near_node(node: Tag | NavigableString) -> str | None:
                 if piece:
                     return piece
 
-            # Walk backwards to find the nearest heading tag
             for sib in parent.find_all_previous(["h1", "h2", "h3", "h4", "h5", "h6"]):
                 text = clean(sib.get_text(" ", strip=True))
                 piece = _choose_name_piece(text)
                 if piece:
                     return piece
 
-    # If node is just a NavigableString, see the parent.
     if isinstance(node, NavigableString):
         parent = node.parent
         if isinstance(parent, Tag):
@@ -904,7 +957,7 @@ def _local_part_role_like(local: str) -> bool:
     # Also handle e.g. "sales-team", "info_us", "support-emea"
     stripped = re.sub(r"[^a-z]", "", local_lower)
     for alias in ROLE_ALIASES:
-        if alias in stripped:
+        if alias and alias in stripped:
             return True
     return False
 
@@ -921,7 +974,6 @@ def _local_context_snippet(node: Tag | NavigableString) -> str | None:
         s = _normalize_space(unescape(txt or ""))
         if not s:
             return None
-        # Truncate to keep tokens under control.
         return s[:280]
     except Exception:
         return None
@@ -941,6 +993,219 @@ def _source_type_for_node(node: Tag | NavigableString) -> str | None:
     return "text"
 
 
+def _candidate_key(c: Candidate) -> tuple[str | None, str, bool]:
+    return (c.email, (c.raw_name or "").lower(), c.is_role_address_guess)
+
+
+def _keep_richer_context(existing: Candidate, incoming: Candidate) -> Candidate:
+    existing_snip = existing.context_snippet or ""
+    incoming_snip = incoming.context_snippet or ""
+    if len(incoming_snip) > len(existing_snip):
+        return incoming
+    return existing
+
+
+def _email_candidate_from_node(
+    *,
+    email: str,
+    node: Tag | NavigableString,
+    source_url: str,
+    effective_domain: str | None,
+) -> Candidate | None:
+    local, _, dom = email.partition("@")
+    if not local or not dom:
+        return None
+
+    if not _same_org(dom, effective_domain, source_url):
+        return None
+
+    is_role_guess = _local_part_role_like(local)
+
+    raw_name = _extract_name_near_node(node)
+    first_name: str | None = None
+    last_name: str | None = None
+
+    if raw_name and _looks_human_name(raw_name):
+        first_name, last_name = _split_first_last(raw_name)
+    else:
+        raw_name = None
+        if local and not is_role_guess:
+            first_name, last_name = _name_from_local_part(local)
+            if first_name and last_name:
+                raw_name = f"{first_name} {last_name}"
+            else:
+                first_name = None
+                last_name = None
+
+    candidate = Candidate(
+        email=email.lower(),
+        source_url=source_url,
+        first_name=first_name,
+        last_name=last_name,
+        raw_name=raw_name,
+        title=None,
+        source_type=_source_type_for_node(node),
+        context_snippet=_local_context_snippet(node),
+        is_role_address_guess=is_role_guess,
+    )
+
+    if not _should_keep_candidate(candidate):
+        return None
+    return candidate
+
+
+def _load_optional_helpers() -> tuple[
+    Callable[[str], Any] | None,
+    Callable[[str], Any] | None,
+    Callable[..., Any] | None,
+    Callable[..., Any] | None,
+]:
+    try:
+        from src.extract.source_filters import (  # type: ignore
+            is_blocked_source_url,
+            is_employee_page_url,
+        )
+    except Exception:  # pragma: no cover
+        is_blocked_source_url = None
+        is_employee_page_url = None
+
+    try:
+        # If you later add an HTML-aware classifier, we will use it when present.
+        # Expected signature (recommendation):
+        #   classify_page_for_people_extraction(
+        #       url: str,
+        #       html: str,
+        #       official_domain: str | None,
+        #   ) -> tuple[bool, str]
+        from src.extract.url_filters import (  # type: ignore
+            classify_page_for_people_extraction,
+        )
+    except Exception:  # pragma: no cover
+        classify_page_for_people_extraction = None
+
+    try:
+        from src.extract.people_cards import extract_people_cards  # type: ignore
+    except Exception:  # pragma: no cover
+        extract_people_cards = None
+
+    return (
+        is_blocked_source_url,
+        is_employee_page_url,
+        classify_page_for_people_extraction,
+        extract_people_cards,
+    )
+
+
+def _should_run_people_cards_page(
+    *,
+    source_url: str,
+    html: str,
+    effective_domain: str | None,
+    extract_people_cards: Callable[..., Any] | None,
+    is_blocked_source_url: Callable[[str], Any] | None,
+    classify_page_for_people_extraction: Callable[..., Any] | None,
+    is_employee_page_url: Callable[[str], Any] | None,
+) -> tuple[bool, str]:
+    if extract_people_cards is None:
+        return False, "skip:no_people_cards_extractor"
+
+    url = (source_url or "").strip()
+
+    if is_blocked_source_url is not None:
+        try:
+            blocked, reason = is_blocked_source_url(url)  # type: ignore[misc]
+        except Exception:
+            blocked, reason = False, None
+        if blocked:
+            why = reason or "blocked"
+            return False, f"skip:blocked_source:{why}"
+
+    if classify_page_for_people_extraction is not None:
+        try:
+            ok, reason = classify_page_for_people_extraction(  # type: ignore[misc]
+                url=url,
+                html=html,
+                official_domain=effective_domain,
+            )
+            if not ok:
+                return False, f"skip:classifier:{reason}"
+            return True, f"allow:classifier:{reason}"
+        except Exception:
+            pass
+
+    if is_employee_page_url is not None:
+        try:
+            if is_employee_page_url(url):  # type: ignore[misc]
+                return True, "allow:is_employee_page_url"
+        except Exception:
+            pass
+
+    head = (html or "")[:60_000].lower()
+    people_signals = (
+        "leadership team",
+        "executive team",
+        "executive leadership",
+        "management team",
+        "board of directors",
+        "our team",
+        "meet the team",
+        "our leadership",
+        "founders",
+        "executives",
+        "directors",
+        '"@type":"person"',
+        '"@type": "person"',
+        '"@type":"employee"',
+        '"@type": "employee"',
+    )
+    if any(s in head for s in people_signals):
+        return True, "allow:html_people_signal"
+
+    return False, "skip:no_strong_people_signal"
+
+
+def _merge_people_cards_into_map(
+    *,
+    by_key: dict[tuple[str | None, str, bool], Candidate],
+    card_candidates: list[Any],
+    source_url: str,
+) -> int:
+    added_cards = 0
+
+    for c in card_candidates:
+        try:
+            c.source_url = source_url
+        except Exception:
+            pass
+
+        if getattr(c, "email", None):
+            try:
+                c.email = None
+            except Exception:
+                pass
+
+        if not _should_keep_candidate(c):
+            continue
+
+        name_key = (getattr(c, "raw_name", None) or "").lower().strip()
+        if not name_key:
+            continue
+
+        key = (None, name_key, False)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = c
+            added_cards += 1
+            continue
+
+        existing_title = getattr(existing, "title", None) or ""
+        new_title = getattr(c, "title", None) or ""
+        if (not existing_title and new_title) or (len(new_title) > len(existing_title)):
+            by_key[key] = c
+
+    return added_cards
+
+
 # --- Main API ----------------------------------------------------------------
 
 
@@ -957,99 +1222,89 @@ def extract_candidates(
 
     We:
       - Parse the DOM with BeautifulSoup.
-      - Find emails via attributes + text.
+      - Find emails via attributes + text (optionally deobfuscated).
       - Filter to the same org/domain when official_domain is supplied.
       - Attach:
           * is_role_address_guess based on local-part
           * best-effort human-looking name (when available)
           * small context snippet and source_type
 
-    We deliberately do **not** try to decide if this is truly a person; that is
-    the AI refiner's job. Downstream code uses:
-      - role/placeholder heuristics to keep role inboxes at company-level, and
-      - AI to filter/normalize person rows.
+    P1/P2 polish:
+      - Extract same-org emails from any page (safe: customer emails won't pass _same_org()).
+      - Run no-email people-cards extraction ONLY on pages that are likely employee pages
+        and NOT third-party content (case studies, customer stories, events, podcasts, etc.).
+        This prevents “customer names” being persisted as company employees.
     """
     if not html:
         return []
 
-    # Handle source_url default
     if source_url is None:
         source_url = "https://example.com/unknown"
 
-    # Handle official_domain: prefer explicit, fall back to company_domain
     effective_domain = official_domain or company_domain
+    (
+        is_blocked_source_url,
+        is_employee_page_url,
+        classify_page_for_people_extraction,
+        extract_people_cards,
+    ) = _load_optional_helpers()
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Per-page dedup: avoid blasting the AI with dozens of identical
-    # office@example.com rows from the same page.
+    # Per-page dedup: avoid blasting the AI with dozens of identical rows.
     by_key: dict[tuple[str | None, str, bool], Candidate] = {}
 
     for email, node in _iter_email_nodes(soup, deobfuscate=deobfuscate):
-        local, _, dom = email.partition("@")
-        if not local or not dom:
-            continue
-
-        # Filter by org/domain, if known.
-        if not _same_org(dom, effective_domain, source_url):
-            continue
-
-        # Role-ness check - FILTER OUT role addresses entirely
-        is_role_guess = _local_part_role_like(local)
-        if is_role_guess:
-            continue
-
-        # Try to infer a name near this email (best-effort).
-        raw_name = _extract_name_near_node(node)
-        first_name: str | None = None
-        last_name: str | None = None
-
-        if raw_name and _looks_human_name(raw_name):
-            first_name, last_name = _split_first_last(raw_name)
-        else:
-            # If the text we found does not pass the name heuristics,
-            # try local-part fallback: jane.doe@domain.com -> Jane / Doe
-            if not raw_name and local:
-                first_name, last_name = _name_from_local_part(local)
-                if first_name or last_name:
-                    parts = [p for p in [first_name, last_name] if p]
-                    raw_name = " ".join(parts) if parts else None
-            else:
-                raw_name = None
-
-        context_snippet = _local_context_snippet(node)
-        source_type = _source_type_for_node(node)
-
-        candidate = Candidate(
-            email=email.lower(),
+        cand = _email_candidate_from_node(
+            email=email,
+            node=node,
             source_url=source_url,
-            first_name=first_name,
-            last_name=last_name,
-            raw_name=raw_name,
-            title=None,
-            source_type=source_type,
-            context_snippet=context_snippet,
-            is_role_address_guess=is_role_guess,
+            effective_domain=effective_domain,
         )
-
-        key = (
-            candidate.email,
-            (candidate.raw_name or "").lower(),
-            candidate.is_role_address_guess,
-        )
-        existing = by_key.get(key)
-
-        if existing is None:
-            by_key[key] = candidate
+        if cand is None:
             continue
 
-        # If we already have this (email, name, role-flag) on this page,
-        # keep the "better" one by a simple heuristic:
-        #   - prefer a candidate with a longer context snippet
-        #   - otherwise keep the first one we saw
-        existing_snip = existing.context_snippet or ""
-        new_snip = candidate.context_snippet or ""
-        if len(new_snip) > len(existing_snip):
-            by_key[key] = candidate
+        k = _candidate_key(cand)
+        existing = by_key.get(k)
+        if existing is None:
+            by_key[k] = cand
+            continue
+        by_key[k] = _keep_richer_context(existing, cand)
+
+    run_cards, cards_reason = _should_run_people_cards_page(
+        source_url=source_url,
+        html=html,
+        effective_domain=effective_domain,
+        extract_people_cards=extract_people_cards,
+        is_blocked_source_url=is_blocked_source_url,
+        classify_page_for_people_extraction=classify_page_for_people_extraction,
+        is_employee_page_url=is_employee_page_url,
+    )
+
+    if run_cards and extract_people_cards is not None:
+        try:
+            card_candidates = extract_people_cards(  # type: ignore[misc]
+                html=html,
+                source_url=source_url,
+                official_domain=effective_domain,
+            )
+        except Exception as exc:  # pragma: no cover
+            log.debug("people_cards extraction failed url=%s err=%s", source_url, exc)
+            card_candidates = []
+
+        added_cards = _merge_people_cards_into_map(
+            by_key=by_key,
+            card_candidates=list(card_candidates or []),
+            source_url=source_url,
+        )
+        if added_cards:
+            log.info(
+                "people_cards added=%d url=%s reason=%s",
+                added_cards,
+                source_url,
+                cards_reason,
+            )
+    else:
+        log.debug("people_cards skipped url=%s reason=%s", source_url, cards_reason)
 
     return list(by_key.values())

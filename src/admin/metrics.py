@@ -8,7 +8,7 @@ from typing import Any
 
 from rq import Queue, Worker
 
-from src.db import get_connection
+from src.db import get_conn
 
 # Prefer the existing Redis helper if it exists, but don't crash if its
 # name/signature changes; fall back to redis.from_url(settings.RQ_REDIS_URL).
@@ -233,7 +233,7 @@ def get_cost_counters(conn: sqlite3.Connection) -> CostCounters:
     These are not hard currency costs, just volume proxies:
     - smtp_probes: total verification_result rows
     - catchall_checks: domain_resolutions rows with a catch-all check
-    - domains_resolved: domain_resolutions rows with a resolved_at timestamp
+    - domains_resolved: domain_resolutions rows with a created_at timestamp
     - pages_crawled: sources rows (HTML pages fetched by the crawler)
     """
     try:
@@ -249,7 +249,7 @@ def get_cost_counters(conn: sqlite3.Connection) -> CostCounters:
             """
             SELECT COUNT(*) AS n
             FROM domain_resolutions
-            WHERE resolved_at IS NOT NULL
+            WHERE created_at IS NOT NULL
             """
         ).fetchone()
         pages_row = conn.execute("SELECT COUNT(*) AS n FROM sources").fetchone()
@@ -530,7 +530,7 @@ def get_admin_summary(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     cost counters.
     """
     if conn is None:
-        conn = get_connection()
+        conn = get_conn()
 
     queues, workers = get_queue_stats()
     verif = get_verification_stats(conn)
@@ -570,7 +570,7 @@ def get_analytics_summary(
       }
     """
     if conn is None:
-        conn = get_connection()
+        conn = get_conn()
 
     ts = get_verification_time_series(conn, window_days=window_days)
     domains = get_domain_breakdown(

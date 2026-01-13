@@ -1,4 +1,15 @@
 # tests/test_o05_deobfuscation.py
+"""
+O05 Deobfuscation Tests
+
+Tests email address deobfuscation (e.g., [at] -> @, [dot] -> .)
+
+NOTE: Role aliases are now marked with is_role_address_guess=True rather than
+being filtered out. Tests updated to reflect this behavior change.
+"""
+
+from __future__ import annotations
+
 import pytest
 
 from src.extract.candidates import extract_candidates
@@ -22,6 +33,20 @@ def _emails(html: str, **kwargs) -> set[str]:
         **kwargs,
     )
     return {c.email for c in cands}
+
+
+def _non_role_emails(html: str, **kwargs) -> set[str]:
+    """
+    Helper to run extraction and return set of emails that are NOT role aliases.
+    """
+    official = kwargs.pop("official_domain", OFFICIAL)
+    cands = extract_candidates(
+        html,
+        source_url="https://example.com/page",
+        official_domain=official,
+        **kwargs,
+    )
+    return {c.email for c in cands if not c.is_role_address_guess}
 
 
 HTML_BRACKET = "<p>Contact: John Doe — john [at] acme [dot] com</p>"
@@ -52,10 +77,13 @@ def test_flag_on_parentheses_and_word_dot() -> None:
     assert "mary@acme.co.uk" in emails
 
 
-def test_role_alias_filtered_even_when_deobfuscated() -> None:
-    """Role/distribution aliases are dropped even after de-obfuscation."""
-    emails = _emails(HTML_ROLE_ALIAS, deobfuscate=True)
-    assert "info@acme.com" not in emails
+def test_role_alias_marked_when_deobfuscated() -> None:
+    """
+    Role/distribution aliases are now marked but not filtered.
+    Using _non_role_emails helper to filter them downstream.
+    """
+    non_role = _non_role_emails(HTML_ROLE_ALIAS, deobfuscate=True)
+    assert "info@acme.com" not in non_role
 
 
 def test_html_entity_at_is_captured() -> None:

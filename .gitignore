@@ -51,3 +51,5 @@ __pycache__/
 *.bak
 *.bak.*
 *.save
+*.save.*
+tmp/

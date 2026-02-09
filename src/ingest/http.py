@@ -28,14 +28,14 @@ def _auth(authorization: str | None) -> None:
 
 def _process_items(items: list[dict], dry_run: bool):
     """
-    Validate → normalize → (optionally) persist.
+    Validate â†’ normalize â†’ (optionally) persist.
 
     R13 wiring:
       - Every item passes through normalize_row(), which:
-          • Title-cases names with particle rules
-          • Normalizes titles with abbreviation safelist
-          • Normalizes company display + computes norm_key
-          • Preserves provenance (source_url) and copies title → title_raw/title_norm
+          â€¢ Title-cases names with particle rules
+          â€¢ Normalizes titles with abbreviation safelist
+          â€¢ Normalizes company display + computes norm_key
+          â€¢ Preserves provenance (source_url) and copies title â†’ title_raw/title_norm
       - We keep normalize_row()'s error snapshot embedded in each row (row['errors']).
       - Only hard schema/domain validation rejections are counted as 'rejected'.
     """
@@ -43,13 +43,13 @@ def _process_items(items: list[dict], dry_run: bool):
     errs: list[str] = []
 
     for idx, obj in enumerate(items, start=1):
-        good, emsg = validate_minimum_fields(obj)
-        if not good:
-            errs.append(f"Item {idx}: {emsg}")
+        try:
+            validate_minimum_fields(obj)
+        except ValueError as e:
+            errs.append(f"Item {idx}: {e}")
             continue
-        if not validate_domain_sanity(obj.get("domain") or ""):
-            errs.append(f"Item {idx}: invalid domain")
-            continue
+        # validate_domain_sanity is intentionally a no-op; real validation happens in normalization
+        validate_domain_sanity(obj.get("domain") or "")
 
         # R13: normalize and preserve provenance/source_url
         row, _norm_errors = normalize_row(obj)

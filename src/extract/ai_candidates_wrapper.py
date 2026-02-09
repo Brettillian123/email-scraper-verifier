@@ -11,9 +11,13 @@ This module wraps the AI refiner to:
 
 Key behavior:
   - AI enabled + ok_nonempty  -> return AI people
-  - AI enabled + ok_empty     -> return [] (NO fallback)
+  - AI enabled + ok_empty     -> return [] (NO fallback) unless safety fallback triggered
   - AI disabled               -> smart fallback
   - AI failed (exception/parse)-> smart fallback
+
+PRODUCTION FIX (2026-01):
+  - Made _PRESS_URL_PATTERNS less aggressive to avoid filtering legitimate team pages
+  - Added safety fallback when AI returns 0 but quality candidates exist
 
 NOTE (batch_test.ps1 compatibility):
   - Emits log lines:
@@ -40,11 +44,12 @@ log = logging.getLogger(__name__)
 _AI_MAX_CANDIDATES = 50
 
 # URL patterns that indicate press/news pages (not team pages)
-# These pages often contain names of journalists, analysts, customers - not employees
+# PRODUCTION FIX: Made more conservative to avoid filtering legitimate team pages
+# Only filter URLs that are clearly NOT employee listing pages
 _PRESS_URL_PATTERNS = re.compile(
-    r"/(press|news|media|blog|articles?|stories|events?|webinars?|podcasts?|"
-    r"case-stud|customer-stor|resources?|insights?|announcements?|"
-    r"industry/media|newsroom|press-room|press-release|in-the-news)(/|$|\?)",
+    r"/(press-release|press-releases|in-the-news|"
+    r"case-stud|customer-stor|testimonial|success-stor|"
+    r"webinars?/\d|podcasts?/\d|episodes?/\d)(/|$|\?)",
     re.IGNORECASE,
 )
 
@@ -131,6 +136,10 @@ _LEADERSHIP_TITLE_PATTERNS = (
     "gm",
     "principal",
     "owner",
+    # Professional services titles (CPA/law firms)
+    "cpa",
+    "attorney",
+    "counsel",
 )
 
 # Any title indicator (broader than leadership)
@@ -148,6 +157,10 @@ _ANY_TITLE_PATTERNS = (
     "architect",
     "analyst",
     "coordinator",
+    "associate",
+    "accountant",
+    "auditor",
+    "tax",
 )
 
 
@@ -185,7 +198,7 @@ class AIRefinementMetrics:
     # Reason-coded outcomes for auditing
     # one of: ok_nonempty | ok_empty | parse_error | exception | disabled
     ai_outcome: str = "disabled"
-    # one of: ai_failed | ai_disabled | none
+    # one of: ai_failed | ai_disabled | none | safety_fallback
     fallback_reason: str = "none"
 
     fallback_used: bool = False
@@ -235,13 +248,13 @@ def _get_candidate_email(cand: Any) -> str | None:
 
 def _get_candidate_title(cand: Any) -> str | None:
     """Extract title from a candidate object."""
-    title = getattr(cand, "title", None)
+    title = getattr(cand, "title", None) or getattr(cand, "raw_title", None)
     return str(title).strip() if title else None
 
 
 def _get_candidate_source_url(cand: Any) -> str | None:
     """Extract source URL from a candidate object."""
-    url = getattr(cand, "source_url", None)
+    url = getattr(cand, "source_url", None) or getattr(cand, "page_url", None)
     return str(url).strip() if url else None
 
 
@@ -647,6 +660,21 @@ def _smart_fallback(
     return [], "none", len(candidates)
 
 
+def _count_quality_candidates(candidates: list[Any]) -> int:
+    """
+    Count candidates that have valid names AND titles (quality signal).
+    
+    These are high-confidence candidates that the AI might have incorrectly filtered.
+    """
+    count = 0
+    for c in candidates:
+        name = _get_candidate_name(c)
+        title = _get_candidate_title(c)
+        if _is_valid_name_structure(name) and _has_any_title(title):
+            count += 1
+    return count
+
+
 def refine_candidates_with_ai(
     *,
     company_name: str,
@@ -659,6 +687,11 @@ def refine_candidates_with_ai(
     Contract:
       - If AI is enabled and the call succeeds but returns 0 people -> return [] (no fallback).
       - Fallback is used only when AI is disabled or the AI call fails.
+      
+    PRODUCTION FIX (2026-01):
+      - Added safety fallback: If AI returns 0 but we had 3+ quality candidates
+        (valid name + title), trigger smart fallback instead of returning empty.
+        This prevents losing good candidates when AI parsing fails.
 
     Pre-filtering (when AI is enabled):
       - Removes press/news page candidates
@@ -777,6 +810,23 @@ def refine_candidates_with_ai(
             metrics.fallback_used = False
             metrics.fallback_reason = "none"
             return refined_list, metrics
+
+        # PRODUCTION FIX: Safety fallback when AI returns 0 but quality candidates exist
+        # This prevents losing good candidates when AI parsing fails or is too conservative
+        quality_count = _count_quality_candidates(filtered_candidates)
+        if quality_count >= 3:
+            log.warning(
+                "AI returned 0 people but had %d quality candidates (name+title); "
+                "triggering safety fallback",
+                quality_count,
+            )
+            metrics.ai_outcome = "ok_empty"
+            metrics.fallback_used = True
+            metrics.fallback_reason = "safety_fallback"
+            filtered, tier, rejections = _smart_fallback(candidates)
+            metrics.fallback_tier = tier
+            metrics.quality_rejections = rejections
+            return filtered, metrics
 
         # Contract: AI succeeded but returned empty -> return [] and DO NOT fallback
         metrics.ai_outcome = "ok_empty"

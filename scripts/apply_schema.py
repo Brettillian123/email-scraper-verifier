@@ -34,9 +34,14 @@ def _import_get_conn():
     return get_conn
 
 
-def _is_postgres_url(url: str) -> bool:
-    u = (url or "").strip().lower()
-    return u.startswith("postgres://") or u.startswith("postgresql://")
+def _import_is_postgres_url():
+    """Import is_postgres_url from utils, with fallback for standalone execution."""
+    try:
+        from src.utils import is_postgres_url  # type: ignore
+    except Exception:
+        sys.path.insert(0, str(ROOT))
+        from src.utils import is_postgres_url  # type: ignore
+    return is_postgres_url
 
 
 @dataclass
@@ -179,7 +184,7 @@ def _is_official_unique_stmt(stmt: str) -> bool:
 def _drop_unique_official_if_present(conn) -> None:
     """
     If a UNIQUE index exists on companies.(official_domain|domain_official), drop it.
-    This enforces "many companies → one domain" regardless of existing state.
+    This enforces "many companies â†’ one domain" regardless of existing state.
     """
     try:
         rows = conn.execute(
@@ -241,7 +246,7 @@ def _apply_sql_text(conn, sql_text: str) -> None:
         # Multi-brand guard: never allow unique index on official_domain / domain_official
         if _is_official_unique_stmt(stmt):
             print(
-                "· Skipping UNIQUE index on companies.(official_domain|domain_official) per multi-brand rule"
+                "Â· Skipping UNIQUE index on companies.(official_domain|domain_official) per multi-brand rule"
             )
             continue
 
@@ -271,7 +276,7 @@ def _apply_migrations(conn, migrations_dir: Path) -> int:
         if version in applied:
             continue
 
-        print(f"→ Applying migration: {p.relative_to(ROOT)}")
+        print(f"â†’ Applying migration: {p.relative_to(ROOT)}")
         sql_text = _read_text(p)
         _apply_sql_text(conn, sql_text)
         conn.execute("INSERT INTO schema_migrations (version) VALUES (?);", (version,))
@@ -336,13 +341,13 @@ def _print_summary(conn) -> None:
         "verification_results",
     ):
         exists = "yes" if _object_exists(conn, t, "table") else "no"
-        print(f"· {t:24} exists: {exists}")
+        print(f"Â· {t:24} exists: {exists}")
 
     v_exists = "yes" if _object_exists(conn, "v_emails_latest", "view") else "no"
-    print(f"· v_emails_latest         exists: {v_exists}")
+    print(f"Â· v_emails_latest         exists: {v_exists}")
 
     mig_exists = "yes" if _object_exists(conn, "schema_migrations", "table") else "no"
-    print(f"· schema_migrations       exists: {mig_exists}")
+    print(f"Â· schema_migrations       exists: {mig_exists}")
 
 
 def main(argv: Iterable[str] | str | None = None) -> int:
@@ -378,7 +383,8 @@ def main(argv: Iterable[str] | str | None = None) -> int:
     args = parser.parse_args(argv_list)
 
     if args.db_url:
-        if not _is_postgres_url(args.db_url):
+        is_postgres_url = _import_is_postgres_url()
+        if not is_postgres_url(args.db_url):
             raise SystemExit(
                 "ERROR: --db must be a Postgres URL (postgresql://... or postgres://...)."
             )
@@ -402,7 +408,7 @@ def main(argv: Iterable[str] | str | None = None) -> int:
                 "(postgresql://...)."
             )
 
-        print("→ Using Postgres via src.db.get_conn()")
+        print("â†’ Using Postgres via src.db.get_conn()")
         _verify_postgres(conn)
 
         if schema_path.is_relative_to(ROOT):
@@ -410,7 +416,7 @@ def main(argv: Iterable[str] | str | None = None) -> int:
         else:
             schema_disp = str(schema_path)
 
-        print(f"→ Applying base schema: {schema_disp}")
+        print(f"â†’ Applying base schema: {schema_disp}")
         schema_text = _read_text(schema_path)
         _apply_sql_text(conn, schema_text)
         conn.commit()
@@ -420,7 +426,7 @@ def main(argv: Iterable[str] | str | None = None) -> int:
         _verify_postgres(conn)
         _print_summary(conn)
 
-    print(f"✔ Schema applied; migrations applied this run: {applied_now}")
+    print(f"âœ” Schema applied; migrations applied this run: {applied_now}")
     return 0
 
 

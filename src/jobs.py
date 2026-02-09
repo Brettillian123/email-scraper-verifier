@@ -6,17 +6,11 @@ from dataclasses import asdict
 from rq import Queue, Retry
 
 from src.config import load_settings
+from src.exceptions import PermanentSMTPError, TemporarySMTPError
 from src.queueing.redis_conn import get_redis
 from src.queueing.tasks import task_generate_emails, task_send_test_email
 
 _cfg = load_settings()
-
-
-# Reuse the same error taxonomy as tasks (kept local to avoid import cycles)
-class TemporarySMTPError(Exception): ...
-
-
-class PermanentSMTPError(Exception): ...
 
 
 def _queue_name_for(kind: str | None = None) -> str:

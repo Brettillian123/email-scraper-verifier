@@ -39,9 +39,14 @@ def _import_get_conn():
     return get_conn
 
 
-def _is_postgres_url(url: str) -> bool:
-    u = (url or "").strip().lower()
-    return u.startswith("postgres://") or u.startswith("postgresql://")
+def _import_is_postgres_url():
+    """Import is_postgres_url from utils."""
+    try:
+        from src.utils import is_postgres_url
+    except ImportError:
+        sys.path.insert(0, str(ROOT))
+        from src.utils import is_postgres_url
+    return is_postgres_url
 
 
 # SQL queries for duplicate detection (tenant-aware)
@@ -231,7 +236,8 @@ def main():
 
     # Set DATABASE_URL if provided via --db
     if args.db_url:
-        if not _is_postgres_url(args.db_url):
+        is_postgres_url = _import_is_postgres_url()
+        if not is_postgres_url(args.db_url):
             print(
                 "[ERROR] --db must be a PostgreSQL URL (postgresql://... or postgres://...)",
                 file=sys.stderr,

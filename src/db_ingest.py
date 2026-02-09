@@ -70,7 +70,7 @@ def upsert_company(
                 return int(row[0] if isinstance(row, tuple) else row["id"])
             raise RuntimeError("Failed to upsert company with domain")
 
-        # No domain → pending_resolution
+        # No domain â†’ pending_resolution
         cur = conn.execute(
             "SELECT id FROM companies WHERE tenant_id = ? AND name = ? AND domain IS NULL",
             (t, normalized_company),
@@ -247,7 +247,7 @@ def upsert_email_placeholder(
         return None
 
 
-# ----- 4) Enqueue follow-ups (R08–R12 hooks; reuse R06 infrastructure) -----
+# ----- 4) Enqueue follow-ups (R08â€“R12 hooks; reuse R06 infrastructure) -----
 def enqueue_followups(
     company_id: int,
     domain_present: bool,
@@ -256,10 +256,10 @@ def enqueue_followups(
     email_id: int | None,
 ) -> None:
     """
-    - If domain missing → enqueue resolve_company_domain(company_id) (R08).
-    - If domain present and we have first/last but no email →
+    - If domain missing â†’ enqueue resolve_company_domain(company_id) (R08).
+    - If domain present and we have first/last but no email â†’
       enqueue generate_permutations(person_id, company_id) (R12).
-    - If explicit email present → enqueue verify_email(email_id) (R06).
+    - If explicit email present â†’ enqueue task_probe_email for SMTP verification.
     """
     q = Queue("verify", connection=get_redis())
 
@@ -272,8 +272,8 @@ def enqueue_followups(
         q.enqueue("src.queueing.tasks.generate_permutations", person_id, company_id)
 
     if email_id is not None:
-        # Reuse R06 verification path
-        q.enqueue("src.queueing.tasks.verify_email", email_id)
+        # Use real SMTP verification via task_probe_email (not the stub verify_email)
+        q.enqueue("src.queueing.tasks.task_probe_email", email_id=email_id, email="", domain="")
 
 
 # ----- 5) Bulk upsert helpers (for batch ingestion) -----

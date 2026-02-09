@@ -114,7 +114,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Minimum score to allow people_cards extraction (classifier threshold)
-_PEOPLE_CARDS_CLASSIFY_MIN_SCORE = max(1, _env_int("PEOPLE_CARDS_CLASSIFY_MIN_SCORE", 8))
+# Lowered to 4 so /about pages (which get +4 from allowed_employee_url) can extract
+_PEOPLE_CARDS_CLASSIFY_MIN_SCORE = max(1, _env_int("PEOPLE_CARDS_CLASSIFY_MIN_SCORE", 4))
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +411,44 @@ _NON_PERSON_PHRASES = frozenset(
         "cookie policy",
         "all rights reserved",
         "copyright",
+        # Navigation / footer / sidebar elements
+        "our firm",
+        "our services",
+        "our story",
+        "our mission",
+        "our values",
+        "our history",
+        "our clients",
+        "our partners",
+        "our approach",
+        "useful links",
+        "quick links",
+        "helpful links",
+        "site map",
+        "sitemap",
+        "main menu",
+        "footer menu",
+        # Business service categories (not people)
+        "tax preparation",
+        "tax services",
+        "tax planning",
+        "individual tax",
+        "business tax",
+        "corporate tax",
+        "estate planning",
+        "retirement planning",
+        "wealth management",
+        "financial planning",
+        "financial services",
+        "accounting services",
+        "bookkeeping services",
+        "payroll services",
+        "audit services",
+        "advisory services",
+        "consulting services",
+        "business services",
+        "professional services",
+        "client services",
     ]
 )
 
@@ -468,20 +507,59 @@ _JOB_TITLE_PATTERNS = (
     "attorney",
 )
 
+# Pattern to strip professional credentials/suffixes from names.
+# Matches: "Name, CPA" or "Name, CPA, MBA" or "Name (CPA)"
+_CREDENTIALS_RE = (
+    r',?\s*\(?\b('
+    r'CPA|MBA|CFP|CFA|EA|JD|PhD|MD|RN|PE|PMP'
+    r'|SPHR|PHR|SHRM|CFE|CIA|CISA|CMA|CGMA'
+    r'|CVA|ABV|ASA|CEPA|ChFC|CLU|RICP|WMCP'
+    r'|AIF|AAMS|CRPC|CDFA|CFP®|CPA/PFS'
+    r')\b\)?'
+)
+
 
 def _looks_like_person_name(text: str) -> bool:
     if not text or len(text) < 3:
         return False
     text = text.strip()
 
-    lower = text.lower()
+    # Strip common professional credentials/suffixes before validation
+    text_clean = re.sub(_CREDENTIALS_RE, '', text, flags=re.IGNORECASE).strip()
+    # Also remove trailing commas left behind
+    text_clean = text_clean.rstrip(',').strip()
+    
+    # Use cleaned text for validation
+    if not text_clean:
+        return False
+
+    lower = text_clean.lower()
     if lower in _NON_PERSON_PHRASES:
         return False
     for phrase in _NON_PERSON_PHRASES:
         if phrase in lower:
             return False
 
-    words = text.split()
+    # Reject if text looks like a job title (not a person name)
+    if any(pattern in lower for pattern in _JOB_TITLE_PATTERNS):
+        return False
+    
+    # Additional job title words/phrases that are clearly not names
+    job_title_indicators = {
+        "accountant", "accounting", "bookkeeper", "bookkeeping",
+        "analyst", "administrator", "administrative", "assistant",
+        "associate", "coordinator", "specialist", "technician",
+        "supervisor", "representative", "consultant", "advisor",
+        "certified", "public", "licensed", "registered",
+        "intern", "trainee", "apprentice",
+        "receptionist", "secretary", "clerk",
+        "officer", "controller", "treasurer",
+    }
+    words_lower = [w.lower() for w in text_clean.split()]
+    if any(w in job_title_indicators for w in words_lower):
+        return False
+
+    words = text_clean.split()
     if len(words) < 2 or len(words) > 5:
         return False
 
@@ -496,7 +574,7 @@ def _looks_like_person_name(text: str) -> bool:
 
     if _HAS_QUALITY_GATES:
         try:
-            result = validate_person_name(text)
+            result = validate_person_name(text_clean)
             if not getattr(result, "is_valid", False):
                 return False
         except Exception:
@@ -545,18 +623,73 @@ def _has_leadership_title(text: str) -> bool:
     return any(pattern in lower for pattern in _LEADERSHIP_TITLE_PATTERNS)
 
 
+def _strip_credentials(name: str) -> str:
+    """Strip professional credentials/suffixes from a name.
+    
+    Examples:
+        "BRITTANY BRANDT, CPA" -> "BRITTANY BRANDT"
+        "John Smith, MBA, CFA" -> "John Smith"
+        "Jane Doe (PhD)" -> "Jane Doe"
+    """
+    if not name:
+        return name
+    
+    # Strip credentials using shared pattern
+    cleaned = re.sub(_CREDENTIALS_RE, '', name, flags=re.IGNORECASE).strip()
+    # Remove trailing commas left behind
+    cleaned = cleaned.rstrip(',').strip()
+    return cleaned if cleaned else name
+
+
 def _split_name(full_name: str) -> tuple[str | None, str | None]:
     if not full_name:
         return None, None
-    parts = full_name.strip().split()
+    # Strip credentials before splitting
+    clean_name = _strip_credentials(full_name)
+    parts = clean_name.strip().split()
     if len(parts) < 2:
-        return full_name.strip(), None
+        return clean_name.strip(), None
     return parts[0], parts[-1]
 
 
 # ---------------------------------------------------------------------------
 # Extraction Strategy 1: LinkedIn Anchors
 # ---------------------------------------------------------------------------
+
+
+def _is_in_nav_or_footer(element: Any) -> bool:
+    """Check if element is inside a nav, footer, header, or sidebar container."""
+    if not _HAS_BS4 or element is None:
+        return False
+    
+    # Check ancestors for nav/footer/header tags or classes
+    nav_footer_tags = {"nav", "footer", "header", "aside"}
+    nav_footer_classes = {
+        "nav", "navbar", "navigation", "menu", "footer", "header", "sidebar",
+        "site-footer", "site-header", "site-nav", "main-nav", "primary-nav",
+        "footer-nav", "footer-menu", "footer-links", "quick-links", "useful-links",
+    }
+    
+    for parent in element.parents:
+        if not hasattr(parent, "name"):
+            continue
+        
+        # Check tag name
+        if parent.name and parent.name.lower() in nav_footer_tags:
+            return True
+        
+        # Check class names
+        parent_classes = parent.get("class", [])
+        if isinstance(parent_classes, list):
+            for cls in parent_classes:
+                if cls.lower() in nav_footer_classes:
+                    return True
+                # Also check partial matches
+                cls_lower = cls.lower()
+                if any(kw in cls_lower for kw in ["footer", "nav", "menu", "sidebar"]):
+                    return True
+    
+    return False
 
 
 def _is_linkedin_url(href: str) -> bool:
@@ -580,33 +713,92 @@ def _extract_from_linkedin_anchors(
         if not _is_linkedin_url(href):
             continue
 
+        # Try to get name from anchor text first
         name_text = anchor.get_text(strip=True)
+        title = None
+        
+        # If anchor text is empty or not a valid name, look in adjacent elements
+        if not name_text or not _looks_like_person_name(name_text):
+            name_text, title = _find_name_near_linkedin_anchor(anchor)
+        
         if not name_text or not _looks_like_person_name(name_text):
             continue
 
-        name_key = name_text.lower().strip()
+        # Clean credentials from name
+        clean_name = _strip_credentials(name_text)
+        
+        name_key = clean_name.lower().strip()
         if name_key in seen_names:
             continue
         seen_names.add(name_key)
 
-        title = _find_adjacent_title(anchor)
-        first_name, last_name = _split_name(name_text)
+        if not title:
+            title = _find_adjacent_title(anchor)
+        first_name, last_name = _split_name(clean_name)
 
         candidates.append(
             _make_candidate(
                 source_url=source_url,
-                full_name=name_text,
+                full_name=clean_name,
                 first_name=first_name,
                 last_name=last_name,
                 title=title,
                 source_type="people_card_linkedin",
-                context_snippet=f"{name_text} - {title}" if title else name_text,
+                context_snippet=f"{clean_name} - {title}" if title else clean_name,
             )
         )
 
-        log.debug("Extracted from LinkedIn anchor: %s (title=%s)", name_text, title)
+        log.debug("Extracted from LinkedIn anchor: %s (title=%s)", clean_name, title)
 
     return candidates
+
+
+def _find_name_near_linkedin_anchor(anchor: Any) -> tuple[str | None, str | None]:
+    """Find a person name in elements near a LinkedIn anchor.
+    
+    Looks at parent containers, siblings, and nearby headings to find
+    the person's name when the anchor text itself is empty or an icon.
+    """
+    if not _HAS_BS4 or anchor is None:
+        return None, None
+    
+    # Look for containing card/div that might have the person's name
+    for tag_name in ["li", "article", "div", "figure", "section"]:
+        container = anchor.find_parent(tag_name)
+        if not container:
+            continue
+        
+        # Skip if container is too large (probably not a person card)
+        container_text = container.get_text(strip=True)
+        if len(container_text) > 500:
+            continue
+        
+        # Look for headings in this container
+        for heading in container.find_all(["h2", "h3", "h4", "h5", "h6"]):
+            heading_text = heading.get_text(strip=True)
+            if _looks_like_person_name(heading_text):
+                # Try to find title in sibling or next element
+                title = None
+                next_elem = heading.find_next_sibling()
+                if next_elem:
+                    next_text = next_elem.get_text(strip=True)
+                    if _looks_like_title(next_text):
+                        title = next_text
+                return heading_text, title
+        
+        # Look for name-like strings in the container
+        strings = list(container.stripped_strings)
+        for i, s in enumerate(strings):
+            if _looks_like_person_name(s):
+                title = None
+                if i + 1 < len(strings) and _looks_like_title(strings[i + 1]):
+                    title = strings[i + 1]
+                return s, title
+        
+        # Found a container but no name - stop looking at larger containers
+        break
+    
+    return None, None
 
 
 def _find_adjacent_title(element: Any) -> str | None:
@@ -678,6 +870,10 @@ def _extract_from_card_structures(
             ["div", "li", "article", "section"],
             class_=pattern,
         ):
+            # Skip cards inside nav/footer/sidebar
+            if _is_in_nav_or_footer(card):
+                continue
+            
             name_elem = card.find(["h2", "h3", "h4", "h5", "h6", "strong", "b"])
             if not name_elem:
                 strings = list(card.stripped_strings)
@@ -753,6 +949,10 @@ def _extract_from_repeated_siblings(
     search_root = section_root if section_root else soup
 
     for container in search_root.find_all(["div", "ul", "section", "article"]):
+        # Skip containers inside nav/footer/sidebar
+        if _is_in_nav_or_footer(container):
+            continue
+        
         children = [
             c
             for c in container.children
@@ -821,14 +1021,61 @@ def _extract_from_repeated_siblings(
 # ---------------------------------------------------------------------------
 
 
-_ALT_SPLITS = [",", " - ", " – ", " | "]
-_ALT_EXCLUDE_WORDS = ("logo", "icon", "banner", "photo", "image", "headshot")
+_ALT_SPLITS = [",", " - ", " â€” ", " | "]
+_ALT_EXCLUDE_WORDS = ("logo", "icon", "banner", "photo", "image", "headshot", "background")
+
+# Title keywords that might appear in image alt text like "Jack Angers VP Engineering"
+_TITLE_KEYWORDS_FOR_ALT = (
+    "ceo", "cfo", "cto", "coo", "cmo", "cpo", "cro", "ciso",
+    "president", "founder", "co-founder", "cofounder",
+    "vp ", " vp", "vice president", "svp", "evp",
+    "director", "head of", "chief", "partner", "principal",
+    "manager", "senior", "lead", "executive", "officer",
+)
 
 
 def _extract_name_title_from_alt(alt_text: str) -> tuple[str | None, str | None]:
     alt = (alt_text or "").strip()
     if not alt:
         return None, None
+    
+    # Skip obvious non-person images
+    if any(x in alt.lower() for x in _ALT_EXCLUDE_WORDS):
+        return None, None
+
+    # First try explicit separators
+    for sep in _ALT_SPLITS:
+        if sep not in alt:
+            continue
+        left, right = alt.split(sep, 1)
+        potential_name = left.strip()
+        potential_title = right.strip()
+        if _looks_like_person_name(potential_name):
+            return potential_name, potential_title if _looks_like_title(potential_title) else None
+
+    # Try to detect title keywords embedded in the alt text
+    # e.g., "Jack Angers VP Engineering" -> name="Jack Angers", title="VP Engineering"
+    alt_lower = alt.lower()
+    for keyword in _TITLE_KEYWORDS_FOR_ALT:
+        idx = alt_lower.find(keyword)
+        if idx > 0:  # Found keyword, and it's not at the start
+            potential_name = alt[:idx].strip()
+            potential_title = alt[idx:].strip()
+            
+            # Validate the split makes sense
+            if _looks_like_person_name(potential_name) and len(potential_name) >= 3:
+                # Clean up potential title (remove leading/trailing junk)
+                potential_title = potential_title.strip(" -â€“|,")
+                if potential_title and _looks_like_title(potential_title):
+                    return potential_name, potential_title
+                else:
+                    return potential_name, None
+
+    # Fallback: if whole string looks like a person name, return it
+    if _looks_like_person_name(alt):
+        return alt, None
+
+    return None, None
 
     for sep in _ALT_SPLITS:
         if sep not in alt:
@@ -880,6 +1127,10 @@ def _extract_from_image_text_patterns(
     search_root = section_root if section_root else soup
 
     for img in search_root.find_all("img"):
+        # Skip images inside nav/footer/sidebar
+        if _is_in_nav_or_footer(img):
+            continue
+        
         alt_name, alt_title = _extract_name_title_from_alt(img.get("alt", ""))
         adj_name, adj_title = _extract_name_title_from_parent(getattr(img, "parent", None))
 
@@ -932,11 +1183,18 @@ def _extract_from_headings(
     search_root = section_root if section_root else soup
 
     for heading in search_root.find_all(["h2", "h3", "h4", "h5", "h6"]):
+        # Skip headings inside nav/footer/sidebar
+        if _is_in_nav_or_footer(heading):
+            continue
+        
         name_text = heading.get_text(strip=True)
         if not _looks_like_person_name(name_text):
             continue
 
-        name_key = name_text.lower().strip()
+        # Clean the name (strip credentials) for dedup and storage
+        clean_name = _strip_credentials(name_text)
+        
+        name_key = clean_name.lower().strip()
         if name_key in seen_names:
             continue
         seen_names.add(name_key)
@@ -959,21 +1217,21 @@ def _extract_from_headings(
                             title = potential
                             break
 
-        first_name, last_name = _split_name(name_text)
+        first_name, last_name = _split_name(clean_name)
 
         candidates.append(
             _make_candidate(
                 source_url=source_url,
-                full_name=name_text,
+                full_name=clean_name,
                 first_name=first_name,
                 last_name=last_name,
                 title=title,
                 source_type="people_card_heading",
-                context_snippet=f"{name_text} - {title}" if title else name_text,
+                context_snippet=f"{clean_name} - {title}" if title else clean_name,
             )
         )
 
-        log.debug("Extracted from heading: %s (title=%s)", name_text, title)
+        log.debug("Extracted from heading: %s (title=%s)", clean_name, title)
 
     return candidates
 
@@ -993,6 +1251,10 @@ def _extract_from_list_items(
     search_root = section_root if section_root else soup
 
     for li in search_root.find_all("li"):
+        # Skip list items inside nav/footer/sidebar
+        if _is_in_nav_or_footer(li):
+            continue
+        
         strings = list(li.stripped_strings)
         if len(strings) < 1:
             continue

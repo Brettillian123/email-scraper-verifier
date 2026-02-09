@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 """
-R18 — Canonical verification status classifier.
+R18 â€” Canonical verification status classifier.
 
 Takes low-level signals from:
   - R16 SMTP RCPT probe (rcpt_category / code / msg)
@@ -23,7 +23,7 @@ Intended usage:
   - Persist verify_status / verify_reason / verified_mx / verified_at
     back onto verification_results.
 
-O26 — Bounce-based escalation helper.
+O26 â€” Bounce-based escalation helper.
 
 Additional helper:
 
@@ -105,7 +105,7 @@ def _norm_rcpt_category(cat: str | None) -> str | None:
     if c in {"unknown"}:
         return "unknown"
 
-    # Unknown label – leave as-is so we can still distinguish it.
+    # Unknown label â€“ leave as-is so we can still distinguish it.
     return c
 
 
@@ -243,7 +243,7 @@ def _classify_good_rcpt(
 
     Policy:
 
-      - Confirmed catch-all domains ("catch_all") → risky_catch_all
+      - Confirmed catch-all domains ("catch_all") â†’ risky_catch_all
         (or invalid if fallback says undeliverable).
       - Non-catch-all ("not_catch_all") AND unknown/None catch-all status:
         treat 2xx as valid by default.
@@ -268,10 +268,13 @@ def _classify_good_rcpt(
         return "risky_catch_all", "rcpt_2xx_catchall"
 
     # Unknown / None catch-all status:
-    # Treat as non-catch-all for verify_status, but keep the reason informative.
+    # Be conservative - treat as risky since we couldn't verify the domain isn't catch-all.
+    # This prevents false "valid" labels on domains where catch-all detection failed.
     if fallback_status == "deliverable":
-        return "valid", "rcpt_2xx_non_catchall_or_unknown_fallback_valid"
-    return "valid", "rcpt_2xx_non_catchall_or_unknown"
+        # Vendor says deliverable, but we couldn't check catch-all status.
+        # Still risky because the domain might accept everything.
+        return "risky_catch_all", "rcpt_2xx_catchall_unknown_fallback_deliverable"
+    return "risky_catch_all", "rcpt_2xx_catchall_unknown"
 
 
 def _classify_soft_fail(
@@ -340,12 +343,12 @@ def classify(
       1. TTL staleness check.
       2. Hard invalids (5xx / undeliverable), unless overridden by fallback.
       3. 2xx / deliverable RCPT:
-         - confirmed catch-all → risky
-         - non-catch-all or unknown → valid (with distinct reasons)
+         - confirmed catch-all â†’ risky
+         - non-catch-all or unknown â†’ valid (with distinct reasons)
            or risky/invalid with fallback.
       4. Tempfail / timeout / blocked, combined with fallback + catch-all.
       5. Fallback-only classifications.
-      6. No strong signals → unknown_timeout / no_verification_attempt.
+      6. No strong signals â†’ unknown_timeout / no_verification_attempt.
     """
     rcpt_category_raw = _norm(signals.rcpt_category)
     rcpt_category = _norm_rcpt_category(rcpt_category_raw)
@@ -369,7 +372,7 @@ def classify(
     )
 
     # ------------------------------------------------------------------
-    # 3) Hard invalids — 5xx / undeliverable
+    # 3) Hard invalids â€” 5xx / undeliverable
     # ------------------------------------------------------------------
     result = _classify_hard_invalid(
         rcpt_category=rcpt_category,

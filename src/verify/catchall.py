@@ -1,5 +1,5 @@
 """
-R17 — Domain-level catch-all detection (with caching on domain_resolutions).
+R17 â€” Domain-level catch-all detection (with caching on domain_resolutions).
 
 Public API:
 
@@ -23,7 +23,7 @@ Behavior:
 
 Tests monkeypatch:
 
-- get_connection() → in-memory SQLite DB with a minimal domain_resolutions table.
+- get_connection() â†’ in-memory SQLite DB with a minimal domain_resolutions table.
 - get_or_resolve_mx() and _smtp_probe_random_address() for controlled behavior.
 """
 
@@ -148,6 +148,9 @@ def _load_cached_state(
           "catch_all_smtp_code",
         }
     or None if no row exists yet.
+    
+    NOTE: PostgreSQL schema uses chosen_domain and user_hint columns.
+    There is NO 'domain' column in the production schema.
     """
     cur = con.execute(
         """
@@ -158,8 +161,8 @@ def _load_cached_state(
             catch_all_localpart,
             catch_all_smtp_code
         FROM domain_resolutions
-        WHERE domain = ?
-           OR (domain IS NULL AND chosen_domain = ?)
+        WHERE chosen_domain = ?
+           OR user_hint = ?
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
@@ -189,13 +192,16 @@ def _update_cached_state(
     """
     Update catch_all_* columns on the most recent domain_resolutions row
     for this domain. If no row exists, we silently skip.
+    
+    NOTE: PostgreSQL schema uses chosen_domain and user_hint columns.
+    There is NO 'domain' column in the production schema.
     """
     cur = con.execute(
         """
         SELECT id
         FROM domain_resolutions
-        WHERE domain = ?
-           OR (domain IS NULL AND chosen_domain = ?)
+        WHERE chosen_domain = ?
+           OR user_hint = ?
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
@@ -214,8 +220,7 @@ def _update_cached_state(
             catch_all_checked_at  = ?,
             catch_all_localpart   = ?,
             catch_all_smtp_code   = ?,
-            catch_all_smtp_msg    = ?,
-            domain                = COALESCE(domain, ?)
+            catch_all_smtp_msg    = ?
         WHERE id = ?
         """,
         (
@@ -224,7 +229,6 @@ def _update_cached_state(
             localpart,
             rcpt_code,
             (rcpt_msg or None),
-            domain,
             row_id,
         ),
     )
@@ -242,7 +246,7 @@ def _classify_from_probe(code: int | None, error: str | None) -> CatchallStatus:
             return "not_catch_all"
         if 400 <= code < 500:
             return "tempfail"
-        # unexpected SMTP code → generic error
+        # unexpected SMTP code â†’ generic error
         return "error"
 
     if error:
@@ -256,7 +260,7 @@ def _classify_from_probe(code: int | None, error: str | None) -> CatchallStatus:
 
 
 # ---------------------------------------------------------------------------
-# SMTP helper – tests monkeypatch _smtp_probe_random_address
+# SMTP helper â€“ tests monkeypatch _smtp_probe_random_address
 # ---------------------------------------------------------------------------
 
 
@@ -397,7 +401,7 @@ def check_catchall_for_domain(
         mx_host = getattr(mx_res, "lowest_mx", None) or None
 
     if not mx_host:
-        # No MX / A-only fallback → no_mx, no SMTP call
+        # No MX / A-only fallback â†’ no_mx, no SMTP call
         status = "no_mx"
         _update_cached_state(
             con,

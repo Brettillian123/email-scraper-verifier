@@ -1477,7 +1477,7 @@ def _sanitize_domain(domain: str) -> str:
 
 
 def _build_hints() -> list[str]:
-    return [h.strip().lower() for h in CRAWL_FOLLOW_KEYWORDS.split(",") if h.strip()]
+    return [h.strip().lower() for h in CRAWL_FOLLOW_KEYWORDS if h.strip()]
 
 
 def _maybe_do_discovery(

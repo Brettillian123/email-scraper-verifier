@@ -8,9 +8,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
         :root {
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-                sans-serif;
-            color-scheme: dark light;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color-scheme: dark;
+        }
+
+        * {
+            box-sizing: border-box;
         }
 
         body {
@@ -21,29 +24,20 @@
         }
 
         .page {
-            max-width: 1080px;
+            max-width: 1400px;
             margin: 0 auto;
             padding: 24px 16px 40px;
         }
 
-        h1,
-        h2,
-        h3 {
+        h1, h2, h3, h4 {
             margin: 0 0 12px;
             font-weight: 600;
         }
 
-        h1 {
-            font-size: 1.6rem;
-        }
-
-        h2 {
-            font-size: 1.2rem;
-        }
-
-        h3 {
-            font-size: 1rem;
-        }
+        h1 { font-size: 1.6rem; }
+        h2 { font-size: 1.2rem; }
+        h3 { font-size: 1rem; }
+        h4 { font-size: 0.9rem; color: #9ca3af; }
 
         .subtitle {
             margin-top: 4px;
@@ -52,24 +46,43 @@
             color: #9ca3af;
         }
 
-        .grid {
+        /* Grid layouts */
+        .grid-4 {
             display: grid;
-            grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 16px;
+            margin-bottom: 20px;
         }
 
-        @media (max-width: 900px) {
-            .grid {
-                grid-template-columns: minmax(0, 1fr);
-            }
+        .grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 20px;
         }
 
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        @media (max-width: 1100px) {
+            .grid-4 { grid-template-columns: repeat(2, 1fr); }
+            .grid-3 { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        @media (max-width: 700px) {
+            .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
+        }
+
+        /* Cards */
         .card {
-            background: #020617;
+            background: #1e293b;
             border-radius: 12px;
             padding: 16px 18px 14px;
-            box-shadow: 0 10px 25px rgba(15, 23, 42, 0.7);
-            border: 1px solid #1f2937;
+            border: 1px solid #334155;
         }
 
         .card-header {
@@ -77,146 +90,171 @@
             justify-content: space-between;
             align-items: baseline;
             gap: 8px;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
         }
 
-        .badge {
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 0.75rem;
-            border: 1px solid #374151;
+        .card-full {
+            grid-column: 1 / -1;
+        }
+
+        /* Stat cards */
+        .stat-card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #334155;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
             color: #9ca3af;
-            white-space: nowrap;
+            margin-bottom: 4px;
         }
 
-        .pill {
-            border-radius: 999px;
-            padding: 3px 9px;
+        .stat-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #f1f5f9;
+        }
+
+        .stat-value.ok { color: #22c55e; }
+        .stat-value.warn { color: #eab308; }
+        .stat-value.err { color: #ef4444; }
+        .stat-value.info { color: #3b82f6; }
+
+        .stat-sub {
             font-size: 0.75rem;
-            background: #111827;
-            border: 1px solid #1f2937;
+            color: #6b7280;
+            margin-top: 4px;
         }
 
-        .pill span {
-            color: #9ca3af;
+        /* Progress bars */
+        .progress-bar {
+            background: #374151;
+            border-radius: 4px;
+            height: 8px;
+            margin-top: 8px;
+            overflow: hidden;
         }
 
+        .progress-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .progress-fill.ok { background: #22c55e; }
+        .progress-fill.warn { background: #eab308; }
+        .progress-fill.err { background: #ef4444; }
+        .progress-fill.info { background: #3b82f6; }
+
+        /* Tables */
         table {
             width: 100%;
             border-collapse: collapse;
             font-size: 0.82rem;
         }
 
-        th,
-        td {
+        th, td {
             text-align: left;
-            padding: 4px 6px;
-            border-bottom: 1px solid #111827;
+            padding: 8px 10px;
+            border-bottom: 1px solid #374151;
             vertical-align: middle;
         }
 
         th {
             font-weight: 500;
             color: #9ca3af;
-            border-bottom: 1px solid #1f2937;
+            border-bottom: 2px solid #475569;
+            position: sticky;
+            top: 0;
+            background: #1e293b;
+        }
+
+        tbody tr:hover {
+            background: rgba(59, 130, 246, 0.1);
         }
 
         tbody tr:last-child td {
             border-bottom: none;
         }
 
-        .muted {
-            color: #6b7280;
-        }
-
-        .ok {
-            color: #22c55e;
-        }
-
-        .warn {
-            color: #eab308;
-        }
-
-        .err {
-            color: #f97316;
-        }
-
-        .mono {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-                "Liberation Mono", "Courier New", monospace;
-        }
-
-        .metrics-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin: 4px 0 6px;
-        }
-
-        .metric {
-            font-size: 0.8rem;
-            padding: 3px 8px;
+        /* Badges */
+        .badge {
+            padding: 3px 10px;
             border-radius: 999px;
-            background: #020617;
-            border: 1px solid #1f2937;
+            font-size: 0.72rem;
+            font-weight: 500;
+            display: inline-block;
         }
 
-        .metric strong {
-            margin-right: 4px;
-        }
+        .badge-ok { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
+        .badge-warn { background: rgba(234, 179, 8, 0.2); color: #eab308; }
+        .badge-err { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .badge-info { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+        .badge-muted { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
 
-        .footer {
-            margin-top: 18px;
-            font-size: 0.75rem;
-            color: #6b7280;
-            display: flex;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-
+        /* Status dots */
         .status-dot {
             display: inline-block;
-            width: 7px;
-            height: 7px;
-            border-radius: 999px;
-            margin-right: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
         }
 
-        .status-ok {
-            background: #22c55e;
+        .status-ok { background: #22c55e; }
+        .status-warn { background: #eab308; }
+        .status-err { background: #ef4444; }
+        .status-info { background: #3b82f6; }
+        .status-muted { background: #6b7280; }
+
+        /* Text utilities */
+        .muted { color: #6b7280; }
+        .ok { color: #22c55e; }
+        .warn { color: #eab308; }
+        .err { color: #ef4444; }
+        .info { color: #3b82f6; }
+
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         }
 
-        .status-warn {
-            background: #eab308;
+        .text-sm { font-size: 0.8rem; }
+        .text-xs { font-size: 0.72rem; }
+        .truncate {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 200px;
         }
 
-        .status-err {
-            background: #f97316;
-        }
-
-        .status-unknown {
-            background: #4b5563;
-        }
-
+        /* Error banner */
         .error-banner {
-            margin-bottom: 12px;
-            padding: 8px 10px;
+            margin-bottom: 16px;
+            padding: 12px 16px;
             border-radius: 8px;
             border: 1px solid #b91c1c;
-            background: rgba(127, 29, 29, 0.6);
-            font-size: 0.8rem;
+            background: rgba(127, 29, 29, 0.4);
+            font-size: 0.85rem;
         }
 
-        .hidden {
-            display: none;
-        }
+        .hidden { display: none; }
 
+        /* Header */
         .header-row {
             display: flex;
             justify-content: space-between;
-            align-items: baseline;
-            gap: 8px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
         }
 
         .refresh-info {
@@ -224,585 +262,765 @@
             color: #6b7280;
         }
 
-        .subtle-label {
-            font-size: 0.78rem;
+        /* User dropdown */
+        .user-section {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #334155;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            color: #e5e7eb;
+            cursor: pointer;
+            font-size: 0.85rem;
+            text-decoration: none;
+            transition: background 0.15s;
+        }
+
+        .user-btn:hover {
+            background: #475569;
+        }
+
+        .user-avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #4f46e5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.75rem;
+        }
+
+        /* Section headers */
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #334155;
+        }
+
+        /* Scrollable table container */
+        .table-scroll {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        /* Navigation tabs */
+        .nav-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #334155;
+            padding-bottom: 0;
+        }
+
+        .nav-tab {
+            padding: 10px 16px;
+            font-size: 0.85rem;
             color: #9ca3af;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: color 0.15s, border-color 0.15s;
+        }
+
+        .nav-tab:hover {
+            color: #e5e7eb;
+        }
+
+        .nav-tab.active {
+            color: #3b82f6;
+            border-bottom-color: #3b82f6;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Quick stats row */
+        .quick-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .quick-stat {
+            padding: 6px 12px;
+            background: #334155;
+            border-radius: 6px;
+            font-size: 0.8rem;
+        }
+
+        .quick-stat strong {
+            color: #f1f5f9;
+            margin-right: 4px;
         }
     </style>
 </head>
 
 <body>
     <div class="page">
-        <header class="header-row">
-            <div>
-                <h1>Email Scraper – Admin</h1>
-                <div class="subtitle">
-                    R24/O17 dashboard for queues, workers, verification, cost proxies, and basic analytics.
+        <!-- Header -->
+        <div class="header-row">
+            <div class="header-left">
+                <h1>📊 Admin Dashboard</h1>
+                <span class="refresh-info">Auto-refresh: 10s | Last: <span id="last-update">--:--:--</span></span>
+            </div>
+            <div class="user-section">
+                <a href="/" class="user-btn">← Dashboard</a>
+                <a href="/admin/users" class="user-btn">👥 Users</a>
+                {% if user %}
+                <div class="user-btn">
+                    <div class="user-avatar">{{ user.email[0]|upper if user.email else '?' }}</div>
+                    <span>{{ user.email or 'Admin' }}</span>
                 </div>
+                {% endif %}
             </div>
-            <div class="refresh-info">
-                Last update:
-                <span id="last-update" class="mono muted">–</span><br />
-                Auto-refresh every 10s
-            </div>
-        </header>
-
-        <div id="error-banner" class="error-banner hidden">
-            Failed to load admin metrics/analytics. Check that the API server and Redis are running.
         </div>
 
-        <section class="grid">
-            <div class="card">
-                <div class="card-header">
-                    <h2>Queues</h2>
-                    <div class="badge">RQ queue health</div>
-                </div>
-                <div class="metrics-row">
-                    <div class="metric">
-                        <strong>Total queued</strong>
-                        <span id="queues-total-queued" class="mono muted">0</span>
-                    </div>
-                    <div class="metric">
-                        <strong>Total failed</strong>
-                        <span id="queues-total-failed" class="mono muted">0</span>
-                    </div>
-                </div>
-                <table id="queues-table">
-                    <thead>
-                        <tr>
-                            <th>Queue</th>
-                            <th class="mono">Queued</th>
-                            <th class="mono">Started</th>
-                            <th class="mono">Failed</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="muted" colspan="4">Loading…</td>
-                        </tr>
-                    </tbody>
-                </table>
+        <!-- Error banner -->
+        <div id="error-banner" class="error-banner hidden">
+            ⚠️ Failed to load metrics. Retrying...
+        </div>
+
+        <!-- Navigation tabs -->
+        <div class="nav-tabs">
+            <div class="nav-tab active" data-tab="overview">Overview</div>
+            <div class="nav-tab" data-tab="users">User Activity</div>
+            <div class="nav-tab" data-tab="runs">Recent Runs</div>
+            <div class="nav-tab" data-tab="queues">Queues & Workers</div>
+            <div class="nav-tab" data-tab="analytics">Analytics</div>
+        </div>
+
+        <!-- Tab: Overview -->
+        <div id="tab-overview" class="tab-content active">
+            <!-- Quick stats row -->
+            <div class="quick-stats" id="quick-stats">
+                <div class="quick-stat"><strong id="qs-runs">0</strong> Total Runs</div>
+                <div class="quick-stat"><strong id="qs-companies">0</strong> Companies</div>
+                <div class="quick-stat"><strong id="qs-emails">0</strong> Emails</div>
+                <div class="quick-stat"><strong id="qs-valid-rate">0%</strong> Valid Rate</div>
             </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2>Workers</h2>
-                    <div class="badge">RQ workers</div>
-                </div>
-                <table id="workers-table">
-                    <thead>
-                        <tr>
-                            <th>Worker</th>
-                            <th>State</th>
-                            <th>Queues</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="muted" colspan="3">Loading…</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <section class="grid" style="margin-top: 16px">
-            <div class="card">
-                <div class="card-header">
-                    <h2>Verification</h2>
-                    <div class="badge">Lead surface</div>
-                </div>
-                <div class="metrics-row">
-                    <div class="metric">
-                        <strong>Total emails</strong>
-                        <span id="verif-total" class="mono muted">0</span>
-                    </div>
-                    <div class="metric">
-                        <strong>Valid rate</strong>
-                        <span id="verif-valid-rate" class="mono muted">0%</span>
+            <!-- Key metrics grid -->
+            <div class="grid-4">
+                <div class="stat-card">
+                    <div class="stat-label">Companies with Candidates</div>
+                    <div class="stat-value ok" id="stat-with-candidates">0</div>
+                    <div class="stat-sub">People extracted</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill ok" id="prog-candidates" style="width: 0%"></div>
                     </div>
                 </div>
-                <table id="verif-table">
-                    <thead>
-                        <tr>
-                            <th>Status</th>
-                            <th class="mono">Count</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="muted" colspan="2">Loading…</td>
-                        </tr>
-                    </tbody>
-                </table>
+
+                <div class="stat-card">
+                    <div class="stat-label">Companies with Valid Email</div>
+                    <div class="stat-value info" id="stat-with-valid">0</div>
+                    <div class="stat-sub">At least 1 verified email</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill info" id="prog-valid" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">403 Blocked</div>
+                    <div class="stat-value err" id="stat-403">0</div>
+                    <div class="stat-sub">WAF/Access denied</div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">Catch-All Domains</div>
+                    <div class="stat-value warn" id="stat-catchall">0</div>
+                    <div class="stat-sub">Accept-all email servers</div>
+                </div>
             </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2>Cost proxies</h2>
-                    <div class="badge">Volume counters</div>
+            <!-- Second row of stats -->
+            <div class="grid-4">
+                <div class="stat-card">
+                    <div class="stat-label">Robots Blocked</div>
+                    <div class="stat-value" id="stat-robots" style="color: #f97316;">0</div>
+                    <div class="stat-sub">robots.txt denied</div>
                 </div>
-                <table id="costs-table">
-                    <thead>
-                        <tr>
-                            <th>Counter</th>
-                            <th class="mono">Total</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="muted" colspan="2">Loading…</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
 
-        <section class="grid" style="margin-top: 16px">
-            <div class="card">
-                <div class="card-header">
-                    <h2>Verification trend</h2>
-                    <div class="badge">Last 30 days</div>
+                <div class="stat-card">
+                    <div class="stat-label">No MX Records</div>
+                    <div class="stat-value muted" id="stat-nomx">0</div>
+                    <div class="stat-sub">Invalid email domains</div>
                 </div>
-                <div class="subtle-label" style="margin-bottom: 4px;">
-                    Daily totals and valid rate over the recent verification window.
+
+                <div class="stat-card">
+                    <div class="stat-label">With Pages</div>
+                    <div class="stat-value" id="stat-with-pages" style="color: #8b5cf6;">0</div>
+                    <div class="stat-sub">Crawled successfully</div>
                 </div>
-                <table id="timeseries-table">
-                    <thead>
-                        <tr>
-                            <th>Date</th>
-                            <th class="mono">Total</th>
-                            <th class="mono">Valid</th>
-                            <th class="mono">Invalid</th>
-                            <th class="mono">Catch-all</th>
-                            <th class="mono">Valid rate</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="muted" colspan="6">Loading…</td>
-                        </tr>
-                    </tbody>
-                </table>
+
+                <div class="stat-card">
+                    <div class="stat-label">Total Companies</div>
+                    <div class="stat-value" id="stat-total-companies">0</div>
+                    <div class="stat-sub">In database</div>
+                </div>
             </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2>Domains &amp; errors</h2>
-                    <div class="badge">Top 10 each</div>
+            <!-- Run status and verification -->
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📋 Run Status</h3>
+                    </div>
+                    <div class="grid-3" style="margin-bottom: 0;">
+                        <div style="text-align: center;">
+                            <div class="stat-value info" id="run-queued" style="font-size: 1.4rem;">0</div>
+                            <div class="stat-label">Queued</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div class="stat-value warn" id="run-running" style="font-size: 1.4rem;">0</div>
+                            <div class="stat-label">Running</div>
+                        </div>
+                        <div style="text-align: center;">
+                            <div class="stat-value ok" id="run-succeeded" style="font-size: 1.4rem;">0</div>
+                            <div class="stat-label">Succeeded</div>
+                        </div>
+                    </div>
+                    <div style="margin-top: 12px; display: flex; gap: 16px; justify-content: center;">
+                        <span class="text-sm"><span class="err">●</span> Failed: <strong id="run-failed">0</strong></span>
+                        <span class="text-sm"><span class="muted">●</span> Cancelled: <strong id="run-cancelled">0</strong></span>
+                    </div>
                 </div>
-                <div class="subtle-label" style="margin-bottom: 4px;">
-                    Hot spots by company_domain and common verification errors.
-                </div>
-                <div style="display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 8px;">
-                    <table id="domains-table">
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>✉️ Email Verification</h3>
+                        <span class="badge badge-info" id="verif-total-badge">0 total</span>
+                    </div>
+                    <table id="verif-table">
                         <thead>
                             <tr>
-                                <th>Domain</th>
-                                <th class="mono">Total</th>
-                                <th class="mono">Valid %</th>
+                                <th>Status</th>
+                                <th>Count</th>
+                                <th>%</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            <tr>
-                                <td class="muted" colspan="3">Loading…</td>
-                            </tr>
-                        </tbody>
+                        <tbody></tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- Cost counters -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>💰 Operations Counter</h3>
+                </div>
+                <div class="grid-4" style="margin-bottom: 0;">
+                    <div style="text-align: center;">
+                        <div class="stat-value" id="cost-smtp" style="font-size: 1.2rem;">0</div>
+                        <div class="stat-label">SMTP Probes</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div class="stat-value" id="cost-catchall" style="font-size: 1.2rem;">0</div>
+                        <div class="stat-label">Catch-all Checks</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div class="stat-value" id="cost-domains" style="font-size: 1.2rem;">0</div>
+                        <div class="stat-label">Domains Resolved</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div class="stat-value" id="cost-pages" style="font-size: 1.2rem;">0</div>
+                        <div class="stat-label">Pages Crawled</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: User Activity -->
+        <div id="tab-users" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h3>👥 User Run Statistics</h3>
+                    <span class="badge badge-muted">Top 15 by runs</span>
+                </div>
+                <div class="table-scroll">
+                    <table id="user-stats-table">
+                        <thead>
+                            <tr>
+                                <th>User</th>
+                                <th>Total Runs</th>
+                                <th>Queued</th>
+                                <th>Running</th>
+                                <th>Succeeded</th>
+                                <th>Failed</th>
+                                <th>Last Run</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Recent Runs -->
+        <div id="tab-runs" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h3>🚀 Recent Runs</h3>
+                    <span class="badge badge-muted">Last 10</span>
+                </div>
+                <div class="table-scroll">
+                    <table id="recent-runs-table">
+                        <thead>
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Status</th>
+                                <th>User</th>
+                                <th>Domains</th>
+                                <th>Label</th>
+                                <th>Created</th>
+                                <th>Error</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Queues & Workers -->
+        <div id="tab-queues" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📬 Queue Status</h3>
+                    </div>
+                    <table id="queues-table">
+                        <thead>
+                            <tr>
+                                <th>Queue</th>
+                                <th>Queued</th>
+                                <th>Started</th>
+                                <th>Failed</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>⚙️ Workers</h3>
+                    </div>
+                    <table id="workers-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>State</th>
+                                <th>Queues</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab: Analytics -->
+        <div id="tab-analytics" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📈 Verification History (30 days)</h3>
+                    </div>
+                    <div class="table-scroll">
+                        <table id="timeseries-table">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Total</th>
+                                    <th>Valid</th>
+                                    <th>Invalid</th>
+                                    <th>Risky</th>
+                                    <th>Rate</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🌐 Top Domains</h3>
+                    </div>
+                    <div class="table-scroll">
+                        <table id="domains-table">
+                            <thead>
+                                <tr>
+                                    <th>Domain</th>
+                                    <th>Total</th>
+                                    <th>Valid Rate</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>❌ Error Breakdown</h3>
+                </div>
+                <div class="table-scroll" style="max-height: 200px;">
                     <table id="errors-table">
                         <thead>
                             <tr>
-                                <th>Error</th>
-                                <th class="mono">Count</th>
+                                <th>Reason</th>
+                                <th>Count</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            <tr>
-                                <td class="muted" colspan="2">Loading…</td>
-                            </tr>
-                        </tbody>
+                        <tbody></tbody>
                     </table>
                 </div>
             </div>
-        </section>
-
-        <footer class="footer">
-            <div>
-                <span class="status-dot status-ok"></span>Green = no failures ·
-                <span class="status-dot status-warn"></span>Yellow = some failures ·
-                <span class="status-dot status-err"></span>Orange = heavy failures
-            </div>
-            <div>
-                Backed by
-                <span class="mono">GET /admin/metrics</span> and
-                <span class="mono">GET /admin/analytics</span>
-            </div>
-        </footer>
+        </div>
     </div>
 
     <script>
-        function classifyQueueState(queued, failed) {
-            if (failed > 0 && failed >= queued) {
-                return "err";
-            }
-            if (failed > 0) {
-                return "warn";
-            }
-            return "ok";
-        }
-
-        function statusDotClass(kind) {
-            if (kind === "ok") return "status-dot status-ok";
-            if (kind === "warn") return "status-dot status-warn";
-            if (kind === "err") return "status-dot status-err";
-            return "status-dot status-unknown";
-        }
-
-        function updateQueues(queues) {
-            const tbody = document.querySelector("#queues-table tbody");
-            tbody.innerHTML = "";
-
-            if (!queues || queues.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 4;
-                cell.textContent = "No queues found.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
-                document.getElementById("queues-total-queued").textContent = "0";
-                document.getElementById("queues-total-failed").textContent = "0";
-                return;
-            }
-
-            let totalQueued = 0;
-            let totalFailed = 0;
-
-            queues.forEach((q) => {
-                const row = document.createElement("tr");
-
-                const state = classifyQueueState(
-                    Number(q.queued || 0),
-                    Number(q.failed || 0)
-                );
-
-                const nameCell = document.createElement("td");
-                nameCell.textContent = q.name || "(unknown)";
-                row.appendChild(nameCell);
-
-                const queuedCell = document.createElement("td");
-                queuedCell.textContent = q.queued;
-                queuedCell.className = "mono";
-                row.appendChild(queuedCell);
-
-                const startedCell = document.createElement("td");
-                startedCell.textContent = q.started;
-                startedCell.className = "mono muted";
-                row.appendChild(startedCell);
-
-                const failedCell = document.createElement("td");
-                failedCell.textContent = q.failed;
-                failedCell.className = "mono " + (state === "ok" ? "muted" : state);
-                row.appendChild(failedCell);
-
-                tbody.appendChild(row);
-
-                totalQueued += Number(q.queued || 0);
-                totalFailed += Number(q.failed || 0);
+        // Tab navigation
+        document.querySelectorAll('.nav-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
             });
+        });
 
-            document.getElementById("queues-total-queued").textContent =
-                String(totalQueued);
-            document.getElementById("queues-total-failed").textContent =
-                String(totalFailed);
+        function formatNumber(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return String(n);
         }
 
-        function updateWorkers(workers) {
-            const tbody = document.querySelector("#workers-table tbody");
-            tbody.innerHTML = "";
-
-            if (!workers || workers.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 3;
-                cell.textContent = "No workers reported.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
-                return;
+        function formatDate(dateStr) {
+            if (!dateStr) return '-';
+            try {
+                const d = new Date(dateStr);
+                return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } catch {
+                return dateStr;
             }
+        }
 
-            workers.forEach((w) => {
-                const row = document.createElement("tr");
+        function getStatusBadge(status) {
+            const badges = {
+                'queued': '<span class="badge badge-info">queued</span>',
+                'running': '<span class="badge badge-warn">running</span>',
+                'succeeded': '<span class="badge badge-ok">succeeded</span>',
+                'failed': '<span class="badge badge-err">failed</span>',
+                'cancelled': '<span class="badge badge-muted">cancelled</span>',
+            };
+            return badges[status] || `<span class="badge badge-muted">${status}</span>`;
+        }
 
-                const nameCell = document.createElement("td");
-                nameCell.textContent = w.name || "(unnamed)";
-                row.appendChild(nameCell);
+        function updateQuickStats(data) {
+            document.getElementById('qs-runs').textContent = formatNumber(data.run_status?.total || 0);
+            document.getElementById('qs-companies').textContent = formatNumber(data.company_health?.total_companies || 0);
+            document.getElementById('qs-emails').textContent = formatNumber(data.verification?.total_emails || 0);
+            const rate = ((data.verification?.valid_rate || 0) * 100).toFixed(1) + '%';
+            document.getElementById('qs-valid-rate').textContent = rate;
+        }
 
-                const stateCell = document.createElement("td");
-                const state = (w.state || "unknown").toLowerCase();
-                const span = document.createElement("span");
-                span.innerHTML =
-                    '<span class="' +
-                    statusDotClass(
-                        state === "busy" || state === "idle" ? "ok" : "unknown"
-                    ) +
-                    '"></span>' +
-                    state;
-                stateCell.appendChild(span);
-                row.appendChild(stateCell);
+        function updateCompanyHealth(health) {
+            const total = health.total_companies || 1;
+            
+            document.getElementById('stat-with-candidates').textContent = formatNumber(health.companies_with_candidates || 0);
+            document.getElementById('stat-with-valid').textContent = formatNumber(health.companies_with_valid_email || 0);
+            document.getElementById('stat-403').textContent = formatNumber(health.companies_403_blocked || 0);
+            document.getElementById('stat-robots').textContent = formatNumber(health.companies_robots_blocked || 0);
+            document.getElementById('stat-catchall').textContent = formatNumber(health.companies_catch_all || 0);
+            document.getElementById('stat-nomx').textContent = formatNumber(health.companies_no_mx || 0);
+            document.getElementById('stat-with-pages').textContent = formatNumber(health.companies_with_pages || 0);
+            document.getElementById('stat-total-companies').textContent = formatNumber(health.total_companies || 0);
 
-                const queuesCell = document.createElement("td");
-                queuesCell.textContent = (w.queues || []).join(", ");
-                queuesCell.className = "muted";
-                row.appendChild(queuesCell);
+            const candPct = Math.min(100, (health.companies_with_candidates / total) * 100);
+            const validPct = Math.min(100, (health.companies_with_valid_email / total) * 100);
+            document.getElementById('prog-candidates').style.width = candPct + '%';
+            document.getElementById('prog-valid').style.width = validPct + '%';
+        }
 
-                tbody.appendChild(row);
-            });
+        function updateRunStatus(status) {
+            document.getElementById('run-queued').textContent = status.queued || 0;
+            document.getElementById('run-running').textContent = status.running || 0;
+            document.getElementById('run-succeeded').textContent = status.succeeded || 0;
+            document.getElementById('run-failed').textContent = status.failed || 0;
+            document.getElementById('run-cancelled').textContent = status.cancelled || 0;
         }
 
         function updateVerification(verif) {
-            const total = Number(verif.total_emails || 0);
-            document.getElementById("verif-total").textContent = String(total);
+            const total = verif.total_emails || 0;
+            document.getElementById('verif-total-badge').textContent = formatNumber(total) + ' total';
 
-            const validRate = Number(verif.valid_rate || 0);
-            const pct = (validRate * 100).toFixed(1) + "%";
-            document.getElementById("verif-valid-rate").textContent = pct;
-
-            const tbody = document.querySelector("#verif-table tbody");
-            tbody.innerHTML = "";
+            const tbody = document.querySelector('#verif-table tbody');
+            tbody.innerHTML = '';
 
             const byStatus = verif.by_status || {};
-            const statuses = Object.keys(byStatus);
+            const statuses = Object.keys(byStatus).sort();
+            
             if (statuses.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 2;
-                cell.textContent = "No verification data yet.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
+                tbody.innerHTML = '<tr><td colspan="3" class="muted">No verification data yet.</td></tr>';
                 return;
             }
 
-            statuses.sort().forEach((status) => {
-                const row = document.createElement("tr");
-
-                const statusCell = document.createElement("td");
-                statusCell.textContent = status;
-                row.appendChild(statusCell);
-
-                const countCell = document.createElement("td");
-                countCell.textContent = byStatus[status];
-                countCell.className = "mono";
-                row.appendChild(countCell);
-
-                tbody.appendChild(row);
+            statuses.forEach(status => {
+                const count = byStatus[status];
+                const pct = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
+                const cls = status === 'valid' ? 'ok' : status === 'invalid' ? 'err' : 'warn';
+                
+                tbody.innerHTML += `
+                    <tr>
+                        <td><span class="status-dot status-${cls}"></span>${status}</td>
+                        <td class="mono">${formatNumber(count)}</td>
+                        <td class="mono ${cls}">${pct}%</td>
+                    </tr>
+                `;
             });
         }
 
         function updateCosts(costs) {
-            const tbody = document.querySelector("#costs-table tbody");
-            tbody.innerHTML = "";
+            document.getElementById('cost-smtp').textContent = formatNumber(costs.smtp_probes || 0);
+            document.getElementById('cost-catchall').textContent = formatNumber(costs.catchall_checks || 0);
+            document.getElementById('cost-domains').textContent = formatNumber(costs.domains_resolved || 0);
+            document.getElementById('cost-pages').textContent = formatNumber(costs.pages_crawled || 0);
+        }
 
-            const entries = [
-                ["SMTP probes", costs.smtp_probes],
-                ["Catch-all checks", costs.catchall_checks],
-                ["Domains resolved", costs.domains_resolved],
-                ["Pages crawled", costs.pages_crawled],
-            ];
+        function updateUserStats(users) {
+            const tbody = document.querySelector('#user-stats-table tbody');
+            tbody.innerHTML = '';
 
-            entries.forEach(([label, value]) => {
-                const row = document.createElement("tr");
+            if (!users || users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">No user activity yet.</td></tr>';
+                return;
+            }
 
-                const labelCell = document.createElement("td");
-                labelCell.textContent = label;
-                row.appendChild(labelCell);
+            users.forEach(u => {
+                tbody.innerHTML += `
+                    <tr>
+                        <td class="truncate">${u.user_email || u.user_id}</td>
+                        <td class="mono"><strong>${u.runs_total}</strong></td>
+                        <td class="mono info">${u.runs_queued}</td>
+                        <td class="mono warn">${u.runs_running}</td>
+                        <td class="mono ok">${u.runs_succeeded}</td>
+                        <td class="mono err">${u.runs_failed}</td>
+                        <td class="muted text-xs">${formatDate(u.last_run_at)}</td>
+                    </tr>
+                `;
+            });
+        }
 
-                const valueCell = document.createElement("td");
-                valueCell.textContent = Number(value || 0);
-                valueCell.className = "mono";
-                row.appendChild(valueCell);
+        function updateRecentRuns(runs) {
+            const tbody = document.querySelector('#recent-runs-table tbody');
+            tbody.innerHTML = '';
 
-                tbody.appendChild(row);
+            if (!runs || runs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="muted">No runs yet.</td></tr>';
+                return;
+            }
+
+            runs.forEach(r => {
+                tbody.innerHTML += `
+                    <tr>
+                        <td class="mono text-xs">${(r.id || '').substring(0, 8)}...</td>
+                        <td>${getStatusBadge(r.status)}</td>
+                        <td class="truncate">${r.user_email || '-'}</td>
+                        <td class="mono">${r.domain_count}</td>
+                        <td class="truncate muted">${r.label || '-'}</td>
+                        <td class="muted text-xs">${formatDate(r.created_at)}</td>
+                        <td class="truncate err text-xs">${r.error || '-'}</td>
+                    </tr>
+                `;
+            });
+        }
+
+        function updateQueues(queues) {
+            const tbody = document.querySelector('#queues-table tbody');
+            tbody.innerHTML = '';
+
+            if (!queues || queues.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="muted">No queue data.</td></tr>';
+                return;
+            }
+
+            queues.forEach(q => {
+                const hasWork = q.queued > 0 || q.started > 0;
+                const hasFailed = q.failed > 0;
+                
+                tbody.innerHTML += `
+                    <tr>
+                        <td><span class="status-dot ${hasFailed ? 'status-err' : hasWork ? 'status-info' : 'status-muted'}"></span>${q.name}</td>
+                        <td class="mono ${q.queued > 0 ? 'info' : ''}">${q.queued}</td>
+                        <td class="mono ${q.started > 0 ? 'warn' : ''}">${q.started}</td>
+                        <td class="mono ${q.failed > 0 ? 'err' : ''}">${q.failed}</td>
+                    </tr>
+                `;
+            });
+        }
+
+        function updateWorkers(workers) {
+            const tbody = document.querySelector('#workers-table tbody');
+            tbody.innerHTML = '';
+
+            if (!workers || workers.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" class="muted">No workers connected.</td></tr>';
+                return;
+            }
+
+            workers.forEach(w => {
+                const state = (w.state || 'unknown').toLowerCase();
+                const stateClass = state === 'busy' ? 'warn' : state === 'idle' ? 'ok' : 'muted';
+                
+                tbody.innerHTML += `
+                    <tr>
+                        <td class="mono text-xs">${w.name}</td>
+                        <td><span class="status-dot status-${stateClass}"></span>${state}</td>
+                        <td class="muted text-xs">${(w.queues || []).join(', ')}</td>
+                    </tr>
+                `;
             });
         }
 
         function updateTimeSeries(points) {
-            const tbody = document.querySelector("#timeseries-table tbody");
-            tbody.innerHTML = "";
+            const tbody = document.querySelector('#timeseries-table tbody');
+            tbody.innerHTML = '';
 
             if (!points || points.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 6;
-                cell.textContent = "No verification history yet.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
+                tbody.innerHTML = '<tr><td colspan="6" class="muted">No verification history.</td></tr>';
                 return;
             }
 
-            points.forEach((p) => {
-                const row = document.createElement("tr");
-
-                const dCell = document.createElement("td");
-                dCell.textContent = p.date;
-                row.appendChild(dCell);
-
-                const totalCell = document.createElement("td");
-                totalCell.textContent = p.total;
-                totalCell.className = "mono";
-                row.appendChild(totalCell);
-
-                const validCell = document.createElement("td");
-                validCell.textContent = p.valid;
-                validCell.className = "mono";
-                row.appendChild(validCell);
-
-                const invalidCell = document.createElement("td");
-                invalidCell.textContent = p.invalid;
-                invalidCell.className = "mono";
-                row.appendChild(invalidCell);
-
-                const riskyCell = document.createElement("td");
-                riskyCell.textContent = p.risky_catch_all;
-                riskyCell.className = "mono";
-                row.appendChild(riskyCell);
-
-                const vrCell = document.createElement("td");
-                const pct = ((p.valid_rate || 0) * 100).toFixed(1) + "%";
-                vrCell.textContent = pct;
-                vrCell.className = "mono";
-                row.appendChild(vrCell);
-
-                tbody.appendChild(row);
+            // Show most recent first
+            [...points].reverse().forEach(p => {
+                const pct = ((p.valid_rate || 0) * 100).toFixed(1);
+                tbody.innerHTML += `
+                    <tr>
+                        <td>${p.date}</td>
+                        <td class="mono">${p.total}</td>
+                        <td class="mono ok">${p.valid}</td>
+                        <td class="mono err">${p.invalid}</td>
+                        <td class="mono warn">${p.risky_catch_all}</td>
+                        <td class="mono">${pct}%</td>
+                    </tr>
+                `;
             });
         }
 
         function updateDomains(domains) {
-            const tbody = document.querySelector("#domains-table tbody");
-            tbody.innerHTML = "";
+            const tbody = document.querySelector('#domains-table tbody');
+            tbody.innerHTML = '';
 
             if (!domains || domains.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 3;
-                cell.textContent = "No domain breakdown available.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
+                tbody.innerHTML = '<tr><td colspan="3" class="muted">No domain data.</td></tr>';
                 return;
             }
 
-            domains.forEach((d) => {
-                const row = document.createElement("tr");
-
-                const domCell = document.createElement("td");
-                domCell.textContent = d.domain;
-                row.appendChild(domCell);
-
-                const totalCell = document.createElement("td");
-                totalCell.textContent = d.total;
-                totalCell.className = "mono";
-                row.appendChild(totalCell);
-
-                const vrCell = document.createElement("td");
-                const pct = ((d.valid_rate || 0) * 100).toFixed(1) + "%";
-                vrCell.textContent = pct;
-                vrCell.className = "mono";
-                row.appendChild(vrCell);
-
-                tbody.appendChild(row);
+            domains.forEach(d => {
+                const pct = ((d.valid_rate || 0) * 100).toFixed(1);
+                const cls = d.valid_rate >= 0.7 ? 'ok' : d.valid_rate >= 0.4 ? 'warn' : 'err';
+                tbody.innerHTML += `
+                    <tr>
+                        <td class="mono">${d.domain}</td>
+                        <td class="mono">${d.total}</td>
+                        <td class="mono ${cls}">${pct}%</td>
+                    </tr>
+                `;
             });
         }
 
         function updateErrors(errors) {
-            const tbody = document.querySelector("#errors-table tbody");
-            tbody.innerHTML = "";
+            const tbody = document.querySelector('#errors-table tbody');
+            tbody.innerHTML = '';
 
             const entries = errors ? Object.entries(errors) : [];
             if (entries.length === 0) {
-                const row = document.createElement("tr");
-                const cell = document.createElement("td");
-                cell.colSpan = 2;
-                cell.textContent = "No error breakdown available.";
-                cell.className = "muted";
-                row.appendChild(cell);
-                tbody.appendChild(row);
+                tbody.innerHTML = '<tr><td colspan="2" class="muted">No error breakdown.</td></tr>';
                 return;
             }
 
             entries.forEach(([key, count]) => {
-                const row = document.createElement("tr");
-
-                const keyCell = document.createElement("td");
-                keyCell.textContent = key;
-                row.appendChild(keyCell);
-
-                const countCell = document.createElement("td");
-                countCell.textContent = count;
-                countCell.className = "mono";
-                row.appendChild(countCell);
-
-                tbody.appendChild(row);
+                tbody.innerHTML += `
+                    <tr>
+                        <td>${key}</td>
+                        <td class="mono">${formatNumber(count)}</td>
+                    </tr>
+                `;
             });
         }
 
         function updateLastUpdate() {
-            const el = document.getElementById("last-update");
             const now = new Date();
-            const hh = String(now.getHours()).padStart(2, "0");
-            const mm = String(now.getMinutes()).padStart(2, "0");
-            const ss = String(now.getSeconds()).padStart(2, "0");
-            el.textContent = `${hh}:${mm}:${ss}`;
+            document.getElementById('last-update').textContent = 
+                now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
         }
 
         async function fetchMetrics() {
-            const resp = await fetch("/admin/metrics", {
-                headers: {
-                    Accept: "application/json",
-                },
+            const resp = await fetch('/admin/metrics', {
+                headers: { 'Accept': 'application/json' }
             });
-            if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}`);
-            }
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
-            updateQueues(data.queues || []);
-            updateWorkers(data.workers || []);
+
+            updateQuickStats(data);
+            updateCompanyHealth(data.company_health || {});
+            updateRunStatus(data.run_status || {});
             updateVerification(data.verification || {});
             updateCosts(data.costs || {});
+            updateUserStats(data.user_stats || []);
+            updateRecentRuns(data.recent_runs || []);
+            updateQueues(data.queues || []);
+            updateWorkers(data.workers || []);
         }
 
         async function fetchAnalytics() {
-            const resp = await fetch("/admin/analytics?window_days=30&top_domains=10&top_errors=10", {
-                headers: {
-                    Accept: "application/json",
-                },
+            const resp = await fetch('/admin/analytics?window_days=30&top_domains=15&top_errors=15', {
+                headers: { 'Accept': 'application/json' }
             });
-            if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}`);
-            }
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
+
             updateTimeSeries(data.verification_time_series || []);
             updateDomains(data.domain_breakdown || []);
             updateErrors(data.error_breakdown || {});
         }
 
         async function refreshAll() {
-            const errorBanner = document.getElementById("error-banner");
+            const errorBanner = document.getElementById('error-banner');
             try {
                 await fetchMetrics();
                 await fetchAnalytics();
                 updateLastUpdate();
-                errorBanner.classList.add("hidden");
+                errorBanner.classList.add('hidden');
             } catch (err) {
-                console.error("Failed to load admin metrics/analytics", err);
-                errorBanner.classList.remove("hidden");
+                console.error('Failed to load metrics:', err);
+                errorBanner.classList.remove('hidden');
             }
         }
 
-        window.addEventListener("load", () => {
+        window.addEventListener('load', () => {
             refreshAll();
             setInterval(refreshAll, 10000);
         });

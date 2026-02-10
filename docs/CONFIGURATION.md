@@ -6,7 +6,7 @@ All configuration is managed through environment variables, loaded from a `.env`
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `sqlite:///dev.db` | PostgreSQL connection string. Format: `postgresql://user:pass@host:port/dbname` |
+| `DATABASE_URL` | `sqlite:///dev.db` | PostgreSQL connection string. Format: `postgresql://user:pass@host:port/dbname` | <!-- pragma: allowlist secret -->
 | `DB_URL` | (falls back to `DATABASE_URL`) | Legacy alias — use `DATABASE_URL` instead |
 
 **Production requirement**: PostgreSQL ≥ 14. SQLite is supported for development only.

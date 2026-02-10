@@ -172,7 +172,7 @@ setup_postgres() {
     systemctl start postgresql
     
     # Create database and user
-    sudo -u postgres psql -c "CREATE USER email_scraper WITH PASSWORD 'changeme';" 2>/dev/null || true
+    sudo -u postgres psql -c "CREATE USER email_scraper WITH PASSWORD 'changeme';" 2>/dev/null || true # pragma: allowlist secret
     sudo -u postgres psql -c "CREATE DATABASE email_scraper OWNER email_scraper;" 2>/dev/null || true
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE email_scraper TO email_scraper;" 2>/dev/null || true
     

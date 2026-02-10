@@ -60,7 +60,7 @@ cp .env.example .env
 At minimum, set these values:
 
 ```ini
-DATABASE_URL=postgresql://scraper_user:YOUR_PASSWORD@127.0.0.1:5432/email_scraper_db
+DATABASE_URL=postgresql://scraper_user:YOUR_PASSWORD@127.0.0.1:5432/email_scraper_db <!-- pragma: allowlist secret -->
 REDIS_URL=redis://127.0.0.1:6379/0
 SMTP_HELO_DOMAIN=verifier.yourdomain.com
 SMTP_MAIL_FROM=bounce@verifier.yourdomain.com

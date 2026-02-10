@@ -42,7 +42,7 @@ sudo apt update && sudo apt install -y caddy
 ```bash
 # Create the database user and database
 sudo -u postgres psql <<EOF
-CREATE USER scraper_user WITH PASSWORD 'YOUR_SECURE_PASSWORD';
+CREATE USER scraper_user WITH PASSWORD 'YOUR_SECURE_PASSWORD'; # pragma: allowlist secret
 CREATE DATABASE email_scraper_db OWNER scraper_user;
 GRANT ALL PRIVILEGES ON DATABASE email_scraper_db TO scraper_user;
 EOF
@@ -80,7 +80,7 @@ Edit `.env` with production values:
 
 ```ini
 # Database
-DATABASE_URL=postgresql://scraper_user:YOUR_SECURE_PASSWORD@127.0.0.1:5432/email_scraper_db
+DATABASE_URL=postgresql://scraper_user:YOUR_SECURE_PASSWORD@127.0.0.1:5432/email_scraper_db <!-- pragma: allowlist secret -->
 
 # Redis
 REDIS_URL=redis://127.0.0.1:6379/0

@@ -62,17 +62,20 @@ def test_admin_requires_api_key_when_configured(monkeypatch) -> None:
     dummy_settings = _DummySettings(api_key="secret-key", allowed_ips=[])
     monkeypatch.setattr(deps_module, "settings", dummy_settings)
 
+    # AUTH_MODE must NOT be "dev" or "none" (which skip key checks entirely).
+    monkeypatch.setattr(deps_module, "AUTH_MODE", "apikey")
+
     client = TestClient(app)
 
-    # No header → 401
+    # No header â†’ 401
     resp = client.get("/admin/metrics")
     assert resp.status_code == 401
 
-    # Wrong key → 401
+    # Wrong key â†’ 401
     resp = client.get("/admin/metrics", headers={"x-admin-api-key": "wrong"})
     assert resp.status_code == 401
 
-    # Correct key → 200
+    # Correct key â†’ 200
     resp = client.get("/admin/metrics", headers={"x-admin-api-key": "secret-key"})
     assert resp.status_code == 200
 

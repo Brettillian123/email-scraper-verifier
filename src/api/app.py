@@ -72,6 +72,8 @@ app.add_middleware(
     exclude_paths=[
         "/auth/",      # Login, register, logout, etc.
         "/api/",       # API routes use header/JWT auth via AuthContext
+        "/leads/",     # Lead search uses AuthContext (header/JWT auth)
+        "/admin/",     # Admin routes use require_admin dependency
         "/static/",    # Static files
         "/health",     # Health checks
         "/favicon.ico",

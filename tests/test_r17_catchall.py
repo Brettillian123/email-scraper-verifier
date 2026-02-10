@@ -33,6 +33,7 @@ def memory_db(
             company_name TEXT,
             chosen_domain TEXT,
             domain TEXT,
+            user_hint TEXT,
             lowest_mx TEXT,
             resolved_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -288,12 +289,12 @@ def test_catchall_uses_cached_verdict_within_ttl(
 
     monkeypatch.setattr(catchall_mod, "_smtp_probe_random_address", fake_probe)
 
-    # First call → fresh probe, populates cache
+    # First call â†’ fresh probe, populates cache
     res1 = catchall_mod.check_catchall_for_domain(domain)
     assert res1.status == "not_catch_all"
     assert res1.cached is False
 
-    # Second call within TTL → should be cached (no new MX/probe)
+    # Second call within TTL â†’ should be cached (no new MX/probe)
     res2 = catchall_mod.check_catchall_for_domain(domain)
     assert res2.status == "not_catch_all"
     assert res2.cached is True

@@ -42,6 +42,7 @@ def _get_ses_client() -> Any:
     global _ses_client
     if _ses_client is None:
         import boto3
+
         _ses_client = boto3.client("ses", region_name=SES_AWS_REGION)
     return _ses_client
 
@@ -49,6 +50,7 @@ def _get_ses_client() -> Any:
 # ---------------------------------------------------------------------------
 # Email Templates
 # ---------------------------------------------------------------------------
+
 
 def _verification_code_html(code: str, expiry_minutes: int = 15) -> str:
     """Build HTML body for the verification code email."""
@@ -77,8 +79,7 @@ def _verification_code_html(code: str, expiry_minutes: int = 15) -> str:
         " color:#1a1a2e; font-family:'Courier New',monospace;"
     )
     footer_style = (
-        "padding:20px 40px; background:#fafafa;"
-        " border-top:1px solid #eee; text-align:center;"
+        "padding:20px 40px; background:#fafafa; border-top:1px solid #eee; text-align:center;"
     )
     return f"""\
 <!DOCTYPE html>
@@ -166,10 +167,9 @@ def _password_reset_html(reset_url: str, expiry_hours: int = 1) -> str:
         " border-radius:8px; font-weight:600; font-size:15px;"
     )
     footer_style = (
-        "padding:20px 40px; background:#fafafa;"
-        " border-top:1px solid #eee; text-align:center;"
+        "padding:20px 40px; background:#fafafa; border-top:1px solid #eee; text-align:center;"
     )
-    exp_label = f'{expiry_hours} hour{"s" if expiry_hours != 1 else ""}'
+    exp_label = f"{expiry_hours} hour{'s' if expiry_hours != 1 else ''}"
     return f"""\
 <!DOCTYPE html>
 <html>
@@ -236,6 +236,7 @@ def _password_reset_text(reset_url: str, expiry_hours: int = 1) -> str:
 # ---------------------------------------------------------------------------
 # Send Functions
 # ---------------------------------------------------------------------------
+
 
 def send_verification_code(to_email: str, code: str, expiry_minutes: int = 15) -> bool:
     """

@@ -676,7 +676,8 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
-        "--run-id", default=None, help="Optional run_id to attach to verification_results.")
+        "--run-id", default=None, help="Optional run_id to attach to verification_results."
+    )
     p.add_argument(
         "--queue",
         default="verify",

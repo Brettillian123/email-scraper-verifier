@@ -110,7 +110,7 @@ def _fetch_invalid_rows(
     try:
         result = conn.execute(
             f"""
-            SELECT {', '.join(select_parts)}
+            SELECT {", ".join(select_parts)}
             FROM emails e
             JOIN verification_results vr ON vr.email_id = e.id
             WHERE vr.verify_status = 'invalid'
@@ -287,7 +287,7 @@ def _count_deletable(conn, where_parts: list[str]) -> int:
             SELECT COUNT(*)
             FROM emails e
             JOIN verification_results vr ON vr.email_id = e.id
-            WHERE {' AND '.join(where_parts)}
+            WHERE {" AND ".join(where_parts)}
             """
         )
         count = result.fetchone()[0]
@@ -312,7 +312,7 @@ def _delete_invalid_generated(conn, where_parts: list[str]) -> int:
         SELECT e.id
         FROM emails e
         JOIN verification_results vr ON vr.email_id = e.id
-        WHERE {' AND '.join(where_parts)}
+        WHERE {" AND ".join(where_parts)}
         """
     )
     ids = [r[0] for r in result.fetchall()]

@@ -9,6 +9,7 @@ Provides comprehensive metrics for the admin dashboard including:
 - User activity and run tracking
 - Domain resolution statistics
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -42,6 +43,7 @@ QUEUE_NAMES: list[str] = ["ingest", "crawl", "mx", "smtp", "catchall", "export",
 # ---------------------------------------------------------------------------
 # Dataclasses (backwards compatible exports)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class QueueStats:
@@ -78,10 +80,11 @@ class CostCounters:
 class DomainStats:
     """
     Optional dataclass representation for per-domain analytics.
-    
+
     The current APIs return plain dicts for JSON serialization, but this type
     is exported for callers that prefer a structured view.
     """
+
     domain: str
     total: int
     valid: int
@@ -94,9 +97,10 @@ class DomainStats:
 class TimeSeriesPoint:
     """
     Optional dataclass representation for per-day verification analytics.
-    
+
     The public API uses plain dicts; this is exported for structured callers.
     """
+
     date: str  # "YYYY-MM-DD"
     total: int
     valid: int
@@ -108,6 +112,7 @@ class TimeSeriesPoint:
 @dataclass
 class CompanyHealthStats:
     """Company-level health metrics."""
+
     total_companies: int = 0
     companies_with_pages: int = 0
     companies_with_candidates: int = 0
@@ -121,6 +126,7 @@ class CompanyHealthStats:
 @dataclass
 class UserRunStats:
     """Per-user run statistics."""
+
     user_id: str
     user_email: str | None
     runs_total: int = 0
@@ -135,6 +141,7 @@ class UserRunStats:
 @dataclass
 class RunStatusBreakdown:
     """Run status counts."""
+
     total: int = 0
     queued: int = 0
     running: int = 0
@@ -146,6 +153,7 @@ class RunStatusBreakdown:
 # ---------------------------------------------------------------------------
 # Redis / RQ helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_redis_connection() -> Any | None:
     """Resolve a Redis connection."""
@@ -199,12 +207,14 @@ def get_queue_stats() -> tuple[list[QueueStats], list[WorkerStats]]:
                 state = "unknown"
                 last_heartbeat = None
 
-            workers.append(WorkerStats(
-                name=w.name,
-                queues=worker_queues,
-                state=state,
-                last_heartbeat=last_heartbeat,
-            ))
+            workers.append(
+                WorkerStats(
+                    name=w.name,
+                    queues=worker_queues,
+                    state=state,
+                    last_heartbeat=last_heartbeat,
+                )
+            )
     except Exception:
         pass
 
@@ -214,6 +224,7 @@ def get_queue_stats() -> tuple[list[QueueStats], list[WorkerStats]]:
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_postgres() -> bool:
     """Check if we're using PostgreSQL."""
@@ -293,6 +304,7 @@ def _get_window_date(window_days: int) -> str:
 # Core metrics functions
 # ---------------------------------------------------------------------------
 
+
 def get_verification_stats(conn: Any) -> VerificationStats:
     """Compute verification distribution from emails/verification_results."""
     # Try using v_emails_latest view first, fall back to direct query
@@ -303,9 +315,9 @@ def get_verification_stats(conn: Any) -> VerificationStats:
         FROM v_emails_latest
         WHERE verify_status IS NOT NULL
         GROUP BY verify_status
-        """
+        """,
     )
-    
+
     if not row_data:
         # Fallback: query verification_results directly
         row_data = _safe_fetchall(
@@ -315,7 +327,7 @@ def get_verification_stats(conn: Any) -> VerificationStats:
             FROM verification_results
             WHERE verify_status IS NOT NULL
             GROUP BY verify_status
-            """
+            """,
         )
 
     by_status: dict[str, int] = {}
@@ -340,19 +352,15 @@ def get_verification_stats(conn: Any) -> VerificationStats:
 def get_cost_counters(conn: Any) -> CostCounters:
     """Compute cost proxy counters."""
     smtp_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM verification_results")
-    
+
     # Catch-all checks: count rows where catch_all_status is set (not null)
     catchall_row = _safe_fetchone(
-        conn,
-        "SELECT COUNT(*) AS n FROM domain_resolutions WHERE catch_all_status IS NOT NULL"
+        conn, "SELECT COUNT(*) AS n FROM domain_resolutions WHERE catch_all_status IS NOT NULL"
     )
-    
+
     # Domains resolved: count all domain_resolutions rows
-    resolved_row = _safe_fetchone(
-        conn,
-        "SELECT COUNT(*) AS n FROM domain_resolutions"
-    )
-    
+    resolved_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM domain_resolutions")
+
     pages_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM sources")
 
     return CostCounters(
@@ -366,11 +374,11 @@ def get_cost_counters(conn: Any) -> CostCounters:
 def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     """Get company-level health metrics."""
     stats = CompanyHealthStats()
-    
+
     # Total companies
     row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM companies")
     stats.total_companies = _row_int(row, "n")
-    
+
     # Companies with pages
     row = _safe_fetchone(
         conn,
@@ -378,10 +386,10 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
         SELECT COUNT(DISTINCT company_id) AS n 
         FROM sources 
         WHERE company_id IS NOT NULL
-        """
+        """,
     )
     stats.companies_with_pages = _row_int(row, "n")
-    
+
     # Companies with candidates (people)
     row = _safe_fetchone(
         conn,
@@ -389,10 +397,10 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
         SELECT COUNT(DISTINCT company_id) AS n 
         FROM people 
         WHERE company_id IS NOT NULL
-        """
+        """,
     )
     stats.companies_with_candidates = _row_int(row, "n")
-    
+
     # Companies with at least 1 valid email
     row = _safe_fetchone(
         conn,
@@ -401,10 +409,10 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
         FROM emails e
         JOIN verification_results vr ON vr.email_id = e.id
         WHERE vr.verify_status = 'valid'
-        """
+        """,
     )
     stats.companies_with_valid_email = _row_int(row, "n")
-    
+
     # Try to get 403/robots stats from run_metrics if available
     row = _safe_fetchone(
         conn,
@@ -413,12 +421,12 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
             COALESCE(SUM(companies_403_blocked), 0) AS blocked_403,
             COALESCE(SUM(companies_robots_blocked), 0) AS blocked_robots
         FROM run_metrics
-        """
+        """,
     )
     if row:
         stats.companies_403_blocked = _row_int(row, "blocked_403")
         stats.companies_robots_blocked = _row_int(row, "blocked_robots")
-    
+
     # Domains with no MX (from domain_resolutions)
     row = _safe_fetchone(
         conn,
@@ -426,10 +434,10 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
         SELECT COUNT(DISTINCT company_id) AS n 
         FROM domain_resolutions 
         WHERE catch_all_status = 'no_mx'
-        """
+        """,
     )
     stats.companies_no_mx = _row_int(row, "n")
-    
+
     # Companies with catch-all domains
     row = _safe_fetchone(
         conn,
@@ -437,31 +445,31 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
         SELECT COUNT(DISTINCT company_id) AS n 
         FROM domain_resolutions 
         WHERE catch_all_status = 'catch_all'
-        """
+        """,
     )
     stats.companies_catch_all = _row_int(row, "n")
-    
+
     return stats
 
 
 def get_run_status_breakdown(conn: Any) -> RunStatusBreakdown:
     """Get breakdown of run statuses."""
     breakdown = RunStatusBreakdown()
-    
+
     rows = _safe_fetchall(
         conn,
         """
         SELECT status, COUNT(*) AS n
         FROM runs
         GROUP BY status
-        """
+        """,
     )
-    
+
     for row in rows:
         status = row.get("status", "")
         count = _row_int(row, "n")
         breakdown.total += count
-        
+
         if status == "queued":
             breakdown.queued = count
         elif status == "running":
@@ -472,7 +480,7 @@ def get_run_status_breakdown(conn: Any) -> RunStatusBreakdown:
             breakdown.failed = count
         elif status == "cancelled":
             breakdown.cancelled = count
-    
+
     return breakdown
 
 
@@ -498,23 +506,25 @@ def get_user_run_stats(conn: Any, limit: int = 20) -> list[UserRunStats]:
         ORDER BY runs_total DESC
         LIMIT ?
         """,
-        (limit,)
+        (limit,),
     )
-    
+
     result = []
     for row in rows:
-        result.append(UserRunStats(
-            user_id=row.get("user_id") or "unknown",
-            user_email=row.get("user_email"),
-            runs_total=_row_int(row, "runs_total"),
-            runs_queued=_row_int(row, "runs_queued"),
-            runs_running=_row_int(row, "runs_running"),
-            runs_succeeded=_row_int(row, "runs_succeeded"),
-            runs_failed=_row_int(row, "runs_failed"),
-            runs_cancelled=_row_int(row, "runs_cancelled"),
-            last_run_at=row.get("last_run_at"),
-        ))
-    
+        result.append(
+            UserRunStats(
+                user_id=row.get("user_id") or "unknown",
+                user_email=row.get("user_email"),
+                runs_total=_row_int(row, "runs_total"),
+                runs_queued=_row_int(row, "runs_queued"),
+                runs_running=_row_int(row, "runs_running"),
+                runs_succeeded=_row_int(row, "runs_succeeded"),
+                runs_failed=_row_int(row, "runs_failed"),
+                runs_cancelled=_row_int(row, "runs_cancelled"),
+                last_run_at=row.get("last_run_at"),
+            )
+        )
+
     return result
 
 
@@ -538,9 +548,9 @@ def get_recent_runs(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
         ORDER BY r.created_at DESC
         LIMIT ?
         """,
-        (limit,)
+        (limit,),
     )
-    
+
     result = []
     for row in rows:
         domains_json = row.get("domains_json", "[]")
@@ -549,19 +559,21 @@ def get_recent_runs(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
             domain_count = len(domains) if isinstance(domains, list) else 0
         except Exception:
             domain_count = 0
-        
-        result.append({
-            "id": row.get("id"),
-            "status": row.get("status"),
-            "label": row.get("label"),
-            "user_email": row.get("user_email"),
-            "domain_count": domain_count,
-            "created_at": row.get("created_at"),
-            "started_at": row.get("started_at"),
-            "finished_at": row.get("finished_at"),
-            "error": row.get("error"),
-        })
-    
+
+        result.append(
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "label": row.get("label"),
+                "user_email": row.get("user_email"),
+                "domain_count": domain_count,
+                "created_at": row.get("created_at"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "error": row.get("error"),
+            }
+        )
+
     return result
 
 
@@ -598,9 +610,9 @@ def get_verification_time_series(
         status = row.get("verify_status")
         n = _row_int(row, "n")
 
-        bucket = by_day.setdefault(day, {
-            "total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0
-        })
+        bucket = by_day.setdefault(
+            day, {"total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0}
+        )
         bucket["total"] += n
         if status in bucket:
             bucket[status] += n
@@ -614,14 +626,16 @@ def get_verification_time_series(
         risky = bucket["risky_catch_all"]
         denom = valid + invalid + risky
         valid_rate = float(valid / denom) if denom else 0.0
-        points.append({
-            "date": day,
-            "total": total,
-            "valid": valid,
-            "invalid": invalid,
-            "risky_catch_all": risky,
-            "valid_rate": valid_rate,
-        })
+        points.append(
+            {
+                "date": day,
+                "total": total,
+                "valid": valid,
+                "invalid": invalid,
+                "risky_catch_all": risky,
+                "valid_rate": valid_rate,
+            }
+        )
 
     return points
 
@@ -661,9 +675,9 @@ def get_domain_breakdown(
         status = row.get("verify_status")
         n = _row_int(row, "n")
 
-        bucket = by_domain.setdefault(domain, {
-            "total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0
-        })
+        bucket = by_domain.setdefault(
+            domain, {"total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0}
+        )
         bucket["total"] += n
         if status and status in bucket:
             bucket[status] += n
@@ -682,14 +696,16 @@ def get_domain_breakdown(
         risky = bucket["risky_catch_all"]
         denom = valid + invalid + risky
         valid_rate = float(valid / denom) if denom else 0.0
-        out.append({
-            "domain": domain,
-            "total": total,
-            "valid": valid,
-            "invalid": invalid,
-            "risky_catch_all": risky,
-            "valid_rate": valid_rate,
-        })
+        out.append(
+            {
+                "domain": domain,
+                "total": total,
+                "valid": valid,
+                "invalid": invalid,
+                "risky_catch_all": risky,
+                "valid_rate": valid_rate,
+            }
+        )
     return out
 
 
@@ -723,6 +739,7 @@ def get_error_breakdown(conn: Any, top_n: int = 20) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 # Main summary functions (API endpoints use these)
 # ---------------------------------------------------------------------------
+
 
 def get_admin_summary(conn: Any | None = None) -> dict[str, Any]:
     """High-level summary for admin API."""

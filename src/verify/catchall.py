@@ -148,7 +148,7 @@ def _load_cached_state(
           "catch_all_smtp_code",
         }
     or None if no row exists yet.
-    
+
     NOTE: PostgreSQL schema uses chosen_domain and user_hint columns.
     There is NO 'domain' column in the production schema.
     """
@@ -192,7 +192,7 @@ def _update_cached_state(
     """
     Update catch_all_* columns on the most recent domain_resolutions row
     for this domain. If no row exists, we silently skip.
-    
+
     NOTE: PostgreSQL schema uses chosen_domain and user_hint columns.
     There is NO 'domain' column in the production schema.
     """

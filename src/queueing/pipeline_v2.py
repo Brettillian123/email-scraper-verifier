@@ -25,7 +25,6 @@ Adjusted behavior (per your requirement):
             sweeps all emails after generation
 """
 
-
 from __future__ import annotations
 
 import json
@@ -55,13 +54,9 @@ DEFAULT_GENERATE_QUEUE = "generate"
 DEFAULT_JOB_TIMEOUT = 1800  # 30 minutes
 
 
-
-
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-
-
 
 
 def _utc_now_iso() -> str:
@@ -126,10 +121,7 @@ def _sum_domains_from_meta_rows(
         except Exception:
             meta = {}
         try:
-            total += int(
-                meta.get("domains_count")
-                or meta.get("effective_domain_count") or 0
-            )
+            total += int(meta.get("domains_count") or meta.get("effective_domain_count") or 0)
         except Exception:
             continue
     return total
@@ -170,7 +162,7 @@ def _count_via_user_activity(
     sql = f"""
     SELECT {meta_col}, {created_col}
     FROM user_activity
-    WHERE {' AND '.join(where)}
+    WHERE {" AND ".join(where)}
     """
 
     rows: list[tuple[Any, Any]] = []
@@ -223,8 +215,7 @@ def _count_via_runs(
         return None, "runs_missing_domains_json"
 
     time_col = next(
-        (c for c in ("started_at", "created_at", "updated_at")
-         if c in run_cols),
+        (c for c in ("started_at", "created_at", "updated_at") if c in run_cols),
         None,
     )
     if not time_col:
@@ -245,7 +236,7 @@ def _count_via_runs(
     base_sql = f"""
     SELECT domains_json, {time_col}
     FROM runs
-    WHERE {' AND '.join(where)}
+    WHERE {" AND ".join(where)}
     """
 
     rows: list[tuple[Any, Any]] = []
@@ -334,10 +325,18 @@ def _tokenize_mode_input(modes: Any) -> list[str]:
 
 
 _MODE_ALIASES: dict[str, list[str]] = {
-    "all": ["full"], "full": ["full"], "everything": ["full"],
-    "autodiscovery": ["autodiscovery"], "discovery": ["autodiscovery"], "crawl": ["autodiscovery"],
-    "generate": ["generate"], "generation": ["generate"], "gen": ["generate"],
-    "verify": ["verify"], "verification": ["verify"], "verif": ["verify"],
+    "all": ["full"],
+    "full": ["full"],
+    "everything": ["full"],
+    "autodiscovery": ["autodiscovery"],
+    "discovery": ["autodiscovery"],
+    "crawl": ["autodiscovery"],
+    "generate": ["generate"],
+    "generation": ["generate"],
+    "gen": ["generate"],
+    "verify": ["verify"],
+    "verification": ["verify"],
+    "verif": ["verify"],
     "genverify": ["generate", "verify"],
     "generateverify": ["generate", "verify"],
     "generate_verify": ["generate", "verify"],
@@ -375,26 +374,18 @@ def _normalize_modes(modes: Any) -> list[str]:
     return out or ["full"]
 
 
-
-
 def _get_conn():
     """Get database connection."""
     from src.db import get_conn
 
-
     return get_conn()
-
-
 
 
 def _get_redis():
     """Get Redis connection."""
     from src.queueing.redis_conn import get_redis
 
-
     return get_redis()
-
-
 
 
 def _has_table(con, table: str) -> bool:
@@ -404,8 +395,6 @@ def _has_table(con, table: str) -> bool:
         return True
     except Exception:
         return False
-
-
 
 
 def _table_cols(con, table: str) -> set[str]:
@@ -433,15 +422,12 @@ def _table_cols(con, table: str) -> set[str]:
     except Exception:
         pass
 
-
     # Dev/test fallback
     try:
         cur = con.execute(f"PRAGMA table_info({table})")
         return {row[1] for row in (cur.fetchall() or []) if row and len(row) > 1}
     except Exception:
         return set()
-
-
 
 
 def _safe_int(x: Any, default: int = 0) -> int:
@@ -467,16 +453,12 @@ def _as_bool(x: Any, default: bool = False) -> bool:
     return default
 
 
-
-
 def _max_probes_per_person_env() -> int:
     """
     Must match behavior in task_generate_emails (default 6).
     If >0, generation will enqueue probes itself.
     """
     return max(0, _safe_int(os.getenv("MAX_PROBES_PER_PERSON", "6"), default=6))
-
-
 
 
 def _update_run_row(
@@ -495,40 +477,32 @@ def _update_run_row(
     updates: list[str] = []
     params: list[Any] = []
 
-
     if status and "status" in cols:
         updates.append("status = ?")
         params.append(status)
-
 
     if progress is not None and "progress_json" in cols:
         updates.append("progress_json = ?")
         params.append(json.dumps(progress, separators=(",", ":")))
 
-
     if error is not None and "error" in cols:
         updates.append("error = ?")
         params.append(error)
-
 
     if started_at and "started_at" in cols:
         updates.append("started_at = ?")
         params.append(started_at)
 
-
     if finished_at and "finished_at" in cols:
         updates.append("finished_at = ?")
         params.append(finished_at)
-
 
     if "updated_at" in cols:
         updates.append("updated_at = ?")
         params.append(_utc_now_iso())
 
-
     if not updates:
         return
-
 
     if "tenant_id" in cols:
         params.extend([tenant_id, run_id])
@@ -543,8 +517,6 @@ def _update_run_row(
             tuple(params),
         )
     con.commit()
-
-
 
 
 def _link_company_to_run(
@@ -589,7 +561,7 @@ def _insert_company_row(
     try:
         row = con.execute(
             f"""
-            INSERT INTO companies ({', '.join(insert_cols)})
+            INSERT INTO companies ({", ".join(insert_cols)})
             VALUES ({placeholders})
             RETURNING id
             """,
@@ -660,8 +632,11 @@ def _ensure_company_for_domain(
         company_name = row[1] or domain
         if has_run_id and run_id:
             _link_company_to_run(
-                con, company_id=company_id, run_id=run_id,
-                tenant_id=tenant_id, has_tenant=has_tenant,
+                con,
+                company_id=company_id,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                has_tenant=has_tenant,
             )
         return company_id, company_name
 
@@ -678,17 +653,20 @@ def _ensure_company_for_domain(
         insert_vals.append(run_id)
 
     company_id = _insert_company_row(
-        con, insert_cols=insert_cols, insert_vals=insert_vals,
+        con,
+        insert_cols=insert_cols,
+        insert_vals=insert_vals,
     )
 
     if not company_id:
         company_id = _select_company_id(
-            con, tenant_id=tenant_id, domain=domain, has_tenant=has_tenant,
+            con,
+            tenant_id=tenant_id,
+            domain=domain,
+            has_tenant=has_tenant,
         )
 
     return company_id, company_name
-
-
 
 
 def _parse_options(options: dict) -> dict[str, Any]:
@@ -710,15 +688,11 @@ def _parse_options(options: dict) -> dict[str, Any]:
     }
 
 
-
-
 def _should_run_stage(modes: list[str], stage: str) -> bool:
     """Check if a pipeline stage should run based on mode selection."""
     if "full" in modes or "all" in modes:
         return True
     return stage in modes
-
-
 
 
 def _pick_people_table(con) -> str | None:
@@ -727,8 +701,6 @@ def _pick_people_table(con) -> str | None:
     if _has_table(con, "persons"):
         return "persons"
     return None
-
-
 
 
 def _query_people_table(
@@ -744,7 +716,7 @@ def _query_people_table(
     if has_tenant:
         cur = con.execute(
             f"""
-            SELECT {', '.join(select_cols)}
+            SELECT {", ".join(select_cols)}
             FROM {table}
             WHERE tenant_id = ? AND company_id = ?
             """,
@@ -753,7 +725,7 @@ def _query_people_table(
     else:
         cur = con.execute(
             f"""
-            SELECT {', '.join(select_cols)}
+            SELECT {", ".join(select_cols)}
             FROM {table}
             WHERE company_id = ?
             """,
@@ -827,21 +799,27 @@ def _load_people_for_company(
 
     if first_col and last_col:
         rows = _query_people_table(
-            con, table=table, select_cols=[id_col, first_col, last_col],
-            has_tenant=has_tenant, tenant_id=tenant_id, company_id=company_id,
+            con,
+            table=table,
+            select_cols=[id_col, first_col, last_col],
+            has_tenant=has_tenant,
+            tenant_id=tenant_id,
+            company_id=company_id,
         )
         return _parse_first_last_rows(rows)
 
     if name_col:
         rows = _query_people_table(
-            con, table=table, select_cols=[id_col, name_col],
-            has_tenant=has_tenant, tenant_id=tenant_id, company_id=company_id,
+            con,
+            table=table,
+            select_cols=[id_col, name_col],
+            has_tenant=has_tenant,
+            tenant_id=tenant_id,
+            company_id=company_id,
         )
         return _parse_full_name_rows(rows)
 
     return []
-
-
 
 
 def _enqueue(
@@ -857,13 +835,9 @@ def _enqueue(
     return q.enqueue(func, **kwargs)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Generation fanout task
 # ---------------------------------------------------------------------------
-
-
 
 
 def task_generate_company_emails(  # noqa: C901
@@ -884,10 +858,8 @@ def task_generate_company_emails(  # noqa: C901
     """
     from rq import get_current_job
 
-
     con = _get_conn()
     dom = (domain or "").strip().lower()
-
 
     try:
         if not dom:
@@ -900,23 +872,19 @@ def task_generate_company_emails(  # noqa: C901
                 "queue": generate_queue,
             }
 
-
         # Read options from job meta (passed from pipeline orchestrator)
         job = get_current_job()
         meta = job.meta if job is not None else {}
-
 
         people = _load_people_for_company(con, tenant_id=tenant_id, company_id=company_id)
         redis = _get_redis()
         q = Queue(name=generate_queue, connection=redis)
 
-
         # IMPORTANT: signature is task_generate_emails(person_id, first, last, domain)
         from src.queueing.tasks import task_generate_emails
 
-
         enqueued = 0
-        for (person_id, first, last) in people:
+        for person_id, first, last in people:
             try:
                 q.enqueue(
                     task_generate_emails,
@@ -952,7 +920,6 @@ def task_generate_company_emails(  # noqa: C901
                     },
                 )
 
-
         return {
             "ok": True,
             "company_id": company_id,
@@ -962,7 +929,6 @@ def task_generate_company_emails(  # noqa: C901
             "queue": generate_queue,
         }
 
-
     finally:
         try:
             con.close()
@@ -970,13 +936,9 @@ def task_generate_company_emails(  # noqa: C901
             pass
 
 
-
-
 # ---------------------------------------------------------------------------
 # Verification sweep helper
 # ---------------------------------------------------------------------------
-
-
 
 
 def verify_company_emails(  # noqa: C901
@@ -1006,10 +968,8 @@ def verify_company_emails(  # noqa: C901
     """
     from src.queueing.tasks import verify_email_task
 
-
     con = _get_conn()
     enqueued = 0
-
 
     try:
         email_cols = _table_cols(con, "emails")
@@ -1017,25 +977,20 @@ def verify_company_emails(  # noqa: C901
         has_person = "person_id" in email_cols
         has_source_url = "source_url" in email_cols
 
-
         select_cols = ["e.id", "e.email"]
         if has_person:
             select_cols.append("e.person_id")
 
-
         where: list[str] = ["e.company_id = ?"]
         params: list[Any] = [company_id]
-
 
         if tenant_id and has_tenant:
             where.append("e.tenant_id = ?")
             params.append(tenant_id)
 
-
         if only_with_source_url and has_source_url:
             where.append("e.source_url IS NOT NULL")
             where.append("BTRIM(e.source_url) <> ''")
-
 
         sql = f"""
         SELECT {", ".join(select_cols)}
@@ -1045,13 +1000,10 @@ def verify_company_emails(  # noqa: C901
           AND vr.id IS NULL
         """
 
-
         cur = con.execute(sql, tuple(params))
-
 
         redis = _get_redis()
         q = Queue(name=verify_queue, connection=redis)
-
 
         for row in cur.fetchall() or []:
             try:
@@ -1059,14 +1011,12 @@ def verify_company_emails(  # noqa: C901
                 if not email_addr:
                     continue
 
-
                 person_id = None
                 if has_person and len(row) >= 3:
                     try:
                         person_id = int(row[2]) if row[2] is not None else None
                     except Exception:
                         person_id = None
-
 
                 q.enqueue(
                     verify_email_task,
@@ -1085,7 +1035,6 @@ def verify_company_emails(  # noqa: C901
             except Exception:
                 pass
 
-
         return {
             "ok": True,
             "company_id": company_id,
@@ -1094,7 +1043,6 @@ def verify_company_emails(  # noqa: C901
             "only_with_source_url": only_with_source_url,
         }
 
-
     finally:
         try:
             con.close()
@@ -1102,13 +1050,9 @@ def verify_company_emails(  # noqa: C901
             pass
 
 
-
-
 # ---------------------------------------------------------------------------
 # Main Pipeline Function
 # ---------------------------------------------------------------------------
-
-
 
 
 def _apply_domain_limits(
@@ -1235,11 +1179,13 @@ def _enqueue_domain_jobs(
                     "skip_catch_all": options.get("skip_catch_all", False),
                 },
             )
-            job_info["jobs"].append({
-                "stage": "autodiscovery",
-                "job_id": autod_job.id,
-                "queue": options["discovery_queue"],
-            })
+            job_info["jobs"].append(
+                {
+                    "stage": "autodiscovery",
+                    "job_id": autod_job.id,
+                    "queue": options["discovery_queue"],
+                }
+            )
         except Exception as exc:
             log.warning("Failed to enqueue autodiscovery for %s: %s", domain, exc)
 
@@ -1267,12 +1213,14 @@ def _enqueue_domain_jobs(
                     "skip_catch_all": options.get("skip_catch_all", False),
                 },
             )
-            job_info["jobs"].append({
-                "stage": "generate",
-                "job_id": gen_job.id,
-                "queue": options["generate_queue"],
-                "depends_on": getattr(autod_job, "id", None),
-            })
+            job_info["jobs"].append(
+                {
+                    "stage": "generate",
+                    "job_id": gen_job.id,
+                    "queue": options["generate_queue"],
+                    "depends_on": getattr(autod_job, "id", None),
+                }
+            )
         except Exception as exc:
             log.warning("Failed to enqueue generate fanout for %s: %s", domain, exc)
 
@@ -1304,13 +1252,15 @@ def _enqueue_domain_jobs(
                     "max_probes_per_person_env": max_probes,
                 },
             )
-            job_info["jobs"].append({
-                "stage": "verify",
-                "job_id": vjob.id,
-                "queue": options["verify_queue"],
-                "depends_on": getattr(depends, "id", None),
-                "only_with_source_url": False,
-            })
+            job_info["jobs"].append(
+                {
+                    "stage": "verify",
+                    "job_id": vjob.id,
+                    "queue": options["verify_queue"],
+                    "depends_on": getattr(depends, "id", None),
+                    "only_with_source_url": False,
+                }
+            )
         except Exception as exc:
             log.warning("Failed to enqueue verify sweep for %s: %s", domain, exc)
 
@@ -1477,12 +1427,14 @@ def _update_progress_for_domain(
         if metric_key:
             progress["metrics"][metric_key] += 1
 
-    progress["domains"].append({
-        "domain": domain,
-        "company_id": company_id,
-        "state": "enqueued",
-        "jobs": job_info["jobs"],
-    })
+    progress["domains"].append(
+        {
+            "domain": domain,
+            "company_id": company_id,
+            "state": "enqueued",
+            "jobs": job_info["jobs"],
+        }
+    )
     progress["metrics"]["companies_enqueued"] = enqueued_count
 
 
@@ -1508,7 +1460,6 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
     con = _get_conn()
     now = _utc_now_iso()
 
-
     try:
         domains, options = _load_run_config(con, tenant_id=tenant_id, run_id=run_id)
 
@@ -1531,19 +1482,29 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
 
         log.info(
             "Pipeline starting: run_id=%s domains=%d modes=%s ai_enabled=%s force_discovery=%s",
-            run_id, len(domains), modes,
-            options.get("ai_enabled", True), options.get("force_discovery", False),
+            run_id,
+            len(domains),
+            modes,
+            options.get("ai_enabled", True),
+            options.get("force_discovery", False),
             extra={"run_id": run_id, "tenant_id": tenant_id},
         )
 
         progress = _build_initial_progress(
-            now=now, options=options, limit_info=limit_info,
-            modes=modes, domain_count=len(domains),
+            now=now,
+            options=options,
+            limit_info=limit_info,
+            modes=modes,
+            domain_count=len(domains),
         )
 
         _update_run_row(
-            con, tenant_id=tenant_id, run_id=run_id,
-            status="running", started_at=now, progress=progress,
+            con,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status="running",
+            started_at=now,
+            progress=progress,
         )
 
         redis = _get_redis()
@@ -1561,33 +1522,49 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
                 continue
 
             company_id, company_name = _ensure_company_for_domain(
-                con, tenant_id=tenant_id, domain=dom, run_id=run_id,
+                con,
+                tenant_id=tenant_id,
+                domain=dom,
+                run_id=run_id,
             )
 
             _write_user_supplied_resolution(
-                con, company_id=company_id, company_name=company_name,
-                domain=dom, tenant_id=tenant_id,
+                con,
+                company_id=company_id,
+                company_name=company_name,
+                domain=dom,
+                tenant_id=tenant_id,
             )
 
             job_info = _enqueue_domain_jobs(
-                con, domain=dom, tenant_id=tenant_id, run_id=run_id,
-                company_id=company_id, options=options,
+                con,
+                domain=dom,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                company_id=company_id,
+                options=options,
                 run_autodiscovery=run_autodiscovery,
-                run_generate=run_generate, run_verify=run_verify,
-                max_probes=max_probes, total_companies=total_companies,
-                discovery_q=discovery_q, generate_q=generate_q,
-                verify_q=verify_q, job_timeout=job_timeout,
+                run_generate=run_generate,
+                run_verify=run_verify,
+                max_probes=max_probes,
+                total_companies=total_companies,
+                discovery_q=discovery_q,
+                generate_q=generate_q,
+                verify_q=verify_q,
+                job_timeout=job_timeout,
             )
             enqueued.append(job_info)
 
             _update_progress_for_domain(
-                progress, job_info=job_info, domain=dom,
-                company_id=company_id, enqueued_count=len(enqueued),
+                progress,
+                job_info=job_info,
+                domain=dom,
+                company_id=company_id,
+                enqueued_count=len(enqueued),
             )
 
             if i % 10 == 0 or i == len(domains) - 1:
                 _update_run_row(con, tenant_id=tenant_id, run_id=run_id, progress=progress)
-
 
         elapsed = time.time() - start_time
         progress["phase"] = "fanout_complete"
@@ -1595,9 +1572,7 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
         progress["metrics"]["companies_enqueued"] = len(enqueued)
         progress["metrics"]["max_probes_per_person_env"] = max_probes
 
-
         _update_run_row(con, tenant_id=tenant_id, run_id=run_id, progress=progress)
-
 
         _log_run_started_activity(
             tenant_id=tenant_id,
@@ -1606,7 +1581,6 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
             modes=modes,
             elapsed=elapsed,
         )
-
 
         return {
             "ok": True,
@@ -1626,7 +1600,6 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
             "max_probes_per_person_env": max_probes,
         }
 
-
     except Exception as exc:
         log.exception("pipeline_start_v2 failed", extra={"run_id": run_id, "tenant_id": tenant_id})
         try:
@@ -1642,16 +1615,11 @@ def pipeline_start_v2(*, run_id: str, tenant_id: str) -> dict[str, Any]:
             pass
         raise
 
-
     finally:
         try:
             con.close()
         except Exception:
             pass
-
-
-
-
 
 
 def _build_permutation_predicate(
@@ -1669,10 +1637,7 @@ def _build_permutation_predicate(
             " OR e.source_note LIKE 'sequential_%')"
         )
         if has_source_url:
-            perm_pred = (
-                f"({perm_pred} AND "
-                f"(e.source_url IS NULL OR TRIM(e.source_url) = ''))"
-            )
+            perm_pred = f"({perm_pred} AND (e.source_url IS NULL OR TRIM(e.source_url) = ''))"
         return perm_pred
 
     if has_source_url:
@@ -1692,11 +1657,7 @@ def _build_cleanup_status_predicate(
     Returns None if cleanup cannot proceed safely.
     """
     has_verify_status = "verify_status" in vr_cols
-    untested_pred = (
-        "NOT EXISTS ("
-        "SELECT 1 FROM verification_results vr0 WHERE vr0.email_id = e.id"
-        ")"
-    )
+    untested_pred = "NOT EXISTS (SELECT 1 FROM verification_results vr0 WHERE vr0.email_id = e.id)"
 
     if has_verify_status:
         latest_status_subq = (
@@ -1720,6 +1681,7 @@ def _batch_delete_email_ids(
     ids: list[int],
 ) -> dict[str, Any]:
     """Delete emails and their verification_results by ID in batches."""
+
     def _chunks(seq: list[int], n: int = 500):
         for i in range(0, len(seq), n):
             yield seq[i : i + n]
@@ -1813,17 +1775,21 @@ def _cleanup_generated_permutations_for_run(
 
     order_expr = _build_vr_order_expr(vr_cols)
 
-    delete_untested = (
-        (os.getenv("PIPELINE_DELETE_UNTESTED_PERMS") or "")
-        .strip().lower() in {"1", "true", "yes"}
-    )
+    delete_untested = (os.getenv("PIPELINE_DELETE_UNTESTED_PERMS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
     status_pred = _build_cleanup_status_predicate(
-        vr_cols, order_expr, delete_untested,
+        vr_cols,
+        order_expr,
+        delete_untested,
     )
     if status_pred is None:
         return {
-            "ok": True, "emails_deleted": 0,
+            "ok": True,
+            "emails_deleted": 0,
             "verification_rows_deleted": 0,
             "reason": "verify_status_missing",
         }
@@ -1837,7 +1803,7 @@ def _cleanup_generated_permutations_for_run(
     sql = f"""
     SELECT e.id
     FROM emails e
-    WHERE {' AND '.join(where)}
+    WHERE {" AND ".join(where)}
       AND {perm_pred}
       AND {status_pred}
     """
@@ -1858,8 +1824,6 @@ def _cleanup_generated_permutations_for_run(
 # ---------------------------------------------------------------------------
 # Completion callback (kept; best-effort)
 # ---------------------------------------------------------------------------
-
-
 
 
 def _aggregate_autodiscovery_metrics(
@@ -1888,9 +1852,8 @@ def _aggregate_autodiscovery_metrics(
         metrics["companies_with_pages"] += 1 if pages > 0 else 0
         metrics["companies_zero_pages"] += 1 if pages <= 0 else 0
 
-        cand = (
-            (r.get("candidates_with_email", 0) or 0)
-            + (r.get("candidates_without_email", 0) or 0)
+        cand = (r.get("candidates_with_email", 0) or 0) + (
+            r.get("candidates_without_email", 0) or 0
         )
         metrics["companies_with_candidates"] += 1 if cand > 0 else 0
         metrics["companies_zero_candidates"] += 1 if cand <= 0 else 0
@@ -1976,15 +1939,18 @@ def _run_optional_cleanup(
     run_id: str,
 ) -> dict[str, Any]:
     """Run permutation cleanup if enabled via env var, else return skip marker."""
-    cleanup_enabled = (
-        (os.getenv("PIPELINE_PERMUTATION_CLEANUP") or "")
-        .strip().lower() in {"1", "true", "yes"}
-    )
+    cleanup_enabled = (os.getenv("PIPELINE_PERMUTATION_CLEANUP") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     if not cleanup_enabled:
         return {"ok": True, "skipped": True, "reason": "cleanup_disabled"}
     try:
         return _cleanup_generated_permutations_for_run(
-            con, tenant_id=tenant_id, run_id=run_id,
+            con,
+            tenant_id=tenant_id,
+            run_id=run_id,
         )
     except Exception:
         return {"ok": False, "reason": "cleanup_exception"}
@@ -2056,12 +2022,19 @@ def run_completion_callback(
         progress["metrics"] = metrics
 
         _update_run_row(
-            con, tenant_id=tenant_id, run_id=run_id,
-            status=status, progress=progress, finished_at=now,
+            con,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status=status,
+            progress=progress,
+            finished_at=now,
         )
 
         _log_run_completed_activity(
-            tenant_id=tenant_id, run_id=run_id, status=status, metrics=metrics,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status=status,
+            metrics=metrics,
         )
 
         return {"ok": True, "run_id": run_id, "status": status, "metrics": metrics}
@@ -2078,8 +2051,6 @@ def run_completion_callback(
             con.close()
         except Exception:
             pass
-
-
 
 
 # ---------------------------------------------------------------------------

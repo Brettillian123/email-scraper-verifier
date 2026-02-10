@@ -70,13 +70,11 @@ def _print_query_results(conn) -> None:
         ),
         (
             "catch_all_status not null",
-            "SELECT COUNT(*) AS n FROM domain_resolutions "
-            "WHERE catch_all_status IS NOT NULL",
+            "SELECT COUNT(*) AS n FROM domain_resolutions WHERE catch_all_status IS NOT NULL",
         ),
         (
             "catch_all_checked_at not null",
-            "SELECT COUNT(*) AS n FROM domain_resolutions "
-            "WHERE catch_all_checked_at IS NOT NULL",
+            "SELECT COUNT(*) AS n FROM domain_resolutions WHERE catch_all_checked_at IS NOT NULL",
         ),
         ("sources count", "SELECT COUNT(*) AS n FROM sources"),
         ("companies count", "SELECT COUNT(*) AS n FROM companies"),
@@ -189,8 +187,7 @@ def _print_recent_runs(conn) -> None:
                 )
             else:
                 print(
-                    f"  ID: {row[0][:8]}... | User: {row[1]} | "
-                    f"Label: {row[2]} | Status: {row[3]}"
+                    f"  ID: {row[0][:8]}... | User: {row[1]} | Label: {row[2]} | Status: {row[3]}"
                 )
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -212,14 +209,8 @@ def _test_metrics_module(conn) -> None:
 
         if "company_health" in summary:
             ch = summary["company_health"]
-            print(
-                "  company_health.total_companies: "
-                f"{ch.get('total_companies', 'N/A')}"
-            )
-            print(
-                "  company_health.companies_catch_all: "
-                f"{ch.get('companies_catch_all', 'N/A')}"
-            )
+            print(f"  company_health.total_companies: {ch.get('total_companies', 'N/A')}")
+            print(f"  company_health.companies_catch_all: {ch.get('companies_catch_all', 'N/A')}")
 
         if "run_status" in summary:
             rs = summary["run_status"]

@@ -160,9 +160,7 @@ def reset_runs(con, dry_run: bool = False):
     # Unlink first
     for table in ["companies", "people", "emails", "sources"]:
         try:
-            cur = con.execute(
-                f"UPDATE {table} SET run_id = NULL WHERE run_id IS NOT NULL"
-            )
+            cur = con.execute(f"UPDATE {table} SET run_id = NULL WHERE run_id IS NOT NULL")
             print(f"  Unlinked {cur.rowcount} rows in {table}")
         except Exception as e:
             print(f"  Skipped {table}: {e}")

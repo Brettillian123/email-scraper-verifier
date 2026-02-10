@@ -177,9 +177,8 @@ def diagnose_verification_results(domain: str) -> dict:
 
             # Flag the problem case
             flag = ""
-            if (
-                r["verify_status"] == "valid"
-                and "non_catchall_or_unknown" in (r["verify_reason"] or "")
+            if r["verify_status"] == "valid" and "non_catchall_or_unknown" in (
+                r["verify_reason"] or ""
             ):
                 flag = " ← ⚠️ SHOULD BE risky_catch_all!"
 

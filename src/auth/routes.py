@@ -62,6 +62,7 @@ VERIFICATION_CODE_EXPIRY_MINUTES = int(os.getenv("VERIFICATION_CODE_EXPIRY_MINUT
 # Request/Response Models
 # ---------------------------------------------------------------------------
 
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -88,6 +89,7 @@ class ResetPasswordRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_client_ip(request: Request) -> str | None:
     """Get client IP, respecting X-Forwarded-For from reverse proxy."""
@@ -168,6 +170,7 @@ def _send_verification_email(user_id: str, email: str) -> tuple[bool, str | None
 # Login Routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, next: str | None = None, error: str | None = None):
     """Render login page."""
@@ -176,11 +179,15 @@ async def login_page(request: Request, next: str | None = None, error: str | Non
         session, user = get_session(session_id)
         if session and user:
             return RedirectResponse(url=next or POST_LOGIN_REDIRECT, status_code=302)
-    
-    return _render_template(request, "login.html", {
-        "next_url": next or POST_LOGIN_REDIRECT,
-        "error": error,
-    })
+
+    return _render_template(
+        request,
+        "login.html",
+        {
+            "next_url": next or POST_LOGIN_REDIRECT,
+            "error": error,
+        },
+    )
 
 
 @router.post("/login")
@@ -193,16 +200,21 @@ async def login_submit(
 ):
     """Process login form submission."""
     redirect_to = next_url or POST_LOGIN_REDIRECT
-    
+
     user, error = authenticate(email, password)
-    
+
     if not user:
-        return _render_template(request, "login.html", {
-            "next_url": redirect_to,
-            "error": error,
-            "email": email,
-        }, status_code=401)
-    
+        return _render_template(
+            request,
+            "login.html",
+            {
+                "next_url": redirect_to,
+                "error": error,
+                "email": email,
+            },
+            status_code=401,
+        )
+
     # Create session
     session = create_session(
         user_id=user.id,
@@ -211,7 +223,7 @@ async def login_submit(
         user_agent=request.headers.get("user-agent"),
         persistent=remember_me,
     )
-    
+
     # Redirect based on user state:
     #  1. Unverified â†’ verify-email page
     #  2. Unapproved â†’ pending page
@@ -225,7 +237,7 @@ async def login_submit(
 
     response = RedirectResponse(url=dest, status_code=302)
     _set_session_cookie(response, session.id, persistent=remember_me)
-    
+
     logger.info(f"User logged in: {user.email} (tenant: {user.tenant_id})")
     return response
 
@@ -234,13 +246,14 @@ async def login_submit(
 # Logout Route
 # ---------------------------------------------------------------------------
 
+
 @router.get("/logout")
 async def logout(request: Request):
     """Log out and clear session."""
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
     if session_id:
         delete_session(session_id)
-    
+
     response = RedirectResponse(url="/auth/login", status_code=302)
     _clear_session_cookie(response)
     return response
@@ -249,6 +262,7 @@ async def logout(request: Request):
 # ---------------------------------------------------------------------------
 # Email Verification Routes
 # ---------------------------------------------------------------------------
+
 
 @router.get("/verify-email", response_class=HTMLResponse)
 async def verify_email_page(
@@ -268,11 +282,15 @@ async def verify_email_page(
             return RedirectResponse(url=POST_LOGIN_REDIRECT, status_code=302)
         return RedirectResponse(url="/auth/pending", status_code=302)
 
-    return _render_template(request, "verify_email.html", {
-        "user_email": user.email,
-        "error": error,
-        "success": success,
-    })
+    return _render_template(
+        request,
+        "verify_email.html",
+        {
+            "user_email": user.email,
+            "error": error,
+            "success": success,
+        },
+    )
 
 
 @router.post("/verify-email")
@@ -294,10 +312,15 @@ async def verify_email_submit(
 
     success, error = validate_email_verification_code(user.id, code)
     if not success:
-        return _render_template(request, "verify_email.html", {
-            "user_email": user.email,
-            "error": error,
-        }, status_code=400)
+        return _render_template(
+            request,
+            "verify_email.html",
+            {
+                "user_email": user.email,
+                "error": error,
+            },
+            status_code=400,
+        )
 
     # Mark user as verified
     mark_user_verified(user.id)
@@ -322,20 +345,29 @@ async def verify_email_resend(request: Request):
 
     sent, error = _send_verification_email(user.id, user.email)
     if not sent:
-        return _render_template(request, "verify_email.html", {
-            "user_email": user.email,
-            "error": error,
-        })
+        return _render_template(
+            request,
+            "verify_email.html",
+            {
+                "user_email": user.email,
+                "error": error,
+            },
+        )
 
-    return _render_template(request, "verify_email.html", {
-        "user_email": user.email,
-        "success": "A new verification code has been sent to your email.",
-    })
+    return _render_template(
+        request,
+        "verify_email.html",
+        {
+            "user_email": user.email,
+            "success": "A new verification code has been sent to your email.",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 # Pending Approval Route
 # ---------------------------------------------------------------------------
+
 
 @router.get("/pending", response_class=HTMLResponse)
 async def pending_page(request: Request):
@@ -352,24 +384,33 @@ async def pending_page(request: Request):
     if user.is_approved:
         return RedirectResponse(url=POST_LOGIN_REDIRECT, status_code=302)
 
-    return _render_template(request, "pending.html", {
-        "user_email": user.email,
-    })
+    return _render_template(
+        request,
+        "pending.html",
+        {
+            "user_email": user.email,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 # Registration Routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/register", response_class=HTMLResponse)
 async def register_page(request: Request, error: str | None = None):
     """Render registration page."""
     if not REGISTRATION_ENABLED:
         raise HTTPException(status_code=403, detail="Registration is disabled")
-    
-    return _render_template(request, "register.html", {
-        "error": error,
-    })
+
+    return _render_template(
+        request,
+        "register.html",
+        {
+            "error": error,
+        },
+    )
 
 
 @router.post("/register")
@@ -383,17 +424,22 @@ async def register_submit(
     """Process registration form submission."""
     if not REGISTRATION_ENABLED:
         raise HTTPException(status_code=403, detail="Registration is disabled")
-    
+
     # Validate passwords match
     if password != password_confirm:
-        return _render_template(request, "register.html", {
-            "error": "Passwords do not match",
-            "email": email,
-            "display_name": display_name,
-        }, status_code=400)
-    
+        return _render_template(
+            request,
+            "register.html",
+            {
+                "error": "Passwords do not match",
+                "email": email,
+                "display_name": display_name,
+            },
+            status_code=400,
+        )
+
     tenant_id = DEFAULT_TENANT_ID
-    
+
     # Create user â€” NOT verified, NOT approved
     user, error = create_user(
         email=email,
@@ -403,14 +449,19 @@ async def register_submit(
         is_verified=False,
         is_approved=False,
     )
-    
+
     if not user:
-        return _render_template(request, "register.html", {
-            "error": error,
-            "email": email,
-            "display_name": display_name,
-        }, status_code=400)
-    
+        return _render_template(
+            request,
+            "register.html",
+            {
+                "error": error,
+                "email": email,
+                "display_name": display_name,
+            },
+            status_code=400,
+        )
+
     # Send verification code via SES
     sent, ses_error = _send_verification_email(user.id, user.email)
     if not sent:
@@ -424,11 +475,11 @@ async def register_submit(
         ip_address=_get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
-    
+
     # Redirect to email verification page
     response = RedirectResponse(url="/auth/verify-email", status_code=302)
     _set_session_cookie(response, session.id)
-    
+
     logger.info(
         "New user registered (pending verification): %s (tenant: %s)",
         user.email,
@@ -441,12 +492,17 @@ async def register_submit(
 # Password Reset Routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/forgot-password", response_class=HTMLResponse)
 async def forgot_password_page(request: Request, success: bool = False):
     """Render forgot password page."""
-    return _render_template(request, "forgot_password.html", {
-        "success": success,
-    })
+    return _render_template(
+        request,
+        "forgot_password.html",
+        {
+            "success": success,
+        },
+    )
 
 
 @router.post("/forgot-password")
@@ -456,19 +512,23 @@ async def forgot_password_submit(
 ):
     """Process forgot password form."""
     user = get_user_by_email(email)
-    
+
     # Always show success to prevent email enumeration
     if user:
         token = create_password_reset_token(user.id, _get_client_ip(request))
         reset_url = f"{APP_URL}/auth/reset-password?token={token}"
-        
+
         sent = send_password_reset(user.email, reset_url)
         if not sent:
             logger.error(f"Failed to send password reset email to {email}")
-    
-    return _render_template(request, "forgot_password.html", {
-        "success": True,
-    })
+
+    return _render_template(
+        request,
+        "forgot_password.html",
+        {
+            "success": True,
+        },
+    )
 
 
 @router.get("/reset-password", response_class=HTMLResponse)
@@ -476,15 +536,23 @@ async def reset_password_page(request: Request, token: str, error: str | None = 
     """Render password reset page."""
     user = validate_password_reset_token(token)
     if not user:
-        return _render_template(request, "reset_password.html", {
-            "error": "Invalid or expired reset link. Please request a new one.",
-            "token": None,
-        })
-    
-    return _render_template(request, "reset_password.html", {
-        "token": token,
-        "error": error,
-    })
+        return _render_template(
+            request,
+            "reset_password.html",
+            {
+                "error": "Invalid or expired reset link. Please request a new one.",
+                "token": None,
+            },
+        )
+
+    return _render_template(
+        request,
+        "reset_password.html",
+        {
+            "token": token,
+            "error": error,
+        },
+    )
 
 
 @router.post("/reset-password")
@@ -496,19 +564,29 @@ async def reset_password_submit(
 ):
     """Process password reset form."""
     if password != password_confirm:
-        return _render_template(request, "reset_password.html", {
-            "error": "Passwords do not match",
-            "token": token,
-        }, status_code=400)
-    
+        return _render_template(
+            request,
+            "reset_password.html",
+            {
+                "error": "Passwords do not match",
+                "token": token,
+            },
+            status_code=400,
+        )
+
     success, error = use_password_reset_token(token, password)
-    
+
     if not success:
-        return _render_template(request, "reset_password.html", {
-            "error": error,
-            "token": token if "expired" not in (error or "").lower() else None,
-        }, status_code=400)
-    
+        return _render_template(
+            request,
+            "reset_password.html",
+            {
+                "error": error,
+                "token": token if "expired" not in (error or "").lower() else None,
+            },
+            status_code=400,
+        )
+
     return RedirectResponse(
         url="/auth/login?error=Password+reset+successful.+Please+log+in.",
         status_code=302,
@@ -519,14 +597,15 @@ async def reset_password_submit(
 # API Endpoints (JSON responses for SPA/API clients)
 # ---------------------------------------------------------------------------
 
+
 @router.post("/api/login")
 async def api_login(request: Request, body: LoginRequest):
     """API endpoint for login (returns JSON)."""
     user, error = authenticate(body.email, body.password)
-    
+
     if not user:
         raise HTTPException(status_code=401, detail=error)
-    
+
     session = create_session(
         user_id=user.id,
         tenant_id=user.tenant_id,
@@ -534,7 +613,7 @@ async def api_login(request: Request, body: LoginRequest):
         user_agent=request.headers.get("user-agent"),
         persistent=body.remember_me,
     )
-    
+
     return {
         "session_id": session.id,
         "user": {
@@ -553,10 +632,10 @@ async def api_register(request: Request, body: RegisterRequest):
     """API endpoint for registration (returns JSON)."""
     if not REGISTRATION_ENABLED:
         raise HTTPException(status_code=403, detail="Registration is disabled")
-    
+
     if body.password != body.password_confirm:
         raise HTTPException(status_code=400, detail="Passwords do not match")
-    
+
     user, error = create_user(
         email=body.email,
         password=body.password,
@@ -564,10 +643,10 @@ async def api_register(request: Request, body: RegisterRequest):
         display_name=body.display_name,
         is_verified=False,
     )
-    
+
     if not user:
         raise HTTPException(status_code=400, detail=error)
-    
+
     # Send verification code
     _send_verification_email(user.id, user.email)
 
@@ -577,7 +656,7 @@ async def api_register(request: Request, body: RegisterRequest):
         ip_address=_get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
-    
+
     return {
         "session_id": session.id,
         "user": {
@@ -629,11 +708,11 @@ async def api_me(request: Request):
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     session, user = get_session(session_id)
     if not session or not user:
         raise HTTPException(status_code=401, detail="Session expired")
-    
+
     return {
         "user": {
             "id": user.id,

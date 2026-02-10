@@ -59,8 +59,7 @@ def main() -> None:
 
         print(f"\n{table}: ({total} rows total)")
         rows = con.execute(
-            f"SELECT tenant_id, COUNT(*) FROM {table} "
-            "GROUP BY tenant_id ORDER BY COUNT(*) DESC"
+            f"SELECT tenant_id, COUNT(*) FROM {table} GROUP BY tenant_id ORDER BY COUNT(*) DESC"
         ).fetchall()
         if not rows:
             print("  (empty table)")
@@ -82,10 +81,7 @@ def main() -> None:
         if not rows:
             print("  No active sessions found.")
         for sid, _uid, email, tid, expires in rows:
-            print(
-                f"  session={sid[:12]}...  user={email}  "
-                f"tenant_id={tid!r}  expires={expires}"
-            )
+            print(f"  session={sid[:12]}...  user={email}  tenant_id={tid!r}  expires={expires}")
     except Exception as e:
         print(f"  Could not query sessions: {e}")
 

@@ -60,14 +60,9 @@ except Exception:  # pragma: no cover
             pass
 
         # 2. Fall back to header-based auth (API / dev callers)
-        tenant = (
-            (x_tenant_id or "").strip()
-            or os.getenv("DEV_TENANT_ID", "dev").strip() or "dev"
-        )
+        tenant = (x_tenant_id or "").strip() or os.getenv("DEV_TENANT_ID", "dev").strip() or "dev"
         user = (
-            (x_user_id or "").strip()
-            or os.getenv("DEV_USER_ID", "user_dev").strip()
-            or "user_dev"
+            (x_user_id or "").strip() or os.getenv("DEV_USER_ID", "user_dev").strip() or "user_dev"
         )
         email = (x_user_email or "").strip() or None
         return AuthContext(tenant_id=tenant, user_id=user, email=email, roles=[])
@@ -445,18 +440,9 @@ def list_companies(
             tuple(params),
         ).fetchone()[0]
 
-        p_tenant = (
-            "AND p.tenant_id = %s"
-            if _has_column(con, "people", "tenant_id") else ""
-        )
-        e_tenant = (
-            "AND e.tenant_id = %s"
-            if _has_column(con, "emails", "tenant_id") else ""
-        )
-        s_tenant = (
-            "AND s.tenant_id = %s"
-            if _has_column(con, "sources", "tenant_id") else ""
-        )
+        p_tenant = "AND p.tenant_id = %s" if _has_column(con, "people", "tenant_id") else ""
+        e_tenant = "AND e.tenant_id = %s" if _has_column(con, "emails", "tenant_id") else ""
+        s_tenant = "AND s.tenant_id = %s" if _has_column(con, "sources", "tenant_id") else ""
 
         sql = f"""
             SELECT
@@ -509,7 +495,9 @@ def list_companies(
             )
 
         risk_map = _domain_risk_levels_for_company_ids(
-            con, tenant_id=tenant_id, company_ids=company_ids,
+            con,
+            tenant_id=tenant_id,
+            company_ids=company_ids,
         )
         for it in items:
             rid = risk_map.get(int(it["id"]))
@@ -592,8 +580,7 @@ def export_selected_companies_csv(
 
         # Status filter via bound parameter (pattern contains %)
         where_parts.append(
-            "LOWER(COALESCE(vr.verify_status, vr.status,"
-            " vr.fallback_status, '')) LIKE %s"
+            "LOWER(COALESCE(vr.verify_status, vr.status, vr.fallback_status, '')) LIKE %s"
         )
         params.append("valid%")
 
@@ -770,7 +757,8 @@ def get_company(
         ).fetchall()
 
         risk_map = _domain_risk_levels_for_company_ids(
-            con, tenant_id=tenant_id,
+            con,
+            tenant_id=tenant_id,
             company_ids=[int(company_id)],
         )
         risk_level = risk_map.get(int(company_id))
@@ -808,8 +796,10 @@ def get_company(
             ],
             "pages": [
                 {
-                    "id": pg[0], "source_url": pg[1],
-                    "html_size": pg[2], "fetched_at": pg[3],
+                    "id": pg[0],
+                    "source_url": pg[1],
+                    "html_size": pg[2],
+                    "fetched_at": pg[3],
                 }
                 for pg in pages
             ],
@@ -1160,32 +1150,32 @@ def create_run(
             "force_discovery": bool(request.force_discovery),
             "company_limit": int(request.company_limit),
         }
-        
+
         label = (request.label or "").strip() or None
 
         # Build dynamic column list based on what exists
         has_tenant = _has_column(con, "runs", "tenant_id")
         has_user = _has_column(con, "runs", "user_id")
         has_label = _has_column(con, "runs", "label")
-        
+
         cols = ["id", "status", "domains_json", "options_json", "created_at", "updated_at"]
         vals: list[Any] = [run_id, "queued", json.dumps(domains), json.dumps(options), now, now]
-        
+
         if has_tenant:
             cols.append("tenant_id")
             vals.append(tenant_id)
-        
+
         if has_user and user_id:
             cols.append("user_id")
             vals.append(user_id)
-        
+
         if has_label and label:
             cols.append("label")
             vals.append(label)
-        
+
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
-        
+
         con.execute(
             f"INSERT INTO runs ({col_names}) VALUES ({placeholders})",
             tuple(vals),
@@ -1243,9 +1233,7 @@ def search_all(
         emails_has_tenant = _has_column(con, "emails", "tenant_id")
 
         companies_where = (
-            "WHERE (LOWER(domain) LIKE %s"
-            " OR LOWER(name) LIKE %s"
-            " OR LOWER(official_domain) LIKE %s)"
+            "WHERE (LOWER(domain) LIKE %s OR LOWER(name) LIKE %s OR LOWER(official_domain) LIKE %s)"
         )
         companies_params: list[Any] = [st, st, st]
         if companies_has_tenant:
@@ -1294,8 +1282,10 @@ def search_all(
             "query": q,
             "companies": [
                 {
-                    "id": c[0], "name": c[1],
-                    "domain": c[2], "official_domain": c[3],
+                    "id": c[0],
+                    "name": c[1],
+                    "domain": c[2],
+                    "official_domain": c[3],
                 }
                 for c in companies
             ],
@@ -1312,8 +1302,10 @@ def search_all(
             ],
             "emails": [
                 {
-                    "id": e[0], "email": e[1],
-                    "company_domain": e[2], "verify_status": e[3],
+                    "id": e[0],
+                    "email": e[1],
+                    "company_domain": e[2],
+                    "verify_status": e[3],
                 }
                 for e in emails
             ],

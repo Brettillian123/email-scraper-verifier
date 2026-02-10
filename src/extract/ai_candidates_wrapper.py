@@ -663,7 +663,7 @@ def _smart_fallback(
 def _count_quality_candidates(candidates: list[Any]) -> int:
     """
     Count candidates that have valid names AND titles (quality signal).
-    
+
     These are high-confidence candidates that the AI might have incorrectly filtered.
     """
     count = 0
@@ -687,7 +687,7 @@ def refine_candidates_with_ai(
     Contract:
       - If AI is enabled and the call succeeds but returns 0 people -> return [] (no fallback).
       - Fallback is used only when AI is disabled or the AI call fails.
-      
+
     PRODUCTION FIX (2026-01):
       - Added safety fallback: If AI returns 0 but we had 3+ quality candidates
         (valid name + title), trigger smart fallback instead of returning empty.

@@ -556,6 +556,7 @@ def test_api_primary_and_alternate_labels_for_multiple_valids(monkeypatch) -> No
     # Ensure auth is in dev mode regardless of environment (.env may set session).
     import src.api.app as app_mod
     import src.api.deps as deps_mod
+
     monkeypatch.setattr(app_mod, "AUTH_MODE", "dev")
     monkeypatch.setattr(deps_mod, "AUTH_MODE", "dev")
 

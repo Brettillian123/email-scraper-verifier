@@ -167,9 +167,7 @@ def _print_team_section_structure(soup: BeautifulSoup) -> None:
         text = div.get_text(strip=True)[:80]
         classes = " ".join(div.get("class", []))[:40]
         if len(children) >= 2 and len(text) > 20:
-            print(
-                f"   div.{classes}: {len(children)} children, text: {text[:50]}..."
-            )
+            print(f"   div.{classes}: {len(children)} children, text: {text[:50]}...")
 
 
 def main() -> None:

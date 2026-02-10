@@ -4,7 +4,7 @@ Apply auth tables migration to the database.
 
 Usage:
     python scripts/apply_auth_migration.py
-    
+
 Or with a specific database URL:
     DATABASE_URL=postgresql://... python scripts/apply_auth_migration.py
 """
@@ -30,37 +30,39 @@ def main() -> int:
     import psycopg2
 
     from src.config import settings
-    
+
     migration_path = Path(__file__).parent.parent / "migrations" / "001_auth_tables.sql"
-    
+
     if not migration_path.exists():
         logger.error(f"Migration file not found: {migration_path}")
         return 1
-    
+
     logger.info(f"Reading migration from: {migration_path}")
     sql = migration_path.read_text()
-    
+
     # Split into statements (basic split on semicolon, but be careful with strings)
     statements = [s.strip() for s in sql.split(";") if s.strip()]
-    
+
     # Connect directly with autocommit to handle each statement independently
     # This prevents PostgreSQL from aborting the entire transaction on a single failure
     db_url = settings.database_url
     conn = psycopg2.connect(db_url)
     conn.autocommit = True  # Each statement commits independently
-    
+
     try:
         logger.info(f"Applying {len(statements)} statements...")
-        
+
         success_count = 0
         skip_count = 0
         fail_count = 0
-        
+
         for i, stmt in enumerate(statements, 1):
             # Skip empty statements and pure comments
-            if not stmt or all(line.strip().startswith("--") or not line.strip() for line in stmt.split("\n")):
+            if not stmt or all(
+                line.strip().startswith("--") or not line.strip() for line in stmt.split("\n")
+            ):
                 continue
-            
+
             try:
                 cur = conn.cursor()
                 cur.execute(stmt)
@@ -84,14 +86,16 @@ def main() -> int:
                 else:
                     fail_count += 1
                     logger.warning(f"  [{i}/{len(statements)}] Failed: {e}")
-        
-        logger.info(f"Migration complete: {success_count} applied, {skip_count} skipped, {fail_count} failed")
-        
+
+        logger.info(
+            f"Migration complete: {success_count} applied, {skip_count} skipped, {fail_count} failed"
+        )
+
         if fail_count > 0:
             logger.warning("Some statements failed - review warnings above")
-        
+
         return 0
-        
+
     except Exception as e:
         logger.exception(f"Migration failed: {e}")
         return 1

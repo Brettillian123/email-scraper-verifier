@@ -41,6 +41,7 @@ AUTH_MODE = os.getenv("AUTH_MODE", "dev").strip().lower()
 
 class PipelineMode(str, Enum):
     """Available pipeline execution modes."""
+
     AUTODISCOVERY = "autodiscovery"
     GENERATE = "generate"
     VERIFY = "verify"
@@ -51,8 +52,10 @@ class PipelineMode(str, Enum):
 # Auth Context (self-contained to avoid circular import)
 # ---------------------------------------------------------------------------
 
+
 class AuthContextV2(BaseModel):
     """Auth context for v2 endpoints."""
+
     tenant_id: str
     user_id: str
     email: str | None = None
@@ -65,7 +68,7 @@ def get_auth_context_v2(
 ) -> AuthContextV2:
     """
     Resolve auth context from headers.
-    
+
     This is a self-contained version to avoid circular imports.
     """
     if AUTH_MODE == "none":
@@ -74,11 +77,11 @@ def get_auth_context_v2(
             user_id=DEV_USER_ID,
             email=x_user_email,
         )
-    
+
     # Dev mode: use headers with fallback to defaults
     tenant_id = (x_tenant_id or "").strip() or DEV_TENANT_ID
     user_id = (x_user_id or "").strip() or DEV_USER_ID
-    
+
     return AuthContextV2(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -90,17 +93,18 @@ def get_auth_context_v2(
 # Request/Response Models
 # ---------------------------------------------------------------------------
 
+
 class RunOptionsV2(BaseModel):
     """Enhanced run options with mode selection and limits."""
+
     modes: list[PipelineMode] = Field(
-        default=[PipelineMode.FULL],
-        description="Pipeline stages to execute"
+        default=[PipelineMode.FULL], description="Pipeline stages to execute"
     )
     company_limit: int = Field(
         default=DEFAULT_COMPANY_LIMIT,
         ge=1,
         le=MAX_COMPANY_LIMIT,
-        description=f"Maximum companies to process (1-{MAX_COMPANY_LIMIT})"
+        description=f"Maximum companies to process (1-{MAX_COMPANY_LIMIT})",
     )
     skip_verified: bool = Field(default=True)
     skip_catch_all: bool = Field(default=False)
@@ -108,7 +112,7 @@ class RunOptionsV2(BaseModel):
     ai_enabled: bool = Field(default=True)
     discovery_queue: str | None = None
     verify_queue: str | None = None
-    
+
     @field_validator("modes", mode="before")
     @classmethod
     def parse_modes(cls, v):
@@ -124,7 +128,7 @@ class RunOptionsV2(BaseModel):
             else:
                 result.append(mode)
         return result
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "modes": [m.value for m in self.modes],
@@ -140,10 +144,11 @@ class RunOptionsV2(BaseModel):
 
 class RunCreateRequestV2(BaseModel):
     """Enhanced run creation request."""
+
     domains: list[str] = Field(..., min_length=1, max_length=MAX_COMPANY_LIMIT)
     options: RunOptionsV2 = Field(default_factory=RunOptionsV2)
     label: str | None = Field(default=None, max_length=255)
-    
+
     @field_validator("domains", mode="before")
     @classmethod
     def normalize_domains(cls, v):
@@ -173,6 +178,7 @@ def _utc_now_iso() -> str:
 def _db_connect():
     """Get database connection."""
     from src.db import get_conn
+
     return get_conn()
 
 
@@ -188,13 +194,13 @@ def _log_activity(
     """Log user activity (best-effort, non-blocking)."""
     try:
         from src.admin.user_activity import log_user_activity
-        
+
         ip = None
         ua = None
         if request:
             ip = request.client.host if request.client else None
             ua = request.headers.get("user-agent")
-        
+
         log_user_activity(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -236,7 +242,7 @@ def _enqueue_pipeline(run_id: str, tenant_id: str) -> None:
         from rq import Queue
     except ImportError as exc:
         raise HTTPException(status_code=500, detail=f"Redis/RQ not available: {exc}") from exc
-    
+
     # Try v2 first, fall back to v1
     try:
         from src.queueing.pipeline_v2 import pipeline_start_v2 as pipeline_func
@@ -248,7 +254,7 @@ def _enqueue_pipeline(run_id: str, tenant_id: str) -> None:
                 status_code=500,
                 detail=f"No pipeline_start available: {exc}",
             ) from exc
-    
+
     redis = Redis.from_url(RQ_REDIS_URL)
     q = Queue(RUNS_QUEUE_NAME, connection=redis)
     q.enqueue(pipeline_func, run_id=run_id, tenant_id=tenant_id)
@@ -258,6 +264,7 @@ def _enqueue_pipeline(run_id: str, tenant_id: str) -> None:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.post("/runs")
 async def create_run_v2(
     payload: RunCreateRequestV2,
@@ -266,29 +273,29 @@ async def create_run_v2(
 ):
     """
     Create a new pipeline run with enhanced options.
-    
+
     Supports mode selection and company limit enforcement.
     """
     domains = payload.domains
     effective_limit = min(len(domains), payload.options.company_limit)
-    
+
     if len(domains) > payload.options.company_limit:
-        domains = domains[:payload.options.company_limit]
-    
+        domains = domains[: payload.options.company_limit]
+
     options_dict = payload.options.to_dict()
     options_dict["_original_domain_count"] = len(payload.domains)
     options_dict["_effective_domain_count"] = len(domains)
-    
+
     run_id = str(uuid.uuid4())
     now = _utc_now_iso()
-    
+
     domains_json = json.dumps(domains, separators=(",", ":"))
     options_json = json.dumps(options_dict, separators=(",", ":"))
-    
+
     con = _db_connect()
     try:
         _bootstrap_tenant_user(con, auth_ctx.tenant_id, auth_ctx.user_id, auth_ctx.email)
-        
+
         con.execute(
             """
             INSERT INTO runs (
@@ -328,9 +335,9 @@ async def create_run_v2(
             con.close()
         except Exception:
             pass
-    
+
     _enqueue_pipeline(run_id, auth_ctx.tenant_id)
-    
+
     _log_activity(
         tenant_id=auth_ctx.tenant_id,
         user_id=auth_ctx.user_id,
@@ -344,7 +351,7 @@ async def create_run_v2(
         },
         request=request,
     )
-    
+
     return {
         "run_id": run_id,
         "status": "queued",
@@ -365,12 +372,13 @@ async def get_run_metrics(
     """Get detailed metrics for a run."""
     try:
         from src.admin.run_metrics import get_run_metrics as load_metrics
+
         summary = load_metrics(run_id, auth_ctx.tenant_id)
         if summary:
             return summary.to_dict()
     except ImportError:
         pass
-    
+
     con = _db_connect()
     try:
         cur = con.execute(
@@ -381,25 +389,23 @@ async def get_run_metrics(
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
-        
+
         progress_raw = row[0] if isinstance(row, tuple) else row["progress_json"]
         status = row[1] if isinstance(row, tuple) else row["status"]
         started = row[2] if isinstance(row, tuple) else row["started_at"]
         finished = row[3] if isinstance(row, tuple) else row["finished_at"]
-        
+
         progress = {}
         if progress_raw:
             try:
                 progress = (
-                    json.loads(progress_raw)
-                    if isinstance(progress_raw, str)
-                    else progress_raw
+                    json.loads(progress_raw) if isinstance(progress_raw, str) else progress_raw
                 )
             except Exception:
                 pass
-        
+
         metrics = progress.get("metrics", {})
-        
+
         return {
             "run_id": run_id,
             "tenant_id": auth_ctx.tenant_id,
@@ -437,7 +443,7 @@ async def get_run_v2(
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
-        
+
         return {
             "id": row[0],
             "tenant_id": row[1],
@@ -471,7 +477,7 @@ async def get_my_activity(
     """Get activity history for the current user."""
     try:
         from src.admin.user_activity import get_user_activity
-        
+
         entries = get_user_activity(
             tenant_id=auth_ctx.tenant_id,
             user_id=auth_ctx.user_id,
@@ -479,7 +485,7 @@ async def get_my_activity(
             offset=offset,
             action_filter=action,
         )
-        
+
         return {
             "user_id": auth_ctx.user_id,
             "results": [e.to_dict() for e in entries],
@@ -505,13 +511,13 @@ async def get_my_usage(
     """Get usage summary for the current user."""
     try:
         from src.admin.user_activity import get_user_usage_summary
-        
+
         summary = get_user_usage_summary(
             tenant_id=auth_ctx.tenant_id,
             user_id=auth_ctx.user_id,
             since_days=days,
         )
-        
+
         return summary.to_dict()
     except ImportError:
         return {

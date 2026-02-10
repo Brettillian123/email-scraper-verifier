@@ -70,19 +70,18 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=BODY_LIMIT_BYTES)
 app.add_middleware(
     RequireAuthMiddleware,
     exclude_paths=[
-        "/auth/",      # Login, register, logout, etc.
-        "/api/",       # API routes use header/JWT auth via AuthContext
-        "/leads/",     # Lead search uses AuthContext (header/JWT auth)
-        "/admin/",     # Admin routes use require_admin dependency
-        "/static/",    # Static files
-        "/health",     # Health checks
+        "/auth/",  # Login, register, logout, etc.
+        "/api/",  # API routes use header/JWT auth via AuthContext
+        "/leads/",  # Lead search uses AuthContext (header/JWT auth)
+        "/admin/",  # Admin routes use require_admin dependency
+        "/static/",  # Static files
+        "/health",  # Health checks
         "/favicon.ico",
-        "/demo",       # Public demo page (no auth required)
+        "/demo",  # Public demo page (no auth required)
     ],
     login_url="/auth/login",
     pending_url="/auth/pending",
 )
-
 
 
 # R24: admin UI + metrics JSON
@@ -106,11 +105,11 @@ def _get_current_user_from_session(request: Request):
     """Get the current user from session cookie if available."""
     try:
         from src.auth.core import SESSION_COOKIE_NAME, get_session
-        
+
         session_id = request.cookies.get(SESSION_COOKIE_NAME)
         if not session_id:
             return None
-        
+
         session, user = get_session(session_id)
         return user
     except Exception:
@@ -123,10 +122,13 @@ def dashboard_page(request: Request) -> HTMLResponse:
     Main dashboard UI accessible at root URL.
     """
     user = _get_current_user_from_session(request)
-    return dashboard_templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "user": user,
-    })
+    return dashboard_templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "user": user,
+        },
+    )
 
 
 @app.get("/demo", response_class=HTMLResponse)
@@ -138,10 +140,12 @@ def demo_page(request: Request) -> HTMLResponse:
     companies, people, and emails.  Run creation is disabled.
     No authentication required.
     """
-    return dashboard_templates.TemplateResponse("demo.html", {
-        "request": request,
-    })
-
+    return dashboard_templates.TemplateResponse(
+        "demo.html",
+        {
+            "request": request,
+        },
+    )
 
 
 # --------------------------------------------------------------------------------------

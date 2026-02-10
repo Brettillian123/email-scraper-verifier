@@ -78,11 +78,7 @@ def fix_page_classifier() -> bool:
         return True
 
     # Check if it's a different pattern
-    if (
-        "job_board" in content
-        and "press_release" in content
-        and "testimonial" in content
-    ):
+    if "job_board" in content and "press_release" in content and "testimonial" in content:
         print("  ⚠ Page classifier pattern different than expected - check manually")
         print("    Look for: page_type in {...} around line 2656")
         return False
@@ -132,11 +128,11 @@ def fix_smtp_timeouts() -> bool:
 
     # Increase SMTP_PREFLIGHT_TIMEOUT from 1.5 to 3.0
     old_preflight = (
-        'SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = _getenv_float('
+        "SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = _getenv_float("
         '"SMTP_PREFLIGHT_TIMEOUT_SECONDS", 1.5)'
     )
     new_preflight = (
-        'SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = _getenv_float('
+        "SMTP_PREFLIGHT_TIMEOUT_SECONDS: float = _getenv_float("
         '"SMTP_PREFLIGHT_TIMEOUT_SECONDS", 3.0)'
     )
     if old_preflight in content:
@@ -436,4 +432,3 @@ Next steps:
 
 if __name__ == "__main__":
     main()
-

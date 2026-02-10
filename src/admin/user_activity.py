@@ -42,7 +42,7 @@ ACTION_API_CALL = "api_call"
 @dataclass
 class UserActivityEntry:
     """A single user activity record."""
-    
+
     id: int | None = None
     tenant_id: str = ""
     user_id: str = ""
@@ -53,7 +53,7 @@ class UserActivityEntry:
     user_agent: str | None = None
     metadata: dict[str, Any] | None = None
     created_at: str | None = None
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -72,7 +72,7 @@ class UserActivityEntry:
 @dataclass
 class UserUsageSummary:
     """Aggregated usage statistics for a user."""
-    
+
     tenant_id: str
     user_id: str
     runs_created: int = 0
@@ -84,7 +84,7 @@ class UserUsageSummary:
     total_actions: int = 0
     first_activity: str | None = None
     last_activity: str | None = None
-    
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "tenant_id": self.tenant_id,
@@ -128,7 +128,7 @@ def log_user_activity(
 ) -> bool:
     """
     Log a user activity event.
-    
+
     Args:
         tenant_id: The tenant ID
         user_id: The user ID
@@ -139,26 +139,26 @@ def log_user_activity(
         user_agent: Optional client user agent
         metadata: Optional additional context as dict
         conn: Optional database connection
-        
+
     Returns:
         True if logged successfully, False otherwise
     """
     if not tenant_id or not user_id or not action:
         log.warning("log_user_activity called with missing required fields")
         return False
-    
+
     close_conn = conn is None
     if conn is None:
         conn = get_conn()
-    
+
     try:
         if not _table_exists(conn, "user_activity"):
             log.debug("user_activity table does not exist; skipping log")
             return False
-        
+
         metadata_json = json.dumps(metadata) if metadata else None
         now = _utc_now_iso()
-        
+
         conn.execute(
             """
             INSERT INTO user_activity (
@@ -169,15 +169,20 @@ def log_user_activity(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                tenant_id, user_id, action,
-                resource_type, resource_id,
-                ip_address, user_agent,
-                metadata_json, now,
+                tenant_id,
+                user_id,
+                action,
+                resource_type,
+                resource_id,
+                ip_address,
+                user_agent,
+                metadata_json,
+                now,
             ),
         )
         conn.commit()
         return True
-        
+
     except Exception as exc:
         log.debug(
             "Failed to log user activity",
@@ -204,7 +209,7 @@ def get_user_activity(
 ) -> list[UserActivityEntry]:
     """
     Query user activity history.
-    
+
     Args:
         tenant_id: The tenant ID
         user_id: The user ID
@@ -213,35 +218,35 @@ def get_user_activity(
         action_filter: Optional filter by action type
         since: Optional ISO timestamp to filter from
         conn: Optional database connection
-        
+
     Returns:
         List of UserActivityEntry objects
     """
     close_conn = conn is None
     if conn is None:
         conn = get_conn()
-    
+
     results: list[UserActivityEntry] = []
-    
+
     try:
         if not _table_exists(conn, "user_activity"):
             return results
-        
+
         # Build query
         where_parts = ["tenant_id = ?", "user_id = ?"]
         params: list[Any] = [tenant_id, user_id]
-        
+
         if action_filter:
             where_parts.append("action = ?")
             params.append(action_filter)
-        
+
         if since:
             where_parts.append("created_at >= ?")
             params.append(since)
-        
+
         where_clause = " AND ".join(where_parts)
         params.extend([limit, offset])
-        
+
         cur = conn.execute(
             f"""
             SELECT id, tenant_id, user_id, action, resource_type, resource_id,
@@ -253,7 +258,7 @@ def get_user_activity(
             """,
             tuple(params),
         )
-        
+
         for row in cur.fetchall():
             # Handle both tuple and dict-like rows
             if hasattr(row, "_asdict"):
@@ -263,7 +268,7 @@ def get_user_activity(
             else:
                 cols = [d[0] for d in cur.description]
                 data = dict(zip(cols, row, strict=False))
-            
+
             # Parse metadata JSON
             meta = data.get("metadata")
             if meta and isinstance(meta, str):
@@ -271,22 +276,24 @@ def get_user_activity(
                     meta = json.loads(meta)
                 except Exception:
                     pass
-            
-            results.append(UserActivityEntry(
-                id=data.get("id"),
-                tenant_id=data.get("tenant_id", ""),
-                user_id=data.get("user_id", ""),
-                action=data.get("action", ""),
-                resource_type=data.get("resource_type"),
-                resource_id=data.get("resource_id"),
-                ip_address=data.get("ip_address"),
-                user_agent=data.get("user_agent"),
-                metadata=meta if isinstance(meta, dict) else None,
-                created_at=data.get("created_at"),
-            ))
-        
+
+            results.append(
+                UserActivityEntry(
+                    id=data.get("id"),
+                    tenant_id=data.get("tenant_id", ""),
+                    user_id=data.get("user_id", ""),
+                    action=data.get("action", ""),
+                    resource_type=data.get("resource_type"),
+                    resource_id=data.get("resource_id"),
+                    ip_address=data.get("ip_address"),
+                    user_agent=data.get("user_agent"),
+                    metadata=meta if isinstance(meta, dict) else None,
+                    created_at=data.get("created_at"),
+                )
+            )
+
         return results
-        
+
     except Exception:
         log.exception("Failed to query user activity", extra={"user_id": user_id})
         return results
@@ -307,37 +314,37 @@ def get_user_usage_summary(
 ) -> UserUsageSummary:
     """
     Get aggregated usage statistics for a user.
-    
+
     Args:
         tenant_id: The tenant ID
         user_id: The user ID
         since_days: Optional limit to last N days
         conn: Optional database connection
-        
+
     Returns:
         UserUsageSummary with aggregated counts
     """
     close_conn = conn is None
     if conn is None:
         conn = get_conn()
-    
+
     summary = UserUsageSummary(tenant_id=tenant_id, user_id=user_id)
-    
+
     try:
         if not _table_exists(conn, "user_activity"):
             return summary
-        
+
         # Build query
         where_parts = ["tenant_id = ?", "user_id = ?"]
         params: list[Any] = [tenant_id, user_id]
-        
+
         if since_days:
             cutoff = (datetime.now(UTC) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
             where_parts.append("created_at >= ?")
             params.append(cutoff)
-        
+
         where_clause = " AND ".join(where_parts)
-        
+
         cur = conn.execute(
             f"""
             SELECT
@@ -355,7 +362,7 @@ def get_user_usage_summary(
             """,
             tuple(params),
         )
-        
+
         row = cur.fetchone()
         if row:
             if hasattr(row, "_asdict"):
@@ -365,7 +372,7 @@ def get_user_usage_summary(
             else:
                 cols = [d[0] for d in cur.description]
                 data = dict(zip(cols, row, strict=False))
-            
+
             summary.runs_created = data.get("runs_created") or 0
             summary.runs_completed = data.get("runs_completed") or 0
             summary.runs_failed = data.get("runs_failed") or 0
@@ -375,9 +382,9 @@ def get_user_usage_summary(
             summary.total_actions = data.get("total_actions") or 0
             summary.first_activity = data.get("first_activity")
             summary.last_activity = data.get("last_activity")
-        
+
         return summary
-        
+
     except Exception:
         log.exception("Failed to get user usage summary", extra={"user_id": user_id})
         return summary
@@ -397,30 +404,30 @@ def get_tenant_usage_summary(
 ) -> list[UserUsageSummary]:
     """
     Get usage summary for all users in a tenant.
-    
+
     Returns list of UserUsageSummary, one per user.
     """
     close_conn = conn is None
     if conn is None:
         conn = get_conn()
-    
+
     results: list[UserUsageSummary] = []
-    
+
     try:
         if not _table_exists(conn, "user_activity"):
             return results
-        
+
         # Build query
         where_parts = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
-        
+
         if since_days:
             cutoff = (datetime.now(UTC) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
             where_parts.append("created_at >= ?")
             params.append(cutoff)
-        
+
         where_clause = " AND ".join(where_parts)
-        
+
         cur = conn.execute(
             f"""
             SELECT
@@ -441,7 +448,7 @@ def get_tenant_usage_summary(
             """,
             tuple(params),
         )
-        
+
         for row in cur.fetchall():
             if hasattr(row, "_asdict"):
                 data = row._asdict()
@@ -450,23 +457,25 @@ def get_tenant_usage_summary(
             else:
                 cols = [d[0] for d in cur.description]
                 data = dict(zip(cols, row, strict=False))
-            
-            results.append(UserUsageSummary(
-                tenant_id=tenant_id,
-                user_id=data.get("user_id", ""),
-                runs_created=data.get("runs_created") or 0,
-                runs_completed=data.get("runs_completed") or 0,
-                runs_failed=data.get("runs_failed") or 0,
-                exports=data.get("exports") or 0,
-                searches=data.get("searches") or 0,
-                verifications=data.get("verifications") or 0,
-                total_actions=data.get("total_actions") or 0,
-                first_activity=data.get("first_activity"),
-                last_activity=data.get("last_activity"),
-            ))
-        
+
+            results.append(
+                UserUsageSummary(
+                    tenant_id=tenant_id,
+                    user_id=data.get("user_id", ""),
+                    runs_created=data.get("runs_created") or 0,
+                    runs_completed=data.get("runs_completed") or 0,
+                    runs_failed=data.get("runs_failed") or 0,
+                    exports=data.get("exports") or 0,
+                    searches=data.get("searches") or 0,
+                    verifications=data.get("verifications") or 0,
+                    total_actions=data.get("total_actions") or 0,
+                    first_activity=data.get("first_activity"),
+                    last_activity=data.get("last_activity"),
+                )
+            )
+
         return results
-        
+
     except Exception:
         log.exception("Failed to get tenant usage summary", extra={"tenant_id": tenant_id})
         return results

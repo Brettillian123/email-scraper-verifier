@@ -65,6 +65,7 @@ MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", "8"))
 
 try:
     import bcrypt
+
     _BCRYPT_AVAILABLE = True
 except ImportError:
     _BCRYPT_AVAILABLE = False
@@ -93,7 +94,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     """Verify a password against its hash."""
     if not password_hash:
         return False
-    
+
     if password_hash.startswith("pbkdf2:"):
         # PBKDF2 format: pbkdf2:sha256:iterations$salt$hash
         try:
@@ -118,27 +119,27 @@ def verify_password(password: str, password_hash: str) -> bool:
             )
         except Exception:
             return False
-    
+
     return False
 
 
 def validate_password_strength(password: str) -> tuple[bool, str | None]:
     """
     Validate password meets requirements.
-    
+
     Returns (is_valid, error_message).
     """
     if len(password) < MIN_PASSWORD_LENGTH:
         return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
-    
+
     # Basic complexity checks
     has_upper = any(c.isupper() for c in password)
     has_lower = any(c.islower() for c in password)
     has_digit = any(c.isdigit() for c in password)
-    
+
     if not (has_upper and has_lower and has_digit):
         return False, "Password must contain uppercase, lowercase, and a number"
-    
+
     return True, None
 
 
@@ -146,9 +147,11 @@ def validate_password_strength(password: str) -> tuple[bool, str | None]:
 # Data Classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class User:
     """User model."""
+
     id: str
     tenant_id: str
     email: str
@@ -159,7 +162,7 @@ class User:
     is_approved: bool
     created_at: str
     last_login_at: str | None
-    
+
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> User:
         return cls(
@@ -179,6 +182,7 @@ class User:
 @dataclass
 class Session:
     """Session model."""
+
     id: str
     user_id: str
     tenant_id: str
@@ -187,9 +191,10 @@ class Session:
     is_persistent: bool
 
 
-@dataclass 
+@dataclass
 class UserLimits:
     """User limits/quotas."""
+
     max_runs_per_day: int | None
     max_domains_per_run: int | None
     max_concurrent_runs: int | None
@@ -205,6 +210,7 @@ class UserLimits:
 # ---------------------------------------------------------------------------
 # Utility Functions
 # ---------------------------------------------------------------------------
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -233,9 +239,11 @@ def _generate_verification_code() -> str:
 # Database Operations
 # ---------------------------------------------------------------------------
 
+
 def _get_conn():
     """Get database connection."""
     from src.db import get_conn
+
     return get_conn()
 
 
@@ -297,7 +305,7 @@ def create_user(
 ) -> tuple[User | None, str | None]:
     """
     Create a new user.
-    
+
     Args:
         email: User's email address
         password: User's password (will be hashed)
@@ -305,29 +313,29 @@ def create_user(
         display_name: Optional display name
         is_verified: Whether email is verified (default False)
         is_approved: Whether user is approved to access the app (default False)
-    
+
     Returns (user, error_message).
     """
     email = email.lower().strip()
-    
+
     # Validate email format
     if not email or "@" not in email:
         return None, "Invalid email address"
-    
+
     # Validate password
     is_valid, error = validate_password_strength(password)
     if not is_valid:
         return None, error
-    
+
     # Check if user exists
     existing = get_user_by_email(email)
     if existing:
         return None, "An account with this email already exists"
-    
+
     user_id = _generate_user_id()
     password_hash = hash_password(password)
     now = _utc_now_iso()
-    
+
     conn = _get_conn()
     try:
         # Ensure tenant exists
@@ -339,7 +347,7 @@ def create_user(
             """,
             (tenant_id, tenant_id, now),
         )
-        
+
         conn.execute(
             """
             INSERT INTO users (
@@ -348,11 +356,18 @@ def create_user(
             ) VALUES (%s, %s, %s, %s, %s, TRUE, %s, FALSE, %s, %s, %s)
             """,
             (
-                user_id, tenant_id, email, password_hash,
-                display_name, is_verified, is_approved, now, now,
+                user_id,
+                tenant_id,
+                email,
+                password_hash,
+                display_name,
+                is_verified,
+                is_approved,
+                now,
+                now,
             ),
         )
-        
+
         # Create default user limits
         conn.execute(
             """
@@ -362,12 +377,12 @@ def create_user(
             """,
             (user_id, tenant_id, now, now),
         )
-        
+
         conn.commit()
-        
+
         user = get_user_by_id(user_id)
         return user, None
-        
+
     except Exception as e:
         conn.rollback()
         logger.exception("Failed to create user")
@@ -392,7 +407,7 @@ def update_last_login(user_id: str) -> None:
 def check_account_locked(user_id: str) -> tuple[bool, str | None]:
     """
     Check if account is locked due to failed login attempts.
-    
+
     Returns (is_locked, locked_until).
     """
     conn = _get_conn()
@@ -404,7 +419,7 @@ def check_account_locked(user_id: str) -> tuple[bool, str | None]:
         row = cur.fetchone()
         if not row:
             return False, None
-        
+
         locked_until = row.get("locked_until")
         if locked_until:
             locked_dt = datetime.fromisoformat(locked_until.replace("Z", "+00:00"))
@@ -416,7 +431,7 @@ def check_account_locked(user_id: str) -> tuple[bool, str | None]:
                 (user_id,),
             )
             conn.commit()
-        
+
         return False, None
     finally:
         conn.close()
@@ -432,13 +447,13 @@ def record_failed_login(user_id: str) -> None:
         )
         row = cur.fetchone()
         attempts = (row.get("failed_login_attempts") or 0) + 1 if row else 1
-        
+
         locked_until = None
         if attempts >= MAX_FAILED_LOGIN_ATTEMPTS:
             locked_until = (_utc_now() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
-        
+
         conn.execute(
             "UPDATE users SET failed_login_attempts = %s, locked_until = %s WHERE id = %s",
             (attempts, locked_until, user_id),
@@ -465,6 +480,7 @@ def clear_failed_logins(user_id: str) -> None:
 # Session Management
 # ---------------------------------------------------------------------------
 
+
 def create_session(
     user_id: str,
     tenant_id: str,
@@ -477,14 +493,14 @@ def create_session(
     session_id = _generate_token()
     now = _utc_now()
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
+
     if persistent:
         expires = now + timedelta(days=SESSION_DURATION_PERSISTENT_DAYS)
     else:
         expires = now + timedelta(hours=SESSION_DURATION_HOURS)
-    
+
     expires_iso = expires.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
+
     conn = _get_conn()
     try:
         conn.execute(
@@ -495,12 +511,19 @@ def create_session(
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                session_id, user_id, tenant_id, now_iso, expires_iso,
-                now_iso, ip_address, user_agent, persistent,
+                session_id,
+                user_id,
+                tenant_id,
+                now_iso,
+                expires_iso,
+                now_iso,
+                ip_address,
+                user_agent,
+                persistent,
             ),
         )
         conn.commit()
-        
+
         return Session(
             id=session_id,
             user_id=user_id,
@@ -516,12 +539,12 @@ def create_session(
 def get_session(session_id: str) -> tuple[Session | None, User | None]:
     """
     Get session and associated user.
-    
+
     Returns (session, user) or (None, None) if invalid/expired.
     """
     if not session_id:
         return None, None
-    
+
     conn = _get_conn()
     try:
         cur = conn.execute(
@@ -535,7 +558,7 @@ def get_session(session_id: str) -> tuple[Session | None, User | None]:
         row = cur.fetchone()
         if not row:
             return None, None
-        
+
         # Check expiry
         expires_at = row.get("expires_at")
         if expires_at:
@@ -544,7 +567,7 @@ def get_session(session_id: str) -> tuple[Session | None, User | None]:
                 # Session expired, clean it up
                 delete_session(session_id)
                 return None, None
-        
+
         session = Session(
             id=row["id"],
             user_id=row["user_id"],
@@ -553,18 +576,18 @@ def get_session(session_id: str) -> tuple[Session | None, User | None]:
             expires_at=row["expires_at"],
             is_persistent=bool(row.get("is_persistent")),
         )
-        
+
         user = User.from_row(dict(row))
-        
+
         # Update last activity
         conn.execute(
             "UPDATE sessions SET last_activity_at = %s WHERE id = %s",
             (_utc_now_iso(), session_id),
         )
         conn.commit()
-        
+
         return session, user
-        
+
     finally:
         conn.close()
 
@@ -607,12 +630,13 @@ def cleanup_expired_sessions() -> int:
 # Password Reset
 # ---------------------------------------------------------------------------
 
+
 def create_password_reset_token(user_id: str, ip_address: str | None = None) -> str:
     """Create a password reset token."""
     token = _generate_token()
     now = _utc_now()
     expires = now + timedelta(hours=PASSWORD_RESET_EXPIRY_HOURS)
-    
+
     conn = _get_conn()
     try:
         conn.execute(
@@ -637,7 +661,7 @@ def create_password_reset_token(user_id: str, ip_address: str | None = None) -> 
 def validate_password_reset_token(token: str) -> User | None:
     """
     Validate a password reset token.
-    
+
     Returns the user if valid, None otherwise.
     """
     conn = _get_conn()
@@ -653,14 +677,14 @@ def validate_password_reset_token(token: str) -> User | None:
         row = cur.fetchone()
         if not row:
             return None
-        
+
         # Check expiry
         expires_at = row.get("expires_at")
         if expires_at:
             expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
             if expires_dt < _utc_now():
                 return None
-        
+
         return User.from_row(dict(row))
     finally:
         conn.close()
@@ -669,21 +693,21 @@ def validate_password_reset_token(token: str) -> User | None:
 def use_password_reset_token(token: str, new_password: str) -> tuple[bool, str | None]:
     """
     Use a password reset token to set a new password.
-    
+
     Returns (success, error_message).
     """
     # Validate password
     is_valid, error = validate_password_strength(new_password)
     if not is_valid:
         return False, error
-    
+
     user = validate_password_reset_token(token)
     if not user:
         return False, "Invalid or expired reset token"
-    
+
     password_hash = hash_password(new_password)
     now = _utc_now_iso()
-    
+
     conn = _get_conn()
     try:
         # Update password
@@ -691,16 +715,16 @@ def use_password_reset_token(token: str, new_password: str) -> tuple[bool, str |
             "UPDATE users SET password_hash = %s, updated_at = %s WHERE id = %s",
             (password_hash, now, user.id),
         )
-        
+
         # Mark token as used
         conn.execute(
             "UPDATE password_reset_tokens SET used_at = %s WHERE id = %s",
             (now, token),
         )
-        
+
         # Invalidate all existing sessions (security measure)
         conn.execute("DELETE FROM sessions WHERE user_id = %s", (user.id,))
-        
+
         conn.commit()
         return True, None
     except Exception as e:
@@ -714,6 +738,7 @@ def use_password_reset_token(token: str, new_password: str) -> tuple[bool, str |
 # ---------------------------------------------------------------------------
 # Email Verification Codes (6-digit via SES)
 # ---------------------------------------------------------------------------
+
 
 def create_email_verification_code(
     user_id: str,
@@ -747,7 +772,7 @@ def create_email_verification_code(
             (user_id, one_hour_ago),
         )
         row = cur.fetchone()
-        recent_count = (row["cnt"] if row else 0)
+        recent_count = row["cnt"] if row else 0
         if recent_count >= VERIFICATION_CODE_MAX_ACTIVE:
             return None, "Too many verification codes requested. Please wait before trying again."
 
@@ -892,10 +917,11 @@ def mark_user_verified(user_id: str) -> None:
 # User Limits
 # ---------------------------------------------------------------------------
 
+
 def get_user_limits(user_id: str, tenant_id: str) -> UserLimits:
     """
     Get effective limits for a user.
-    
+
     User-specific limits override tenant defaults (NULL = use tenant default).
     """
     conn = _get_conn()
@@ -906,14 +932,14 @@ def get_user_limits(user_id: str, tenant_id: str) -> UserLimits:
             (user_id,),
         )
         user_row = cur.fetchone()
-        
+
         # Get tenant limits (fallback)
         cur = conn.execute(
             "SELECT * FROM tenant_limits WHERE tenant_id = %s",
             (tenant_id,),
         )
         tenant_row = cur.fetchone()
-        
+
         def _get_limit(field: str, default: Any = None) -> Any:
             # User override takes precedence
             if user_row and user_row.get(field) is not None:
@@ -922,7 +948,7 @@ def get_user_limits(user_id: str, tenant_id: str) -> UserLimits:
             if tenant_row and tenant_row.get(field) is not None:
                 return tenant_row[field]
             return default
-        
+
         return UserLimits(
             max_runs_per_day=_get_limit("max_runs_per_day"),
             max_domains_per_run=_get_limit("max_domains_per_run"),
@@ -947,11 +973,11 @@ def check_usage_limit(
 ) -> tuple[int, int | None]:
     """
     Check current usage against limit.
-    
+
     Returns (current_count, limit) where limit=None means unlimited.
     """
     limits = get_user_limits(user_id, tenant_id)
-    
+
     # Map counter type to limit field
     limit_map = {
         ("runs", "daily"): limits.max_runs_per_day,
@@ -959,16 +985,16 @@ def check_usage_limit(
         ("verifications", "monthly"): limits.max_verifications_per_month,
         ("exports", "daily"): limits.max_exports_per_day,
     }
-    
+
     limit = limit_map.get((counter_type, period_type))
-    
+
     # Get current count
     now = _utc_now()
     if period_type == "daily":
         period_start = now.strftime("%Y-%m-%d")
     else:  # monthly
         period_start = now.strftime("%Y-%m")
-    
+
     conn = _get_conn()
     try:
         cur = conn.execute(
@@ -981,7 +1007,7 @@ def check_usage_limit(
         )
         row = cur.fetchone()
         current_count = row["count"] if row else 0
-        
+
         return current_count, limit
     finally:
         conn.close()
@@ -996,7 +1022,7 @@ def increment_usage_counter(
 ) -> int:
     """
     Increment a usage counter.
-    
+
     Returns new count.
     """
     now = _utc_now()
@@ -1004,9 +1030,9 @@ def increment_usage_counter(
         period_start = now.strftime("%Y-%m-%d")
     else:  # monthly
         period_start = now.strftime("%Y-%m")
-    
+
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    
+
     conn = _get_conn()
     try:
         # Upsert counter
@@ -1021,13 +1047,19 @@ def increment_usage_counter(
             DO UPDATE SET count = usage_counters.count + %s, updated_at = %s
             """,
             (
-                tenant_id, user_id, counter_type,
-                period_start, period_type, amount, now_iso,
-                amount, now_iso,
+                tenant_id,
+                user_id,
+                counter_type,
+                period_start,
+                period_type,
+                amount,
+                now_iso,
+                amount,
+                now_iso,
             ),
         )
         conn.commit()
-        
+
         # Return new count
         cur = conn.execute(
             """
@@ -1047,34 +1079,35 @@ def increment_usage_counter(
 # High-Level Auth Operations
 # ---------------------------------------------------------------------------
 
+
 def authenticate(email: str, password: str) -> tuple[User | None, str | None]:
     """
     Authenticate a user by email and password.
-    
+
     Returns (user, error_message).
     """
     user = get_user_by_email(email)
     if not user:
         # Don't reveal whether email exists
         return None, "Invalid email or password"
-    
+
     # Check if account is locked
     is_locked, locked_until = check_account_locked(user.id)
     if is_locked:
         return None, f"Account locked. Try again after {locked_until}"
-    
+
     # Verify password
     password_hash = get_user_password_hash(user.id)
     if not verify_password(password, password_hash):
         record_failed_login(user.id)
         return None, "Invalid email or password"
-    
+
     # Check if account is active
     if not user.is_active:
         return None, "Account is disabled"
-    
+
     # Success
     clear_failed_logins(user.id)
     update_last_login(user.id)
-    
+
     return user, None

@@ -32,9 +32,11 @@ def main() -> None:
         return
 
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     from src.db import get_conn
+
     con = get_conn()
 
     try:
@@ -49,7 +51,9 @@ def main() -> None:
             print(f"No users found with tenant_id='{old_tenant}'. Nothing to do.")
             return
 
-        print(f"Found {count} user(s) with tenant_id='{old_tenant}' → will update to '{dev_tenant}'")
+        print(
+            f"Found {count} user(s) with tenant_id='{old_tenant}' → will update to '{dev_tenant}'"
+        )
 
         if dry_run:
             # Show which users would be affected

@@ -54,9 +54,7 @@ def find_person_like_patterns(html: str) -> None:
             print(f"   • {name}")
 
     # Find potential names near title keywords
-    title_pattern = (
-        r"(.{0,50}(?:Partner|Principal|Director|Manager|Senior|Staff|Tax|Audit).{0,50})"
-    )
+    title_pattern = r"(.{0,50}(?:Partner|Principal|Director|Manager|Senior|Staff|Tax|Audit).{0,50})"
     title_context = re.findall(title_pattern, text)
     if title_context:
         print("\n📋 Text near title keywords (first 10):")

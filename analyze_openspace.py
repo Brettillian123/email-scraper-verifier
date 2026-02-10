@@ -13,16 +13,12 @@ from src.db import get_conn
 # Get the about page HTML
 con = get_conn()
 cur = con.execute(
-    "SELECT source_url, html FROM sources WHERE source_url LIKE %s",
-    ("%openspace%about%",)
+    "SELECT source_url, html FROM sources WHERE source_url LIKE %s", ("%openspace%about%",)
 )
 row = cur.fetchone()
 if not row:
     print("About page not found, checking what pages exist...")
-    cur = con.execute(
-        "SELECT source_url FROM sources WHERE source_url LIKE %s",
-        ("%openspace%",)
-    )
+    cur = con.execute("SELECT source_url FROM sources WHERE source_url LIKE %s", ("%openspace%",))
     for r in cur.fetchall():
         print(f"  Found: {r[0]}")
     sys.exit(1)
@@ -47,6 +43,7 @@ for heading in soup.find_all(["h2", "h3", "h4"])[:30]:
 print("\n📋 TESTING _looks_like_person_name() on headings:")
 try:
     from src.extract.people_cards import _looks_like_person_name
+
     for heading in soup.find_all(["h2", "h3", "h4"])[:30]:
         text = heading.get_text(strip=True)
         if text and len(text) < 50:
@@ -59,13 +56,46 @@ except Exception as e:
 # 3. Look for names with typical patterns
 print("\n📋 CAPITALIZED WORD PAIRS (potential names):")
 text = soup.get_text()
-name_pattern = r'\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b'
+name_pattern = r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b"
 found = re.findall(name_pattern, text)
-skip_first = {'Our', 'The', 'We', 'For', 'About', 'Contact', 'Learn', 'Read', 'View', 
-              'Get', 'See', 'Join', 'Meet', 'Work', 'Sign', 'Log', 'Start', 'Book',
-              'San', 'New', 'Los', 'Las'}
-skip_last = {'Team', 'Us', 'More', 'Now', 'Here', 'Today', 'Free', 'Demo',
-             'Francisco', 'York', 'Angeles', 'Vegas'}
+skip_first = {
+    "Our",
+    "The",
+    "We",
+    "For",
+    "About",
+    "Contact",
+    "Learn",
+    "Read",
+    "View",
+    "Get",
+    "See",
+    "Join",
+    "Meet",
+    "Work",
+    "Sign",
+    "Log",
+    "Start",
+    "Book",
+    "San",
+    "New",
+    "Los",
+    "Las",
+}
+skip_last = {
+    "Team",
+    "Us",
+    "More",
+    "Now",
+    "Here",
+    "Today",
+    "Free",
+    "Demo",
+    "Francisco",
+    "York",
+    "Angeles",
+    "Vegas",
+}
 seen = set()
 count = 0
 for first, last in found:
@@ -89,6 +119,6 @@ print("\n📋 IMAGES WITH POTENTIAL NAME ALT TEXT:")
 for img in soup.find_all("img"):
     alt = img.get("alt", "").strip()
     if alt and 2 <= len(alt.split()) <= 4:
-        skip = {'logo', 'icon', 'image', 'photo', 'banner', 'header', 'background'}
+        skip = {"logo", "icon", "image", "photo", "banner", "header", "background"}
         if not any(s in alt.lower() for s in skip):
             print(f"   • {alt}")

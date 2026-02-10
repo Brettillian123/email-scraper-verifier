@@ -40,3 +40,14 @@ local_backups/
 tmp/
 tmp*.py
 tmp_*.py
+
+# One-off fix scripts (never commit hotfixes)
+fix_*.sh
+fix_*.py
+master_fix*.sh
+setup_*.sh
+master_fix*.sh
+diagnose*.sh
+reset_and_rerun*.sh
+*.tmp
+batch_test_results*.txt

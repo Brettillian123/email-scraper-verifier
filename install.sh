@@ -45,7 +45,7 @@ check_privileges() {
 # Install system dependencies
 install_system_deps() {
     log_info "Installing system dependencies..."
-    
+
     apt-get update
     apt-get install -y \
         python${PYTHON_VERSION} \
@@ -60,24 +60,24 @@ install_system_deps() {
         curl \
         htop \
         jq
-    
+
     log_success "System dependencies installed"
 }
 
 # Create deploy user
 create_deploy_user() {
     log_info "Creating deploy user..."
-    
+
     if id "$DEPLOY_USER" &>/dev/null; then
         log_warn "User $DEPLOY_USER already exists"
     else
         useradd -m -s /bin/bash "$DEPLOY_USER"
         log_success "User $DEPLOY_USER created"
     fi
-    
+
     # Add to sudo group for service management
     usermod -aG sudo "$DEPLOY_USER"
-    
+
     # Allow passwordless sudo for systemctl commands only
     cat > /etc/sudoers.d/email-scraper << 'EOF'
 deploy ALL=(ALL) NOPASSWD: /bin/systemctl start email-scraper*
@@ -90,16 +90,16 @@ deploy ALL=(ALL) NOPASSWD: /bin/systemctl daemon-reload
 deploy ALL=(ALL) NOPASSWD: /bin/journalctl -u email-scraper*
 EOF
     chmod 440 /etc/sudoers.d/email-scraper
-    
+
     log_success "Deploy user configured"
 }
 
 # Setup application directory
 setup_app_dir() {
     log_info "Setting up application directory..."
-    
+
     mkdir -p "$APP_DIR"/{data,logs,bin}
-    
+
     # Clone or update repo
     if [[ -d "$APP_DIR/src" ]]; then
         log_info "Updating existing installation..."
@@ -116,42 +116,42 @@ setup_app_dir() {
             rm -rf "$APP_DIR/repo-temp"
         fi
     fi
-    
+
     # Set ownership
     chown -R "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR"
-    
+
     log_success "Application directory ready"
 }
 
 # Setup Python virtual environment
 setup_venv() {
     log_info "Setting up Python virtual environment..."
-    
+
     cd "$APP_DIR"
-    
+
     # Create venv if doesn't exist
     if [[ ! -d ".venv" ]]; then
         python${PYTHON_VERSION} -m venv .venv
     fi
-    
+
     # Activate and install dependencies
     source .venv/bin/activate
     pip install --upgrade pip wheel
     pip install -r requirements.txt
-    
+
     chown -R "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/.venv"
-    
+
     log_success "Python environment ready"
 }
 
 # Setup Redis
 setup_redis() {
     log_info "Configuring Redis..."
-    
+
     # Enable and start Redis
     systemctl enable redis-server
     systemctl start redis-server
-    
+
     # Wait for Redis to be ready
     for i in {1..10}; do
         if redis-cli ping &>/dev/null; then
@@ -160,22 +160,22 @@ setup_redis() {
         fi
         sleep 1
     done
-    
+
     log_error "Redis failed to start"
 }
 
 # Setup PostgreSQL (optional - can use SQLite)
 setup_postgres() {
     log_info "Configuring PostgreSQL..."
-    
+
     systemctl enable postgresql
     systemctl start postgresql
-    
+
     # Create database and user
     sudo -u postgres psql -c "CREATE USER email_scraper WITH PASSWORD 'changeme';" 2>/dev/null || true # pragma: allowlist secret
     sudo -u postgres psql -c "CREATE DATABASE email_scraper OWNER email_scraper;" 2>/dev/null || true
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE email_scraper TO email_scraper;" 2>/dev/null || true
-    
+
     log_success "PostgreSQL configured"
     log_warn "Remember to change the database password in .env!"
 }
@@ -183,40 +183,40 @@ setup_postgres() {
 # Install systemd services
 install_services() {
     log_info "Installing systemd services..."
-    
+
     # Copy service files
     cp "$APP_DIR/deploy/email-scraper-api.service" /etc/systemd/system/
     cp "$APP_DIR/deploy/email-scraper-worker@.service" /etc/systemd/system/
-    
+
     # Reload systemd
     systemctl daemon-reload
-    
+
     # Enable services
     systemctl enable email-scraper-api
     for i in $(seq 1 $NUM_WORKERS); do
         systemctl enable "email-scraper-worker@${i}"
     done
-    
+
     log_success "Systemd services installed"
 }
 
 # Install management script
 install_esctl() {
     log_info "Installing management script..."
-    
+
     cp "$APP_DIR/deploy/esctl" "$APP_DIR/bin/esctl"
     chmod +x "$APP_DIR/bin/esctl"
-    
+
     # Create symlink in /usr/local/bin
     ln -sf "$APP_DIR/bin/esctl" /usr/local/bin/esctl
-    
+
     log_success "esctl installed (available as 'esctl' command)"
 }
 
 # Setup environment file
 setup_env() {
     log_info "Setting up environment file..."
-    
+
     if [[ ! -f "$APP_DIR/.env" ]]; then
         cp "$APP_DIR/deploy/.env.production.template" "$APP_DIR/.env"
         chown "$DEPLOY_USER:$DEPLOY_USER" "$APP_DIR/.env"
@@ -230,12 +230,12 @@ setup_env() {
 # Setup Nginx reverse proxy (optional)
 setup_nginx() {
     log_info "Configuring Nginx reverse proxy..."
-    
+
     cat > /etc/nginx/sites-available/email-scraper << 'EOF'
 server {
     listen 80;
     server_name _;  # Replace with your domain
-    
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -252,27 +252,27 @@ server {
     }
 }
 EOF
-    
+
     ln -sf /etc/nginx/sites-available/email-scraper /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
-    
+
     nginx -t && systemctl reload nginx
-    
+
     log_success "Nginx configured"
 }
 
 # Apply database schema
 apply_schema() {
     log_info "Applying database schema..."
-    
+
     cd "$APP_DIR"
     source .venv/bin/activate
-    
+
     # Run schema application script if it exists
     if [[ -f "src/db/apply_schema.py" ]]; then
         python -m src.db.apply_schema || log_warn "Schema application had issues"
     fi
-    
+
     log_success "Database schema applied"
 }
 
@@ -319,7 +319,7 @@ main() {
     echo "Email Scraper VPS Deployment"
     echo "============================================================"
     echo ""
-    
+
     check_privileges
     install_system_deps
     create_deploy_user
@@ -332,7 +332,7 @@ main() {
     install_esctl
     setup_nginx
     # apply_schema  # Uncomment after .env is configured
-    
+
     print_summary
 }
 

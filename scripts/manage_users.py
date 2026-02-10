@@ -96,7 +96,7 @@ def cmd_list(args):
         if hasattr(args, "pending") and args.pending:
             cur = conn.execute(
                 """
-                SELECT id, email, tenant_id, display_name, is_active, is_superuser, 
+                SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, created_at, last_login_at
                 FROM users
                 WHERE is_approved = FALSE
@@ -106,7 +106,7 @@ def cmd_list(args):
         else:
             cur = conn.execute(
                 """
-                SELECT id, email, tenant_id, display_name, is_active, is_superuser, 
+                SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, created_at, last_login_at
                 FROM users
                 ORDER BY created_at DESC

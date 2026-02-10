@@ -86,7 +86,7 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
         if pending_only:
             cur = conn.execute(
                 """
-                SELECT id, email, tenant_id, display_name, is_active, is_superuser, 
+                SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
                 WHERE is_approved = FALSE
@@ -96,7 +96,7 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
         else:
             cur = conn.execute(
                 """
-                SELECT id, email, tenant_id, display_name, is_active, is_superuser, 
+                SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
                 ORDER BY created_at DESC

@@ -1,6 +1,6 @@
 #!/bin/bash
 # fix_all.sh - Complete fix for Email Scraper pipeline
-# 
+#
 # This script fixes ALL known issues:
 # 1. The critical bug in task_generate_emails (wrong upsert_generated_email call)
 # 2. Sets official_domain for all companies
@@ -86,7 +86,7 @@ else:
         else:
             new_lines.append(line)
         i += 1
-    
+
     if fixed:
         with open(filepath, 'w') as f:
             f.write('\n'.join(new_lines))

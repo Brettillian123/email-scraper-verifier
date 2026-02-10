@@ -45,7 +45,7 @@ def get_catchall_domains(con) -> dict[str, str]:
     # NOTE: PostgreSQL schema uses chosen_domain and user_hint, NOT 'domain'
     rows = con.execute(
         """
-        SELECT DISTINCT 
+        SELECT DISTINCT
             COALESCE(chosen_domain, user_hint) as dom,
             catch_all_status
         FROM domain_resolutions
@@ -62,7 +62,7 @@ def find_misclassified_emails(con, domain_filter: str | None = None) -> list[dic
 
     # Join with emails table since verification_results only has email_id
     query = """
-        SELECT 
+        SELECT
             vr.id,
             e.email,
             vr.verify_status,

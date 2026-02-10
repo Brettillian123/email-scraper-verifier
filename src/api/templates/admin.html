@@ -748,7 +748,7 @@
 
         function updateCompanyHealth(health) {
             const total = health.total_companies || 1;
-            
+
             document.getElementById('stat-with-candidates').textContent = formatNumber(health.companies_with_candidates || 0);
             document.getElementById('stat-with-valid').textContent = formatNumber(health.companies_with_valid_email || 0);
             document.getElementById('stat-403').textContent = formatNumber(health.companies_403_blocked || 0);
@@ -781,7 +781,7 @@
 
             const byStatus = verif.by_status || {};
             const statuses = Object.keys(byStatus).sort();
-            
+
             if (statuses.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="3" class="muted">No verification data yet.</td></tr>';
                 return;
@@ -791,7 +791,7 @@
                 const count = byStatus[status];
                 const pct = total > 0 ? ((count / total) * 100).toFixed(1) : '0.0';
                 const cls = status === 'valid' ? 'ok' : status === 'invalid' ? 'err' : 'warn';
-                
+
                 tbody.innerHTML += `
                     <tr>
                         <td><span class="status-dot status-${cls}"></span>${status}</td>
@@ -869,7 +869,7 @@
             queues.forEach(q => {
                 const hasWork = q.queued > 0 || q.started > 0;
                 const hasFailed = q.failed > 0;
-                
+
                 tbody.innerHTML += `
                     <tr>
                         <td><span class="status-dot ${hasFailed ? 'status-err' : hasWork ? 'status-info' : 'status-muted'}"></span>${q.name}</td>
@@ -893,7 +893,7 @@
             workers.forEach(w => {
                 const state = (w.state || 'unknown').toLowerCase();
                 const stateClass = state === 'busy' ? 'warn' : state === 'idle' ? 'ok' : 'muted';
-                
+
                 tbody.innerHTML += `
                     <tr>
                         <td class="mono text-xs">${w.name}</td>
@@ -973,7 +973,7 @@
 
         function updateLastUpdate() {
             const now = new Date();
-            document.getElementById('last-update').textContent = 
+            document.getElementById('last-update').textContent =
                 now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
         }
 

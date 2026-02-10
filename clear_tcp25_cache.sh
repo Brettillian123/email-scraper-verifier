@@ -1,7 +1,7 @@
 #!/bin/bash
 # clear_tcp25_cache.sh - Clear TCP25 preflight cache from Redis
 #
-# This clears the cached TCP25 probe results that might be blocking 
+# This clears the cached TCP25 probe results that might be blocking
 # email verification. Use this if you're seeing many "tcp25_blocked" errors.
 #
 # Usage: bash clear_tcp25_cache.sh
@@ -20,7 +20,7 @@ if [ -z "$KEYS" ]; then
 else
     echo "  Found keys:"
     echo "$KEYS" | head -20
-    
+
     echo ""
     echo "[2/2] Deleting keys..."
     echo "$KEYS" | xargs redis-cli DEL 2>/dev/null

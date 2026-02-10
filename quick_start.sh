@@ -112,9 +112,9 @@ if [ -z "$RESPONSE" ]; then
     echo "  python -m src.cli run ${DOMAIN}"
 else
     echo "  Response: $RESPONSE"
-    
+
     RUN_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('run_id') or d.get('id') or '')" 2>/dev/null)
-    
+
     if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "None" ]; then
         echo "  ✓ Run created: $RUN_ID"
     fi

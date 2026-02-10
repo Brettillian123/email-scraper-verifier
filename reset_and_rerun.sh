@@ -6,7 +6,7 @@
 # 2. Optionally deletes existing people/emails to start fresh
 # 3. Triggers a new pipeline run
 #
-# Usage: 
+# Usage:
 #   bash reset_and_rerun.sh [domain]
 #   bash reset_and_rerun.sh [domain] --full  # Also delete people/emails
 
@@ -23,7 +23,7 @@ cd /opt/email-scraper 2>/dev/null || true
 # Check current state
 echo "[1/5] Current state for $DOMAIN:"
 psql $DATABASE_URL -c "
-SELECT 
+SELECT
     c.id as company_id,
     c.domain,
     c.attrs::json->>'ai_people_extracted' as ai_extracted,
@@ -36,8 +36,8 @@ WHERE c.domain = '${DOMAIN}' OR c.official_domain = '${DOMAIN}';
 
 # Get company ID
 COMPANY_ID=$(psql $DATABASE_URL -t -c "
-SELECT id FROM companies 
-WHERE domain = '${DOMAIN}' OR official_domain = '${DOMAIN}' 
+SELECT id FROM companies
+WHERE domain = '${DOMAIN}' OR official_domain = '${DOMAIN}'
 LIMIT 1;
 " | tr -d ' ')
 
@@ -53,7 +53,7 @@ echo ""
 # Reset AI flag
 echo "[2/5] Resetting AI extraction flag..."
 psql $DATABASE_URL -c "
-UPDATE companies 
+UPDATE companies
 SET attrs = COALESCE(attrs::jsonb, '{}'::jsonb) - 'ai_people_extracted' - 'ai_extraction_timestamp'
 WHERE id = ${COMPANY_ID};
 "
@@ -63,26 +63,26 @@ echo "  ✓ AI flag reset"
 if [ "$FULL_RESET" = "--full" ]; then
     echo ""
     echo "[3/5] Performing FULL reset (deleting people, emails, verification results)..."
-    
+
     # Delete verification results first (foreign key)
     psql $DATABASE_URL -c "
-    DELETE FROM verification_results 
+    DELETE FROM verification_results
     WHERE email_id IN (SELECT id FROM emails WHERE company_id = ${COMPANY_ID});
     "
     echo "  ✓ Deleted verification results"
-    
+
     # Delete emails
     psql $DATABASE_URL -c "
     DELETE FROM emails WHERE company_id = ${COMPANY_ID};
     "
     echo "  ✓ Deleted emails"
-    
+
     # Delete people
     psql $DATABASE_URL -c "
     DELETE FROM people WHERE company_id = ${COMPANY_ID};
     "
     echo "  ✓ Deleted people"
-    
+
     # Optionally delete crawled pages too
     read -p "Delete crawled pages too? (y/N): " DELETE_PAGES
     if [ "$DELETE_PAGES" = "y" ] || [ "$DELETE_PAGES" = "Y" ]; then
@@ -100,9 +100,9 @@ fi
 echo ""
 echo "[4/5] Ensuring official_domain is set..."
 psql $DATABASE_URL -c "
-UPDATE companies 
-SET official_domain = domain 
-WHERE id = ${COMPANY_ID} 
+UPDATE companies
+SET official_domain = domain
+WHERE id = ${COMPANY_ID}
   AND (official_domain IS NULL OR official_domain = '');
 "
 echo "  ✓ official_domain set"

@@ -1000,7 +1000,7 @@ def check_usage_limit(
         cur = conn.execute(
             """
             SELECT count FROM usage_counters
-            WHERE tenant_id = %s AND user_id = %s 
+            WHERE tenant_id = %s AND user_id = %s
               AND counter_type = %s AND period_start = %s AND period_type = %s
             """,
             (tenant_id, user_id, counter_type, period_start, period_type),
@@ -1064,7 +1064,7 @@ def increment_usage_counter(
         cur = conn.execute(
             """
             SELECT count FROM usage_counters
-            WHERE tenant_id = %s AND user_id = %s 
+            WHERE tenant_id = %s AND user_id = %s
               AND counter_type = %s AND period_start = %s AND period_type = %s
             """,
             (tenant_id, user_id, counter_type, period_start, period_type),

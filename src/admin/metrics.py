@@ -383,8 +383,8 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     row = _safe_fetchone(
         conn,
         """
-        SELECT COUNT(DISTINCT company_id) AS n 
-        FROM sources 
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM sources
         WHERE company_id IS NOT NULL
         """,
     )
@@ -394,8 +394,8 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     row = _safe_fetchone(
         conn,
         """
-        SELECT COUNT(DISTINCT company_id) AS n 
-        FROM people 
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM people
         WHERE company_id IS NOT NULL
         """,
     )
@@ -417,7 +417,7 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     row = _safe_fetchone(
         conn,
         """
-        SELECT 
+        SELECT
             COALESCE(SUM(companies_403_blocked), 0) AS blocked_403,
             COALESCE(SUM(companies_robots_blocked), 0) AS blocked_robots
         FROM run_metrics
@@ -431,8 +431,8 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     row = _safe_fetchone(
         conn,
         """
-        SELECT COUNT(DISTINCT company_id) AS n 
-        FROM domain_resolutions 
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM domain_resolutions
         WHERE catch_all_status = 'no_mx'
         """,
     )
@@ -442,8 +442,8 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     row = _safe_fetchone(
         conn,
         """
-        SELECT COUNT(DISTINCT company_id) AS n 
-        FROM domain_resolutions 
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM domain_resolutions
         WHERE catch_all_status = 'catch_all'
         """,
     )
@@ -489,7 +489,7 @@ def get_user_run_stats(conn: Any, limit: int = 20) -> list[UserRunStats]:
     rows = _safe_fetchall(
         conn,
         """
-        SELECT 
+        SELECT
             r.user_id,
             u.email AS user_email,
             COUNT(*) AS runs_total,
@@ -533,7 +533,7 @@ def get_recent_runs(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
     rows = _safe_fetchall(
         conn,
         """
-        SELECT 
+        SELECT
             r.id,
             r.status,
             r.label,

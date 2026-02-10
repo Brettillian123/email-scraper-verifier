@@ -50,7 +50,7 @@ new = '''def _classifier_allows_people_cards(html: str, source_url: str) -> bool
     if any(p in url_lower for p in ['/our-team', '/the-team', '/team/', '/staff', '/people', '/leadership', '/partners', '/about-us']):
         log.debug("Bypassing classifier for team URL: %s", source_url)
         return True
-    
+
     if _HAS_SOURCE_FILTERS and classify_page_for_people_extraction is not None:'''
 
 if old in content:
@@ -74,10 +74,10 @@ filepath = "/opt/email-scraper/src/extract/ai_candidates_wrapper.py"
 try:
     with open(filepath, 'r') as f:
         content = f.read()
-    
+
     # Make the press URL pattern more conservative
     old_pattern = r'_PRESS_URL_PATTERNS = re\.compile\(\s*r"[^"]+"\s*r"[^"]+"\s*r"[^"]+",\s*re\.IGNORECASE,\s*\)'
-    
+
     if '_PRESS_URL_PATTERNS' in content:
         # Check if it contains the broad patterns
         if 'blog|articles' in content and 'resources' in content:
@@ -181,8 +181,8 @@ echo "└───────────────────────�
 
 # Get company ID
 COMPANY_ID=$(psql $DATABASE_URL -t -c "
-SELECT id FROM companies 
-WHERE domain = '${DOMAIN}' OR official_domain = '${DOMAIN}' 
+SELECT id FROM companies
+WHERE domain = '${DOMAIN}' OR official_domain = '${DOMAIN}'
 LIMIT 1;
 " 2>/dev/null | tr -d ' ')
 
@@ -191,33 +191,33 @@ if [ -z "$COMPANY_ID" ]; then
     echo "  Will be created on first run"
 else
     echo "  Company ID: $COMPANY_ID"
-    
+
     echo "[3.1] Resetting AI extraction flag..."
     psql $DATABASE_URL -c "
-    UPDATE companies 
+    UPDATE companies
     SET attrs = COALESCE(attrs::jsonb, '{}'::jsonb) - 'ai_people_extracted'
     WHERE id = ${COMPANY_ID};
     " 2>/dev/null >/dev/null && echo "  ✓ Done"
-    
+
     echo "[3.2] Deleting verification results..."
     psql $DATABASE_URL -c "
-    DELETE FROM verification_results 
+    DELETE FROM verification_results
     WHERE email_id IN (SELECT id FROM emails WHERE company_id = ${COMPANY_ID});
     " 2>/dev/null >/dev/null && echo "  ✓ Done"
-    
+
     echo "[3.3] Deleting emails..."
     psql $DATABASE_URL -c "
     DELETE FROM emails WHERE company_id = ${COMPANY_ID};
     " 2>/dev/null >/dev/null && echo "  ✓ Done"
-    
+
     echo "[3.4] Deleting people..."
     psql $DATABASE_URL -c "
     DELETE FROM people WHERE company_id = ${COMPANY_ID};
     " 2>/dev/null >/dev/null && echo "  ✓ Done"
-    
+
     echo "[3.5] Ensuring official_domain is set..."
     psql $DATABASE_URL -c "
-    UPDATE companies SET official_domain = domain 
+    UPDATE companies SET official_domain = domain
     WHERE id = ${COMPANY_ID} AND (official_domain IS NULL OR official_domain = '');
     " 2>/dev/null >/dev/null && echo "  ✓ Done"
 fi

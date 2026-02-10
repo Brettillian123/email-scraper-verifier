@@ -130,7 +130,7 @@ def recalculate_run_metrics(run_id: str, tenant_id: str) -> dict[str, Any]:
         # Count verification results
         verify_stats = con.execute(
             f"""
-            SELECT 
+            SELECT
                 e.company_id,
                 vr.verify_status,
                 COUNT(*) as cnt

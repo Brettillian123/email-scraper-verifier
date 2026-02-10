@@ -418,7 +418,7 @@
                 if (!response.ok) throw new Error('Failed to load users');
                 const data = await response.json();
                 allUsers = data.users;
-                
+
                 // Update counts
                 const pendingCount = allUsers.filter(u => !u.is_approved).length;
                 document.getElementById('pending-count').textContent = pendingCount;
@@ -466,8 +466,8 @@
                     </td>
                     <td>
                         ${user.is_superuser ? '<span class="badge badge-superuser">Superuser</span> ' : ''}
-                        ${!user.is_approved ? '<span class="badge badge-pending">Pending</span>' : 
-                          !user.is_active ? '<span class="badge badge-inactive">Disabled</span>' : 
+                        ${!user.is_approved ? '<span class="badge badge-pending">Pending</span>' :
+                          !user.is_active ? '<span class="badge badge-inactive">Disabled</span>' :
                           '<span class="badge badge-approved">Active</span>'}
                     </td>
                     <td class="date-cell">${formatDate(user.created_at)}</td>
@@ -486,12 +486,12 @@
                     <button class="btn btn-reject" onclick="rejectUser('${user.email}')">Reject</button>
                 `;
             }
-            
+
             if (user.is_superuser) {
                 return '<span style="color: #6b7280; font-size: 0.8rem;">Protected</span>';
             }
 
-            return user.is_active 
+            return user.is_active
                 ? `<button class="btn btn-disable" onclick="toggleActive('${user.email}')">Disable</button>`
                 : `<button class="btn btn-enable" onclick="toggleActive('${user.email}')">Enable</button>`;
         }
@@ -499,8 +499,8 @@
         function formatDate(dateStr) {
             if (!dateStr) return '';
             const date = new Date(dateStr);
-            return date.toLocaleDateString('en-US', { 
-                month: 'short', 
+            return date.toLocaleDateString('en-US', {
+                month: 'short',
                 day: 'numeric',
                 year: 'numeric',
                 hour: '2-digit',
@@ -510,16 +510,16 @@
 
         async function approveUser(email) {
             if (!confirm(`Approve user ${email}?`)) return;
-            
+
             try {
                 const response = await fetch('/admin/users/approve', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                
+
                 if (!response.ok) throw new Error('Failed to approve user');
-                
+
                 showToast(`Approved ${email}`);
                 loadUsers();
             } catch (error) {
@@ -530,16 +530,16 @@
 
         async function rejectUser(email) {
             if (!confirm(`Reject and DELETE user ${email}? This cannot be undone.`)) return;
-            
+
             try {
                 const response = await fetch('/admin/users/reject', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                
+
                 if (!response.ok) throw new Error('Failed to reject user');
-                
+
                 showToast(`Rejected ${email}`);
                 loadUsers();
             } catch (error) {
@@ -555,9 +555,9 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                
+
                 if (!response.ok) throw new Error('Failed to update user');
-                
+
                 const data = await response.json();
                 showToast(`${data.is_active ? 'Enabled' : 'Disabled'} ${email}`);
                 loadUsers();

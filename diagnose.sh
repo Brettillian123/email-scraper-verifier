@@ -51,11 +51,11 @@ echo ""
 echo "[4] Recent Run Status"
 echo "---------------------"
 psql $DATABASE_URL << 'SQL'
-SELECT id, status, 
+SELECT id, status,
        (progress_json::json->>'phase') as phase,
        created_at
-FROM runs 
-ORDER BY created_at DESC 
+FROM runs
+ORDER BY created_at DESC
 LIMIT 3;
 SQL
 
@@ -96,8 +96,8 @@ echo ""
 echo "[8] Verification Status Breakdown"
 echo "----------------------------------"
 psql $DATABASE_URL << 'SQL'
-SELECT COALESCE(verify_status, 'NULL') as status, COUNT(*) 
-FROM verification_results 
+SELECT COALESCE(verify_status, 'NULL') as status, COUNT(*)
+FROM verification_results
 GROUP BY verify_status
 ORDER BY COUNT(*) DESC;
 SQL

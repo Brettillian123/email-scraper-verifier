@@ -55,7 +55,7 @@ for i in {1..12}; do
     sleep 5
     STATUS=$(curl -s "http://localhost:8000/api/browser/runs/$RUN_ID" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','unknown'))" 2>/dev/null)
     echo "  Status after ${i}0s: $STATUS"
-    
+
     if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "completed" ]; then
         break
     fi
@@ -73,9 +73,9 @@ echo "[4/4] Checking database results..."
 echo ""
 psql $DATABASE_URL << SQLCHECK
 SELECT '=== Companies ===' as section;
-SELECT id, domain, official_domain, 
-       (attrs::json->>'ai_people_extracted')::text as ai_extracted 
-FROM companies 
+SELECT id, domain, official_domain,
+       (attrs::json->>'ai_people_extracted')::text as ai_extracted
+FROM companies
 WHERE domain = '$DOMAIN' OR official_domain = '$DOMAIN';
 
 SELECT '=== People ===' as section;
@@ -92,7 +92,7 @@ JOIN companies c ON c.id = e.company_id
 WHERE c.domain = '$DOMAIN' OR c.official_domain = '$DOMAIN';
 
 SELECT '=== Summary ===' as section;
-SELECT 
+SELECT
     (SELECT COUNT(*) FROM companies WHERE domain = '$DOMAIN' OR official_domain = '$DOMAIN') as companies,
     (SELECT COUNT(*) FROM people p JOIN companies c ON c.id = p.company_id WHERE c.domain = '$DOMAIN' OR c.official_domain = '$DOMAIN') as people,
     (SELECT COUNT(*) FROM emails e JOIN companies c ON c.id = e.company_id WHERE c.domain = '$DOMAIN' OR c.official_domain = '$DOMAIN') as emails,

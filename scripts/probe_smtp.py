@@ -643,7 +643,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="probe_smtp.py",
         description=(
-            "R16/R18: Probe an email via RCPT TO (direct) or enqueue to mx worker (default) "
+            "R16/R18: Probe an email via RCPT TO (direct) or enqueue to verify worker (default) "
             "and show R18 verify_status from the DB."
         ),
     )
@@ -667,7 +667,7 @@ def _parse_args() -> argparse.Namespace:
     mode.add_argument(
         "--enqueue",
         action="store_true",
-        help="Enqueue the probe to the mx queue and wait/poll for DB results (default).",
+        help="Enqueue the probe to the verify queue and wait/poll for DB results (default).",
     )
     mode.add_argument(
         "--direct",
@@ -676,9 +676,12 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--run-id", default=None, help="Optional run_id to attach to verification_results."
+    )
+    p.add_argument(
         "--queue",
-        default="mx",
-        help='RQ queue name for enqueue mode (default: "mx").',
+        default="verify",
+        help='RQ queue name for enqueue mode (default: "verify").',
     )
     p.add_argument(
         "--wait-seconds",

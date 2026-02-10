@@ -1,0 +1,574 @@
+<!-- src/api/templates/admin_users.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>User Management – Admin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color-scheme: dark light;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            color: #e5e7eb;
+        }
+
+        .page {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px 16px 40px;
+        }
+
+        h1, h2, h3 {
+            margin: 0 0 12px;
+            font-weight: 600;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .back-link {
+            color: #9ca3af;
+            text-decoration: none;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .back-link:hover {
+            color: #e5e7eb;
+        }
+
+        .subtitle {
+            margin-top: 4px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            color: #9ca3af;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: 1px solid #374151;
+            background: transparent;
+            color: #9ca3af;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            background: #1f2937;
+            color: #e5e7eb;
+        }
+
+        .tab.active {
+            background: #3b82f6;
+            border-color: #3b82f6;
+            color: white;
+        }
+
+        .tab .count {
+            margin-left: 6px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.2);
+            font-size: 0.75rem;
+        }
+
+        .card {
+            background: #020617;
+            border-radius: 12px;
+            padding: 0;
+            box-shadow: 0 10px 25px rgba(15, 23, 42, 0.7);
+            border: 1px solid #1f2937;
+            overflow: hidden;
+        }
+
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid #1f2937;
+        }
+
+        th {
+            background: #111827;
+            color: #9ca3af;
+            font-weight: 500;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        tr:hover {
+            background: #111827;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .badge {
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            display: inline-block;
+        }
+
+        .badge-pending {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge-approved {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .badge-inactive {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .badge-superuser {
+            background: #ddd6fe;
+            color: #5b21b6;
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .btn-approve {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-approve:hover {
+            background: #059669;
+        }
+
+        .btn-reject {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-reject:hover {
+            background: #dc2626;
+        }
+
+        .btn-disable {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-disable:hover {
+            background: #4b5563;
+        }
+
+        .btn-enable {
+            background: #3b82f6;
+            color: white;
+        }
+
+        .btn-enable:hover {
+            background: #2563eb;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .empty-state {
+            padding: 48px 24px;
+            text-align: center;
+            color: #9ca3af;
+        }
+
+        .empty-state svg {
+            width: 48px;
+            height: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .loading {
+            padding: 48px 24px;
+            text-align: center;
+            color: #9ca3af;
+        }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid #374151;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 12px 20px;
+            border-radius: 8px;
+            color: white;
+            font-size: 0.9rem;
+            animation: slideIn 0.3s ease;
+            z-index: 1000;
+        }
+
+        .toast-success {
+            background: #10b981;
+        }
+
+        .toast-error {
+            background: #ef4444;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .email-cell {
+            max-width: 250px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .date-cell {
+            font-size: 0.85rem;
+            color: #9ca3af;
+        }
+
+        .refresh-btn {
+            background: transparent;
+            border: 1px solid #374151;
+            color: #9ca3af;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .refresh-btn:hover {
+            background: #1f2937;
+            color: #e5e7eb;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+        <div class="header">
+            <div class="header-left">
+                <a href="/admin/dashboard" class="back-link">
+                    <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                    </svg>
+                    Back to Dashboard
+                </a>
+                <h1>User Management</h1>
+            </div>
+            <button class="refresh-btn" onclick="loadUsers()">
+                <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+                Refresh
+            </button>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" data-filter="pending" onclick="setFilter('pending')">
+                Pending Approval
+                <span class="count" id="pending-count">0</span>
+            </button>
+            <button class="tab" data-filter="all" onclick="setFilter('all')">
+                All Users
+                <span class="count" id="all-count">0</span>
+            </button>
+        </div>
+
+        <div class="card">
+            <div class="table-container">
+                <div id="loading" class="loading">
+                    <div class="spinner"></div>
+                    Loading users...
+                </div>
+                <div id="empty-state" class="empty-state" style="display: none;">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/>
+                    </svg>
+                    <p id="empty-message">No pending users</p>
+                </div>
+                <table id="users-table" style="display: none;">
+                    <thead>
+                        <tr>
+                            <th>Email</th>
+                            <th>Status</th>
+                            <th>Created</th>
+                            <th>Last Login</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="users-tbody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentFilter = 'pending';
+        let allUsers = [];
+
+        function setFilter(filter) {
+            currentFilter = filter;
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.filter === filter);
+            });
+            renderUsers();
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        async function loadUsers() {
+            const loading = document.getElementById('loading');
+            const table = document.getElementById('users-table');
+            const emptyState = document.getElementById('empty-state');
+
+            loading.style.display = 'block';
+            table.style.display = 'none';
+            emptyState.style.display = 'none';
+
+            try {
+                const response = await fetch('/admin/users/list');
+                if (!response.ok) throw new Error('Failed to load users');
+                const data = await response.json();
+                allUsers = data.users;
+
+                // Update counts
+                const pendingCount = allUsers.filter(u => !u.is_approved).length;
+                document.getElementById('pending-count').textContent = pendingCount;
+                document.getElementById('all-count').textContent = allUsers.length;
+
+                renderUsers();
+            } catch (error) {
+                console.error('Error loading users:', error);
+                showToast('Failed to load users', 'error');
+                loading.style.display = 'none';
+            }
+        }
+
+        function renderUsers() {
+            const loading = document.getElementById('loading');
+            const table = document.getElementById('users-table');
+            const emptyState = document.getElementById('empty-state');
+            const tbody = document.getElementById('users-tbody');
+            const emptyMessage = document.getElementById('empty-message');
+
+            loading.style.display = 'none';
+
+            let filteredUsers = allUsers;
+            if (currentFilter === 'pending') {
+                filteredUsers = allUsers.filter(u => !u.is_approved);
+                emptyMessage.textContent = 'No pending users';
+            } else {
+                emptyMessage.textContent = 'No users found';
+            }
+
+            if (filteredUsers.length === 0) {
+                table.style.display = 'none';
+                emptyState.style.display = 'block';
+                return;
+            }
+
+            table.style.display = 'table';
+            emptyState.style.display = 'none';
+
+            tbody.innerHTML = filteredUsers.map(user => `
+                <tr data-email="${user.email}">
+                    <td class="email-cell" title="${user.email}">
+                        ${user.email}
+                        ${user.display_name ? `<br><small style="color: #6b7280">${user.display_name}</small>` : ''}
+                    </td>
+                    <td>
+                        ${user.is_superuser ? '<span class="badge badge-superuser">Superuser</span> ' : ''}
+                        ${!user.is_approved ? '<span class="badge badge-pending">Pending</span>' :
+                          !user.is_active ? '<span class="badge badge-inactive">Disabled</span>' :
+                          '<span class="badge badge-approved">Active</span>'}
+                    </td>
+                    <td class="date-cell">${formatDate(user.created_at)}</td>
+                    <td class="date-cell">${user.last_login_at ? formatDate(user.last_login_at) : 'Never'}</td>
+                    <td class="actions">
+                        ${getActionButtons(user)}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function getActionButtons(user) {
+            if (!user.is_approved) {
+                return `
+                    <button class="btn btn-approve" onclick="approveUser('${user.email}')">Approve</button>
+                    <button class="btn btn-reject" onclick="rejectUser('${user.email}')">Reject</button>
+                `;
+            }
+
+            if (user.is_superuser) {
+                return '<span style="color: #6b7280; font-size: 0.8rem;">Protected</span>';
+            }
+
+            return user.is_active
+                ? `<button class="btn btn-disable" onclick="toggleActive('${user.email}')">Disable</button>`
+                : `<button class="btn btn-enable" onclick="toggleActive('${user.email}')">Enable</button>`;
+        }
+
+        function formatDate(dateStr) {
+            if (!dateStr) return '';
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
+        async function approveUser(email) {
+            if (!confirm(`Approve user ${email}?`)) return;
+
+            try {
+                const response = await fetch('/admin/users/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+
+                if (!response.ok) throw new Error('Failed to approve user');
+
+                showToast(`Approved ${email}`);
+                loadUsers();
+            } catch (error) {
+                console.error('Error approving user:', error);
+                showToast('Failed to approve user', 'error');
+            }
+        }
+
+        async function rejectUser(email) {
+            if (!confirm(`Reject and DELETE user ${email}? This cannot be undone.`)) return;
+
+            try {
+                const response = await fetch('/admin/users/reject', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+
+                if (!response.ok) throw new Error('Failed to reject user');
+
+                showToast(`Rejected ${email}`);
+                loadUsers();
+            } catch (error) {
+                console.error('Error rejecting user:', error);
+                showToast('Failed to reject user', 'error');
+            }
+        }
+
+        async function toggleActive(email) {
+            try {
+                const response = await fetch('/admin/users/toggle-active', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+
+                if (!response.ok) throw new Error('Failed to update user');
+
+                const data = await response.json();
+                showToast(`${data.is_active ? 'Enabled' : 'Disabled'} ${email}`);
+                loadUsers();
+            } catch (error) {
+                console.error('Error updating user:', error);
+                showToast('Failed to update user', 'error');
+            }
+        }
+
+        // Load users on page load
+        loadUsers();
+    </script>
+</body>
+</html>

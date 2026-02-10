@@ -1,32 +1,48 @@
 # src/admin/metrics.py
+"""
+Admin metrics module - Compatible with db.py's SQLite/PostgreSQL abstraction.
+
+Provides comprehensive metrics for the admin dashboard including:
+- Queue/worker health (Redis/RQ)
+- Verification statistics
+- Company health metrics (403s, candidates, valid emails)
+- User activity and run tracking
+- Domain resolution statistics
+"""
+
 from __future__ import annotations
 
 import datetime as dt
-import sqlite3
+import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 from rq import Queue, Worker
 
+from src.config import settings
 from src.db import get_conn
 
-# Prefer the existing Redis helper if it exists, but don't crash if its
-# name/signature changes; fall back to redis.from_url(settings.RQ_REDIS_URL).
-try:  # pragma: no cover - defensive shim
-    from src.queueing.redis_conn import (
-        redis_connection as _redis_connection,  # type: ignore[attr-defined]
-    )
-except Exception:  # pragma: no cover
-    _redis_connection = None  # type: ignore[assignment]
+log = logging.getLogger(__name__)
 
-try:  # pragma: no cover - import guarded for environments without Redis
-    import redis  # type: ignore
-except Exception:  # pragma: no cover
-    redis = None  # type: ignore
+# Prefer the existing Redis helper if it exists
+try:
+    from src.queueing.redis_conn import redis_connection as _redis_connection
+except Exception:
+    _redis_connection = None
 
-from src.config import settings
+try:
+    import redis
+except Exception:
+    redis = None
 
-QUEUE_NAMES: list[str] = ["ingest", "crawl", "mx", "smtp", "catchall", "export"]
+QUEUE_NAMES: list[str] = ["ingest", "crawl", "mx", "smtp", "catchall", "export", "orchestrator"]
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses (backwards compatible exports)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -41,7 +57,7 @@ class QueueStats:
 class WorkerStats:
     name: str
     queues: list[str]
-    state: str  # e.g. "busy", "idle"
+    state: str
     last_heartbeat: dt.datetime | None
 
 
@@ -49,7 +65,7 @@ class WorkerStats:
 class VerificationStats:
     total_emails: int
     by_status: dict[str, int]
-    valid_rate: float  # 0–1
+    valid_rate: float  # 0-1
 
 
 @dataclass
@@ -74,7 +90,7 @@ class DomainStats:
     valid: int
     invalid: int
     risky_catch_all: int
-    valid_rate: float  # 0–1
+    valid_rate: float  # 0-1
 
 
 @dataclass
@@ -90,28 +106,63 @@ class TimeSeriesPoint:
     valid: int
     invalid: int
     risky_catch_all: int
-    valid_rate: float  # 0–1
+    valid_rate: float  # 0-1
+
+
+@dataclass
+class CompanyHealthStats:
+    """Company-level health metrics."""
+
+    total_companies: int = 0
+    companies_with_pages: int = 0
+    companies_with_candidates: int = 0
+    companies_with_valid_email: int = 0
+    companies_403_blocked: int = 0
+    companies_robots_blocked: int = 0
+    companies_no_mx: int = 0
+    companies_catch_all: int = 0
+
+
+@dataclass
+class UserRunStats:
+    """Per-user run statistics."""
+
+    user_id: str
+    user_email: str | None
+    runs_total: int = 0
+    runs_queued: int = 0
+    runs_running: int = 0
+    runs_succeeded: int = 0
+    runs_failed: int = 0
+    runs_cancelled: int = 0
+    last_run_at: str | None = None
+
+
+@dataclass
+class RunStatusBreakdown:
+    """Run status counts."""
+
+    total: int = 0
+    queued: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Redis / RQ helpers
+# ---------------------------------------------------------------------------
 
 
 def _get_redis_connection() -> Any | None:
-    """
-    Resolve a Redis connection without hard-coding the helper name.
-
-    Preference order:
-      1. src.queueing.redis_conn.redis_connection() if available
-      2. redis.from_url(settings.RQ_REDIS_URL)
-
-    Returns None if Redis is unavailable; callers must handle that.
-    """
-    # Try the project helper first, if present.
+    """Resolve a Redis connection."""
     if _redis_connection is not None:
         try:
             return _redis_connection()
         except Exception:
-            # Fall through to direct redis.from_url()
             pass
 
-    # Fallback: construct directly from URL.
     if redis is None:
         return None
 
@@ -122,18 +173,12 @@ def _get_redis_connection() -> Any | None:
 
 
 def get_queue_stats() -> tuple[list[QueueStats], list[WorkerStats]]:
-    """
-    Inspect Redis / RQ to compute basic queue and worker health.
-
-    This function is intentionally defensive: if Redis is unavailable or RQ
-    raises, it will return zeroed stats instead of crashing the caller.
-    """
+    """Inspect Redis/RQ for queue and worker health."""
     queues: list[QueueStats] = []
     workers: list[WorkerStats] = []
 
     redis_conn = _get_redis_connection()
     if redis_conn is None:
-        # If we cannot even construct a Redis connection, return empty stats.
         for name in QUEUE_NAMES:
             queues.append(QueueStats(name=name, queued=0, started=0, failed=0))
         return queues, workers
@@ -149,14 +194,7 @@ def get_queue_stats() -> tuple[list[QueueStats], list[WorkerStats]]:
             started = 0
             failed = 0
 
-        queues.append(
-            QueueStats(
-                name=name,
-                queued=queued,
-                started=started,
-                failed=failed,
-            )
-        )
+        queues.append(QueueStats(name=name, queued=queued, started=started, failed=failed))
 
     try:
         for w in Worker.all(connection=redis_conn):
@@ -178,43 +216,128 @@ def get_queue_stats() -> tuple[list[QueueStats], list[WorkerStats]]:
                 )
             )
     except Exception:
-        # If Worker.all() fails (e.g. Redis down), we just return the queues.
         pass
 
     return queues, workers
 
 
-def get_verification_stats(conn: sqlite3.Connection) -> VerificationStats:
-    """
-    Compute verification distribution and valid rate from the lead surface.
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
 
-    We use v_emails_latest as the canonical "lead" view so the stats line up
-    with exportable leads rather than raw verification rows.
-    """
+
+def _is_postgres() -> bool:
+    """Check if we're using PostgreSQL."""
+    url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    return url.startswith("postgres://") or url.startswith("postgresql://")
+
+
+def _safe_execute(conn, query: str, params: tuple = ()) -> Any:
+    """Safely execute a query."""
     try:
-        cur = conn.execute(
+        return conn.execute(query, params)
+    except Exception as e:
+        log.debug(f"Query failed: {e}")
+        return None
+
+
+def _safe_fetchone(conn, query: str, params: tuple = ()) -> dict[str, Any] | None:
+    """Safely execute a query and return one row as dict."""
+    try:
+        cur = conn.execute(query, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        if hasattr(row, "keys"):
+            return dict(row)
+        if hasattr(row, "_asdict"):
+            return row._asdict()
+        # Tuple fallback
+        cols = [d[0] for d in cur.description] if cur.description else []
+        return dict(zip(cols, row, strict=False)) if cols else None
+    except Exception as e:
+        log.debug(f"Query failed: {e}")
+        return None
+
+
+def _safe_fetchall(conn, query: str, params: tuple = ()) -> list[dict[str, Any]]:
+    """Safely execute a query and return all rows as dicts."""
+    try:
+        cur = conn.execute(query, params)
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            if hasattr(row, "keys"):
+                result.append(dict(row))
+            elif hasattr(row, "_asdict"):
+                result.append(row._asdict())
+            else:
+                cols = [d[0] for d in cur.description] if cur.description else []
+                if cols:
+                    result.append(dict(zip(cols, row, strict=False)))
+        return result
+    except Exception as e:
+        log.debug(f"Query failed: {e}")
+        return []
+
+
+def _row_int(row: dict[str, Any] | None, key: str, default: int = 0) -> int:
+    """Extract int from row dict."""
+    if row is None:
+        return default
+    val = row.get(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _get_window_date(window_days: int) -> str:
+    """Get ISO date string for N days ago."""
+    d = dt.datetime.now(dt.UTC) - dt.timedelta(days=window_days)
+    return d.strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# Core metrics functions
+# ---------------------------------------------------------------------------
+
+
+def get_verification_stats(conn: Any) -> VerificationStats:
+    """Compute verification distribution from emails/verification_results."""
+    # Try using v_emails_latest view first, fall back to direct query
+    row_data = _safe_fetchall(
+        conn,
+        """
+        SELECT verify_status, COUNT(*) AS n
+        FROM v_emails_latest
+        WHERE verify_status IS NOT NULL
+        GROUP BY verify_status
+        """,
+    )
+
+    if not row_data:
+        # Fallback: query verification_results directly
+        row_data = _safe_fetchall(
+            conn,
             """
             SELECT verify_status, COUNT(*) AS n
-            FROM v_emails_latest
+            FROM verification_results
+            WHERE verify_status IS NOT NULL
             GROUP BY verify_status
-            """
+            """,
         )
-        rows = cur.fetchall()
-    except sqlite3.Error:
-        # Missing view or other DB issue – treat as "no data yet".
-        return VerificationStats(total_emails=0, by_status={}, valid_rate=0.0)
 
     by_status: dict[str, int] = {}
-    for row in rows:
-        try:
-            status = row["verify_status"]
-            count = row["n"]
-        except (KeyError, IndexError, TypeError):
-            continue
-        by_status[str(status)] = int(count)
+    for row in row_data:
+        status = row.get("verify_status")
+        count = _row_int(row, "n", 0)
+        if status:
+            by_status[str(status)] = count
 
     total_emails = sum(by_status.values())
-
     denom = sum(by_status.get(x, 0) for x in ("valid", "invalid", "risky_catch_all"))
     valid = by_status.get("valid", 0)
     valid_rate = float(valid / denom) if denom else 0.0
@@ -226,131 +349,269 @@ def get_verification_stats(conn: sqlite3.Connection) -> VerificationStats:
     )
 
 
-def get_cost_counters(conn: sqlite3.Connection) -> CostCounters:
-    """
-    Compute simple cost proxy counters from existing tables.
+def get_cost_counters(conn: Any) -> CostCounters:
+    """Compute cost proxy counters."""
+    smtp_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM verification_results")
 
-    These are not hard currency costs, just volume proxies:
-    - smtp_probes: total verification_result rows
-    - catchall_checks: domain_resolutions rows with a catch-all check
-    - domains_resolved: domain_resolutions rows with a created_at timestamp
-    - pages_crawled: sources rows (HTML pages fetched by the crawler)
-    """
-    try:
-        smtp_probes_row = conn.execute("SELECT COUNT(*) AS n FROM verification_results").fetchone()
-        catchall_row = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM domain_resolutions
-            WHERE catch_all_checked_at IS NOT NULL
-            """
-        ).fetchone()
-        resolved_row = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM domain_resolutions
-            WHERE created_at IS NOT NULL
-            """
-        ).fetchone()
-        pages_row = conn.execute("SELECT COUNT(*) AS n FROM sources").fetchone()
-    except sqlite3.Error:
-        # Any missing table / view => zeroed cost counters.
-        return CostCounters(
-            smtp_probes=0,
-            catchall_checks=0,
-            domains_resolved=0,
-            pages_crawled=0,
-        )
+    # Catch-all checks: count rows where catch_all_status is set (not null)
+    catchall_row = _safe_fetchone(
+        conn, "SELECT COUNT(*) AS n FROM domain_resolutions WHERE catch_all_status IS NOT NULL"
+    )
 
-    def _row_count(row: Any) -> int:
-        if row is None:
-            return 0
-        try:
-            if isinstance(row, sqlite3.Row):
-                # Prefer alias "n" if present; fall back to first column.
-                if "n" in row.keys():
-                    return int(row["n"] or 0)
-                return int(row[0] or 0)
-            return int(row[0] or 0)
-        except Exception:
-            return 0
+    # Domains resolved: count all domain_resolutions rows
+    resolved_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM domain_resolutions")
 
-    smtp_probes = _row_count(smtp_probes_row)
-    catchall_checks = _row_count(catchall_row)
-    domains_resolved = _row_count(resolved_row)
-    pages_crawled = _row_count(pages_row)
+    pages_row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM sources")
 
     return CostCounters(
-        smtp_probes=smtp_probes,
-        catchall_checks=catchall_checks,
-        domains_resolved=domains_resolved,
-        pages_crawled=pages_crawled,
+        smtp_probes=_row_int(smtp_row, "n"),
+        catchall_checks=_row_int(catchall_row, "n"),
+        domains_resolved=_row_int(resolved_row, "n"),
+        pages_crawled=_row_int(pages_row, "n"),
     )
 
 
-# ---------------------------------------------------------------------------
-# O17: analytics helpers
-# ---------------------------------------------------------------------------
+def get_company_health_stats(conn: Any) -> CompanyHealthStats:
+    """Get company-level health metrics."""
+    stats = CompanyHealthStats()
+
+    # Total companies
+    row = _safe_fetchone(conn, "SELECT COUNT(*) AS n FROM companies")
+    stats.total_companies = _row_int(row, "n")
+
+    # Companies with pages
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM sources
+        WHERE company_id IS NOT NULL
+        """,
+    )
+    stats.companies_with_pages = _row_int(row, "n")
+
+    # Companies with candidates (people)
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM people
+        WHERE company_id IS NOT NULL
+        """,
+    )
+    stats.companies_with_candidates = _row_int(row, "n")
+
+    # Companies with at least 1 valid email
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT COUNT(DISTINCT e.company_id) AS n
+        FROM emails e
+        JOIN verification_results vr ON vr.email_id = e.id
+        WHERE vr.verify_status = 'valid'
+        """,
+    )
+    stats.companies_with_valid_email = _row_int(row, "n")
+
+    # Try to get 403/robots stats from run_metrics if available
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT
+            COALESCE(SUM(companies_403_blocked), 0) AS blocked_403,
+            COALESCE(SUM(companies_robots_blocked), 0) AS blocked_robots
+        FROM run_metrics
+        """,
+    )
+    if row:
+        stats.companies_403_blocked = _row_int(row, "blocked_403")
+        stats.companies_robots_blocked = _row_int(row, "blocked_robots")
+
+    # Domains with no MX (from domain_resolutions)
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM domain_resolutions
+        WHERE catch_all_status = 'no_mx'
+        """,
+    )
+    stats.companies_no_mx = _row_int(row, "n")
+
+    # Companies with catch-all domains
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT COUNT(DISTINCT company_id) AS n
+        FROM domain_resolutions
+        WHERE catch_all_status = 'catch_all'
+        """,
+    )
+    stats.companies_catch_all = _row_int(row, "n")
+
+    return stats
+
+
+def get_run_status_breakdown(conn: Any) -> RunStatusBreakdown:
+    """Get breakdown of run statuses."""
+    breakdown = RunStatusBreakdown()
+
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT status, COUNT(*) AS n
+        FROM runs
+        GROUP BY status
+        """,
+    )
+
+    for row in rows:
+        status = row.get("status", "")
+        count = _row_int(row, "n")
+        breakdown.total += count
+
+        if status == "queued":
+            breakdown.queued = count
+        elif status == "running":
+            breakdown.running = count
+        elif status == "succeeded":
+            breakdown.succeeded = count
+        elif status == "failed":
+            breakdown.failed = count
+        elif status == "cancelled":
+            breakdown.cancelled = count
+
+    return breakdown
+
+
+def get_user_run_stats(conn: Any, limit: int = 20) -> list[UserRunStats]:
+    """Get per-user run statistics."""
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            r.user_id,
+            u.email AS user_email,
+            COUNT(*) AS runs_total,
+            SUM(CASE WHEN r.status = 'queued' THEN 1 ELSE 0 END) AS runs_queued,
+            SUM(CASE WHEN r.status = 'running' THEN 1 ELSE 0 END) AS runs_running,
+            SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS runs_succeeded,
+            SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS runs_failed,
+            SUM(CASE WHEN r.status = 'cancelled' THEN 1 ELSE 0 END) AS runs_cancelled,
+            MAX(r.created_at) AS last_run_at
+        FROM runs r
+        LEFT JOIN users u ON r.user_id = u.id
+        WHERE r.user_id IS NOT NULL
+        GROUP BY r.user_id, u.email
+        ORDER BY runs_total DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    result = []
+    for row in rows:
+        result.append(
+            UserRunStats(
+                user_id=row.get("user_id") or "unknown",
+                user_email=row.get("user_email"),
+                runs_total=_row_int(row, "runs_total"),
+                runs_queued=_row_int(row, "runs_queued"),
+                runs_running=_row_int(row, "runs_running"),
+                runs_succeeded=_row_int(row, "runs_succeeded"),
+                runs_failed=_row_int(row, "runs_failed"),
+                runs_cancelled=_row_int(row, "runs_cancelled"),
+                last_run_at=row.get("last_run_at"),
+            )
+        )
+
+    return result
+
+
+def get_recent_runs(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Get most recent runs with basic info."""
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            r.id,
+            r.status,
+            r.label,
+            r.created_at,
+            r.started_at,
+            r.finished_at,
+            r.error,
+            u.email AS user_email,
+            r.domains_json
+        FROM runs r
+        LEFT JOIN users u ON r.user_id = u.id
+        ORDER BY r.created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    result = []
+    for row in rows:
+        domains_json = row.get("domains_json", "[]")
+        try:
+            domains = json.loads(domains_json) if isinstance(domains_json, str) else domains_json
+            domain_count = len(domains) if isinstance(domains, list) else 0
+        except Exception:
+            domain_count = 0
+
+        result.append(
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "label": row.get("label"),
+                "user_email": row.get("user_email"),
+                "domain_count": domain_count,
+                "created_at": row.get("created_at"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "error": row.get("error"),
+            }
+        )
+
+    return result
 
 
 def get_verification_time_series(
-    conn: sqlite3.Connection,
+    conn: Any,
     window_days: int = 30,
 ) -> list[dict[str, Any]]:
-    """
-    Return a per-day verification time series over the given rolling window.
-
-    Each entry:
-      {
-        "date": "YYYY-MM-DD",
-        "total": int,
-        "valid": int,
-        "invalid": int,
-        "risky_catch_all": int,
-        "valid_rate": float (0–1),
-      }
-
-    Only rows with a non-NULL verify_status are included; unclassified rows
-    are ignored here (but still contribute to other metrics).
-    """
+    """Return daily verification counts."""
     if window_days <= 0:
         window_days = 30
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-              date(COALESCE(verified_at, checked_at)) AS day,
-              verify_status,
-              COUNT(*) AS n
-            FROM verification_results
-            WHERE COALESCE(verified_at, checked_at) >= datetime('now', ?)
-              AND verify_status IS NOT NULL
-            GROUP BY day, verify_status
-            ORDER BY day ASC
-            """,
-            (f"-{int(window_days)} days",),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
+    # Use a date string for the comparison (works on both SQLite and Postgres)
+    cutoff_date = _get_window_date(window_days)
+
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            DATE(COALESCE(verified_at, checked_at)) AS day,
+            verify_status,
+            COUNT(*) AS n
+        FROM verification_results
+        WHERE DATE(COALESCE(verified_at, checked_at)) >= ?
+          AND verify_status IS NOT NULL
+        GROUP BY day, verify_status
+        ORDER BY day ASC
+        """,
+        (cutoff_date,),
+    )
 
     by_day: dict[str, dict[str, int]] = {}
     for row in rows:
-        try:
-            day = row["day"]
-            status = row["verify_status"]
-            n = int(row["n"])
-        except (KeyError, IndexError, TypeError, ValueError):
-            continue
+        day = str(row.get("day", ""))
+        status = row.get("verify_status")
+        n = _row_int(row, "n")
 
         bucket = by_day.setdefault(
-            day,
-            {
-                "total": 0,
-                "valid": 0,
-                "invalid": 0,
-                "risky_catch_all": 0,
-            },
+            day, {"total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0}
         )
         bucket["total"] += n
         if status in bucket:
@@ -380,86 +641,52 @@ def get_verification_time_series(
 
 
 def get_domain_breakdown(
-    conn: sqlite3.Connection,
+    conn: Any,
     window_days: int = 30,
     top_n: int = 20,
 ) -> list[dict[str, Any]]:
-    """
-    Return a per-domain breakdown of verification outcomes.
-
-    Each entry:
-      {
-        "domain": "example.com",
-        "total": int,              # includes unverified leads
-        "valid": int,
-        "invalid": int,
-        "risky_catch_all": int,
-        "valid_rate": float (0–1), # computed from valid/invalid/risky only
-      }
-
-    Unverified leads (verify_status IS NULL) are included in `total` but do
-    not change the valid/invalid/risky buckets or the valid_rate denominator.
-    Domains with only unverified leads will still show up.
-    """
+    """Return per-domain verification breakdown."""
     if window_days <= 0:
         window_days = 30
     if top_n <= 0:
         top_n = 20
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-              LOWER(company_domain) AS domain,
-              verify_status,
-              COUNT(*) AS n
-            FROM v_emails_latest
-            WHERE company_domain IS NOT NULL
-              AND company_domain <> ''
-              AND (
-                    -- Verified rows respect the rolling window
-                    date(COALESCE(verified_at, checked_at)) >= date('now', ?)
-                    -- Completely unverified leads are always included
-                    OR (verified_at IS NULL AND checked_at IS NULL)
-                  )
-            GROUP BY domain, verify_status
-            """,
-            (f"-{int(window_days)} days",),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
+    cutoff_date = _get_window_date(window_days)
+
+    # Use LOWER and SUBSTRING for email domain extraction (works on both)
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            LOWER(SUBSTRING(e.email FROM POSITION('@' IN e.email) + 1)) AS domain,
+            vr.verify_status,
+            COUNT(*) AS n
+        FROM emails e
+        JOIN verification_results vr ON vr.email_id = e.id
+        WHERE DATE(COALESCE(vr.verified_at, vr.checked_at)) >= ?
+        GROUP BY domain, vr.verify_status
+        """,
+        (cutoff_date,),
+    )
 
     by_domain: dict[str, dict[str, int]] = {}
     for row in rows:
-        try:
-            domain = row["domain"]
-            status = row["verify_status"]
-            n = int(row["n"])
-        except (KeyError, IndexError, TypeError, ValueError):
-            continue
+        domain = row.get("domain", "")
+        status = row.get("verify_status")
+        n = _row_int(row, "n")
 
         bucket = by_domain.setdefault(
-            domain,
-            {
-                "total": 0,
-                "valid": 0,
-                "invalid": 0,
-                "risky_catch_all": 0,
-            },
+            domain, {"total": 0, "valid": 0, "invalid": 0, "risky_catch_all": 0}
         )
         bucket["total"] += n
-
-        # Only increment specific outcome buckets for known statuses; NULL or
-        # other statuses just contribute to "total".
-        if status in bucket:
+        if status and status in bucket:
             bucket[status] += n
 
-    # Sort by total volume and truncate.
     items = sorted(
         by_domain.items(),
         key=lambda kv: kv[1]["total"],
         reverse=True,
-    )[: int(top_n)]
+    )[:top_n]
 
     out: list[dict[str, Any]] = []
     for domain, bucket in items:
@@ -482,106 +709,139 @@ def get_domain_breakdown(
     return out
 
 
-def get_error_breakdown(
-    conn: sqlite3.Connection,
-    top_n: int = 20,
-) -> dict[str, int]:
-    """
-    Return a breakdown of verification errors keyed by reason/status.
-
-    We coalesce verify_reason, legacy reason, and status into a single label
-    to keep analytics simple.
-    """
+def get_error_breakdown(conn: Any, top_n: int = 20) -> dict[str, int]:
+    """Return breakdown of verification errors."""
     if top_n <= 0:
         top_n = 20
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-              COALESCE(verify_reason, reason, status, 'unknown') AS key,
-              COUNT(*) AS n
-            FROM verification_results
-            GROUP BY key
-            ORDER BY n DESC
-            LIMIT ?
-            """,
-            (int(top_n),),
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            COALESCE(verify_reason, reason, status, 'unknown') AS key,
+            COUNT(*) AS n
+        FROM verification_results
+        GROUP BY key
+        ORDER BY n DESC
+        LIMIT ?
+        """,
+        (top_n,),
+    )
 
     out: dict[str, int] = {}
     for row in rows:
-        try:
-            key = row["key"]
-            n = int(row["n"])
-        except (KeyError, IndexError, TypeError, ValueError):
-            continue
+        key = row.get("key", "unknown")
+        n = _row_int(row, "n")
         out[str(key)] = n
     return out
 
 
-def get_admin_summary(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
-    """
-    High-level summary used by both the admin API and CLI.
+# ---------------------------------------------------------------------------
+# Main summary functions (API endpoints use these)
+# ---------------------------------------------------------------------------
 
-    Returns a JSON-serializable dict with queues, workers, verification, and
-    cost counters.
-    """
+
+def get_admin_summary(conn: Any | None = None) -> dict[str, Any]:
+    """High-level summary for admin API."""
+    close_conn = conn is None
     if conn is None:
         conn = get_conn()
 
-    queues, workers = get_queue_stats()
-    verif = get_verification_stats(conn)
-    cost = get_cost_counters(conn)
+    try:
+        queues, workers = get_queue_stats()
+        verif = get_verification_stats(conn)
+        cost = get_cost_counters(conn)
+        company_health = get_company_health_stats(conn)
+        run_status = get_run_status_breakdown(conn)
+        user_stats = get_user_run_stats(conn, limit=15)
+        recent_runs = get_recent_runs(conn, limit=10)
 
-    return {
-        "queues": [q.__dict__ for q in queues],
-        "workers": [w.__dict__ for w in workers],
-        "verification": {
-            "total_emails": verif.total_emails,
-            "by_status": verif.by_status,
-            "valid_rate": verif.valid_rate,
-        },
-        "costs": {
-            "smtp_probes": cost.smtp_probes,
-            "catchall_checks": cost.catchall_checks,
-            "domains_resolved": cost.domains_resolved,
-            "pages_crawled": cost.pages_crawled,
-        },
-    }
+        return {
+            "queues": [q.__dict__ for q in queues],
+            "workers": [
+                {
+                    **w.__dict__,
+                    "last_heartbeat": w.last_heartbeat.isoformat() if w.last_heartbeat else None,
+                }
+                for w in workers
+            ],
+            "verification": {
+                "total_emails": verif.total_emails,
+                "by_status": verif.by_status,
+                "valid_rate": verif.valid_rate,
+            },
+            "costs": {
+                "smtp_probes": cost.smtp_probes,
+                "catchall_checks": cost.catchall_checks,
+                "domains_resolved": cost.domains_resolved,
+                "pages_crawled": cost.pages_crawled,
+            },
+            "company_health": {
+                "total_companies": company_health.total_companies,
+                "companies_with_pages": company_health.companies_with_pages,
+                "companies_with_candidates": company_health.companies_with_candidates,
+                "companies_with_valid_email": company_health.companies_with_valid_email,
+                "companies_403_blocked": company_health.companies_403_blocked,
+                "companies_robots_blocked": company_health.companies_robots_blocked,
+                "companies_no_mx": company_health.companies_no_mx,
+                "companies_catch_all": company_health.companies_catch_all,
+            },
+            "run_status": {
+                "total": run_status.total,
+                "queued": run_status.queued,
+                "running": run_status.running,
+                "succeeded": run_status.succeeded,
+                "failed": run_status.failed,
+                "cancelled": run_status.cancelled,
+            },
+            "user_stats": [
+                {
+                    "user_id": u.user_id,
+                    "user_email": u.user_email,
+                    "runs_total": u.runs_total,
+                    "runs_queued": u.runs_queued,
+                    "runs_running": u.runs_running,
+                    "runs_succeeded": u.runs_succeeded,
+                    "runs_failed": u.runs_failed,
+                    "runs_cancelled": u.runs_cancelled,
+                    "last_run_at": u.last_run_at,
+                }
+                for u in user_stats
+            ],
+            "recent_runs": recent_runs,
+        }
+    finally:
+        if close_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_analytics_summary(
-    conn: sqlite3.Connection | None = None,
+    conn: Any | None = None,
     window_days: int = 30,
     top_domains: int = 20,
     top_errors: int = 20,
 ) -> dict[str, Any]:
-    """
-    Aggregate O17 analytics into a single JSON-serializable payload.
-
-    Shape:
-      {
-        "verification_time_series": [...],
-        "domain_breakdown": [...],
-        "error_breakdown": {...},
-      }
-    """
+    """Aggregate analytics for admin dashboard."""
+    close_conn = conn is None
     if conn is None:
         conn = get_conn()
 
-    ts = get_verification_time_series(conn, window_days=window_days)
-    domains = get_domain_breakdown(
-        conn,
-        window_days=window_days,
-        top_n=top_domains,
-    )
-    errors = get_error_breakdown(conn, top_n=top_errors)
+    try:
+        ts = get_verification_time_series(conn, window_days=window_days)
+        domains = get_domain_breakdown(conn, window_days=window_days, top_n=top_domains)
+        errors = get_error_breakdown(conn, top_n=top_errors)
 
-    return {
-        "verification_time_series": ts,
-        "domain_breakdown": domains,
-        "error_breakdown": errors,
-    }
+        return {
+            "verification_time_series": ts,
+            "domain_breakdown": domains,
+            "error_breakdown": errors,
+        }
+    finally:
+        if close_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass

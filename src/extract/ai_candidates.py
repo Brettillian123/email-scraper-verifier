@@ -1,5 +1,5 @@
 """
-O27 — AI-assisted people extraction/refinement.
+O27 â€” AI-assisted people extraction/refinement.
 
 Given a broad list of Candidate objects (from heuristic extraction),
 use an LLM to filter and normalize to real people only.
@@ -51,8 +51,9 @@ OPENAI_MODEL = (
 OPENAI_API_BASE = (os.getenv("OPENAI_API_BASE") or "").strip() or None
 
 # Exported feature flag used by wrapper glue.
+# AI is enabled by default when OPENAI_API_KEY is set, unless AI_PEOPLE_ENABLED=false
 AI_PEOPLE_ENABLED: bool = bool(OPENAI_API_KEY) and bool(
-    getattr(settings, "ai_people_enabled", False)
+    getattr(settings, "ai_people_enabled", True)  # Default True when API key present
 )
 
 _HAS_NEW_OPENAI = OpenAI is not None
@@ -164,13 +165,13 @@ CRITICAL RULE FOR ROLE/SHARED EMAILS:
 - Role emails are shared company inboxes like: info@, office@, contact@, hello@, support@,
   sales@, team@, careers@, hr@, billing@, example@, admin@, general@, enquiries@, help@
 - If a candidate has BOTH a role email AND a real person name:
-  → Return the PERSON with email set to null or empty string
-  → Do NOT attribute the role email to that specific person
-  → The role email is a shared inbox, not their personal email
+  â†’ Return the PERSON with email set to null or empty string
+  â†’ Do NOT attribute the role email to that specific person
+  â†’ The role email is a shared inbox, not their personal email
 - If a candidate has ONLY a role email with no real person name:
-  → Do NOT include it in the output (it's not a person)
+  â†’ Do NOT include it in the output (it's not a person)
 - If a candidate has a personal-looking email (first.last@, flast@, firstl@, jsmith@, etc.):
-  → Return the person WITH that email
+  â†’ Return the person WITH that email
 
 OUTPUT FORMAT:
 For each real person, return:
@@ -409,7 +410,7 @@ def extract_ai_candidates(
         raise ValueError("AI response missing 'people' list")
 
     refined = _apply_ai_people(candidates, people)
-    log.info("AI refinement complete: %d raw → %d people", len(candidates), len(refined))
+    log.info("AI refinement complete: %d raw â†’ %d people", len(candidates), len(refined))
 
     # CRITICAL: do NOT fallback here. Wrapper will apply quality gates & fallback.
     return refined

@@ -1,0 +1,1323 @@
+<!-- src/api/templates/demo.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Email Scraper Dashboard — Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-input: #334155;
+            --border: #475569;
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #22c55e;
+            --warning: #eab308;
+            --danger: #ef4444;
+            --info: #06b6d4;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-dark);
+            color: var(--text);
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+        h2 { margin: 0 0 16px; font-size: 1.1rem; font-weight: 600; }
+        h3 { margin: 0 0 12px; font-size: 1rem; font-weight: 500; }
+
+        .subtitle { color: var(--text-muted); font-size: 0.9rem; }
+
+        /* Demo banner */
+        .demo-banner {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.95rem;
+        }
+        .demo-banner strong { font-size: 1rem; }
+        .demo-banner a {
+            color: white;
+            background: rgba(255,255,255,0.2);
+            padding: 6px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+        }
+        .demo-banner a:hover { background: rgba(255,255,255,0.3); }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.95rem;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: all 0.2s;
+        }
+
+        .tab:hover { color: var(--text); }
+        .tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* Forms */
+        .form-group { margin-bottom: 16px; }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            color: var(--text-muted);
+        }
+
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: monospace;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover { background: var(--primary-hover); }
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover { background: var(--border); }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 0.85rem;
+        }
+
+        .btn-disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        /* Tables */
+        .table-container { overflow-x: auto; }
+
+        table { width: 100%; border-collapse: collapse; }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--bg-input);
+            font-weight: 500;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        tr:hover { background: rgba(255,255,255,0.02); }
+
+        /* Status Badges */
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .badge-success { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+        .badge-warning { background: rgba(234, 179, 8, 0.2); color: var(--warning); }
+        .badge-danger { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+        .badge-info { background: rgba(6, 182, 212, 0.2); color: var(--info); }
+        .badge-muted { background: var(--bg-input); color: var(--text-muted); }
+        .badge-demo {
+            background: rgba(102, 126, 234, 0.25);
+            color: #a5b4fc;
+            font-size: 0.7rem;
+            vertical-align: middle;
+            margin-left: 8px;
+        }
+
+        /* Pagination */
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+        .pagination-info { color: var(--text-muted); }
+
+        .pagination-buttons { display: flex; gap: 8px; }
+
+        /* Search */
+        .search-box {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .search-box input { flex: 1; }
+
+        /* Grid layouts */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+
+        /* Utility */
+        .mono { font-family: monospace; }
+        .text-muted { color: var(--text-muted); }
+        .text-success { color: var(--success); }
+        .text-danger { color: var(--danger); }
+        .truncate {
+            max-width: 200px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .clickable { cursor: pointer; }
+        .clickable:hover { text-decoration: underline; }
+
+        /* Alert */
+        .alert {
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+        .alert-success { background: rgba(34, 197, 94, 0.15); border: 1px solid var(--success); }
+        .alert-danger { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); }
+        .alert-info { background: rgba(6, 182, 212, 0.15); border: 1px solid var(--info); }
+
+        /* Detail panel */
+        .detail-panel {
+            position: fixed;
+            right: 0;
+            top: 0;
+            width: 500px;
+            height: 100vh;
+            background: var(--bg-card);
+            border-left: 1px solid var(--border);
+            padding: 20px;
+            overflow-y: auto;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            z-index: 1000;
+        }
+
+        .detail-panel.open { transform: translateX(0); }
+
+        .detail-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+        .close-btn:hover { color: var(--text); }
+
+        .overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 999;
+            display: none;
+        }
+
+        .overlay.open { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Demo Banner -->
+        <div class="demo-banner">
+            <div>
+                <strong>🎯 Demo Mode</strong> — This is a read-only preview with sample data. No real scraping or verification is performed.
+            </div>
+            <a href="/auth/login">Sign in for full access →</a>
+        </div>
+
+        <header>
+            <div>
+                <h1>Email Scraper Dashboard <span class="badge badge-demo">DEMO</span></h1>
+                <div class="subtitle">Multi-tenant control-plane UI (runs, companies, people, emails)</div>
+            </div>
+            <div class="text-muted">
+                Last update: <span id="last-update">-</span>
+            </div>
+        </header>
+
+        <!-- Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="stat-companies">12</div>
+                <div class="stat-label">Companies</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-people">47</div>
+                <div class="stat-label">People</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-emails">83</div>
+                <div class="stat-label">Emails</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-verified">61</div>
+                <div class="stat-label">Verifications</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-pages">156</div>
+                <div class="stat-label">Pages</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-runs">5</div>
+                <div class="stat-label">Runs</div>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" data-tab="create-run">Create Run</button>
+            <button class="tab" data-tab="run-history">Run History</button>
+            <button class="tab" data-tab="companies">Companies</button>
+            <button class="tab" data-tab="people">People</button>
+            <button class="tab" data-tab="emails">Emails</button>
+            <button class="tab" data-tab="search">Search</button>
+        </div>
+
+        <!-- Tab Contents -->
+
+        <!-- Create Run Tab (disabled in demo) -->
+        <div id="tab-create-run" class="tab-content active">
+            <div class="grid-2">
+                <div class="card">
+                    <h2>Create New Pipeline Run</h2>
+                    <div class="alert alert-info" style="margin-bottom: 16px;">
+                        <strong>Demo Mode:</strong> Run creation is disabled in the demo. Sign in to create and manage pipeline runs.
+                    </div>
+                    <form id="run-form" onsubmit="return false;">
+                        <div class="form-group">
+                            <label>Domains (one per line)</label>
+                            <textarea id="domains" placeholder="example.com
+another.com" disabled style="opacity: 0.5;"></textarea>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Pipeline Mode</label>
+                            <select id="pipeline-mode" disabled style="opacity: 0.5;">
+                                <option value="full">Full (crawl + extract + generate + verify)</option>
+                                <option value="autodiscovery">Autodiscovery only</option>
+                                <option value="generate_verify">Generate + Verify</option>
+                                <option value="verify">Verify only</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="ai-enabled" checked disabled>
+                            <label for="ai-enabled" style="margin:0; opacity: 0.5;">Enable AI extraction</label>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="force-discovery" disabled>
+                            <label for="force-discovery" style="margin:0; opacity: 0.5;">Force re-discovery (ignore cache)</label>
+                        </div>
+
+                        <button type="button" class="btn btn-primary btn-disabled" style="width:100%;">Start Run (Demo)</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h2>Recent Runs</h2>
+                    <div id="recent-runs"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Run History Tab -->
+        <div id="tab-run-history" class="tab-content">
+            <div class="card">
+                <h2>All Pipeline Runs</h2>
+                <div id="runs-table" class="table-container"></div>
+            </div>
+        </div>
+
+        <!-- Companies Tab -->
+        <div id="tab-companies" class="tab-content">
+            <div class="card">
+                <h2>Companies Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="company-search" placeholder="Search by domain or name...">
+                    <button class="btn btn-secondary" onclick="filterCompanies()">Search</button>
+                </div>
+                <div class="search-box" style="justify-content:flex-start;">
+                    <button class="btn btn-primary btn-disabled">Export selected (valid emails)</button>
+                    <span class="text-muted">Demo — export disabled</span>
+                </div>
+                <div id="companies-table" class="table-container"></div>
+            </div>
+        </div>
+
+        <!-- People Tab -->
+        <div id="tab-people" class="tab-content">
+            <div class="card">
+                <h2>People Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="people-search" placeholder="Search by name or title...">
+                    <button class="btn btn-secondary" onclick="filterPeople()">Search</button>
+                </div>
+                <div id="people-table" class="table-container"></div>
+            </div>
+        </div>
+
+        <!-- Emails Tab -->
+        <div id="tab-emails" class="tab-content">
+            <div class="card">
+                <h2>Emails Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="email-search" placeholder="Search by email...">
+                    <select id="email-status-filter" style="width: auto; min-width: 150px;">
+                        <option value="">All statuses</option>
+                        <option value="valid">Valid</option>
+                        <option value="invalid">Invalid</option>
+                        <option value="risky_catch_all">Risky (Catch-all)</option>
+                        <option value="unknown_timeout">Unknown/Timeout</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="filterEmails()">Search</button>
+                </div>
+                <div id="emails-table" class="table-container"></div>
+            </div>
+        </div>
+
+        <!-- Search Tab -->
+        <div id="tab-search" class="tab-content">
+            <div class="card">
+                <h2>Global Search</h2>
+                <div class="search-box">
+                    <input type="text" id="global-search" placeholder="Search companies, people, or emails...">
+                    <button class="btn btn-primary" onclick="globalSearch()">Search</button>
+                </div>
+                <div id="search-results"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail Panel -->
+    <div class="overlay" id="overlay" onclick="closeDetail()"></div>
+    <div class="detail-panel" id="detail-panel">
+        <div class="detail-panel-header">
+            <h2><span id="detail-title">Details</span><span id="detail-title-badge"></span></h2>
+            <button class="close-btn" onclick="closeDetail()">&times;</button>
+        </div>
+        <div id="detail-content"></div>
+    </div>
+
+    <script>
+    // =========================================================================
+    // DEMO DATA
+    // =========================================================================
+
+    const DEMO_COMPANIES = [
+        {
+            id: 1, domain: 'acmewidgets.com', name: 'Acme Widgets Inc.', official_domain: 'acmewidgets.com',
+            ai_extracted: true, people_count: 6, emails_count: 11, pages_count: 18,
+            people: [
+                { full_name: 'Sarah Chen', title: 'Chief Executive Officer' },
+                { full_name: 'Marcus Johnson', title: 'VP of Engineering' },
+                { full_name: 'Priya Patel', title: 'Director of Marketing' },
+                { full_name: 'David Kim', title: 'Head of Sales' },
+                { full_name: 'Emily Rodriguez', title: 'Software Engineer' },
+                { full_name: 'James Wright', title: 'Product Manager' },
+            ],
+            emails: [
+                { email: 's.chen@acmewidgets.com', verify_status: 'valid' },
+                { email: 'sarah.chen@acmewidgets.com', verify_status: 'valid' },
+                { email: 'm.johnson@acmewidgets.com', verify_status: 'valid' },
+                { email: 'p.patel@acmewidgets.com', verify_status: 'valid' },
+                { email: 'd.kim@acmewidgets.com', verify_status: 'valid' },
+                { email: 'e.rodriguez@acmewidgets.com', verify_status: 'invalid' },
+                { email: 'j.wright@acmewidgets.com', verify_status: 'valid' },
+                { email: 'info@acmewidgets.com', verify_status: 'valid' },
+                { email: 'sales@acmewidgets.com', verify_status: 'valid' },
+                { email: 'careers@acmewidgets.com', verify_status: 'risky_catch_all' },
+                { email: 'contact@acmewidgets.com', verify_status: 'unknown_timeout' },
+            ],
+            pages: [
+                { source_url: 'https://acmewidgets.com/about', html_size: 45200 },
+                { source_url: 'https://acmewidgets.com/team', html_size: 32100 },
+                { source_url: 'https://acmewidgets.com/contact', html_size: 12400 },
+            ]
+        },
+        {
+            id: 2, domain: 'brightpath.io', name: 'BrightPath Solutions', official_domain: 'brightpath.io',
+            ai_extracted: true, people_count: 5, emails_count: 8, pages_count: 14,
+            people: [
+                { full_name: 'Alex Nakamura', title: 'Founder & CEO' },
+                { full_name: 'Rachel Foster', title: 'CTO' },
+                { full_name: 'Omar Hassan', title: 'VP of Sales' },
+                { full_name: 'Lisa Thompson', title: 'Senior Developer' },
+                { full_name: 'Carlos Mendez', title: 'Marketing Manager' },
+            ],
+            emails: [
+                { email: 'alex@brightpath.io', verify_status: 'valid' },
+                { email: 'rachel.foster@brightpath.io', verify_status: 'valid' },
+                { email: 'omar@brightpath.io', verify_status: 'valid' },
+                { email: 'lisa.t@brightpath.io', verify_status: 'valid' },
+                { email: 'carlos@brightpath.io', verify_status: 'invalid' },
+                { email: 'hello@brightpath.io', verify_status: 'valid' },
+                { email: 'support@brightpath.io', verify_status: 'valid' },
+                { email: 'demo@brightpath.io', verify_status: 'risky_catch_all' },
+            ],
+            pages: [
+                { source_url: 'https://brightpath.io/about-us', html_size: 38700 },
+                { source_url: 'https://brightpath.io/team', html_size: 27500 },
+            ]
+        },
+        {
+            id: 3, domain: 'novatek-systems.com', name: 'NovaTek Systems', official_domain: 'novatek-systems.com',
+            ai_extracted: true, people_count: 4, emails_count: 7, pages_count: 11,
+            people: [
+                { full_name: 'Diana Volkov', title: 'Managing Director' },
+                { full_name: 'Brian O\'Sullivan', title: 'Head of Engineering' },
+                { full_name: 'Yuki Tanaka', title: 'Product Lead' },
+                { full_name: 'Fatima Al-Rashidi', title: 'Business Development' },
+            ],
+            emails: [
+                { email: 'd.volkov@novatek-systems.com', verify_status: 'valid' },
+                { email: 'brian@novatek-systems.com', verify_status: 'valid' },
+                { email: 'y.tanaka@novatek-systems.com', verify_status: 'valid' },
+                { email: 'fatima@novatek-systems.com', verify_status: 'valid' },
+                { email: 'contact@novatek-systems.com', verify_status: 'valid' },
+                { email: 'jobs@novatek-systems.com', verify_status: 'risky_catch_all' },
+                { email: 'press@novatek-systems.com', verify_status: 'unknown_timeout' },
+            ],
+            pages: [
+                { source_url: 'https://novatek-systems.com/leadership', html_size: 29300 },
+                { source_url: 'https://novatek-systems.com/contact', html_size: 9800 },
+            ]
+        },
+        {
+            id: 4, domain: 'greenleaf.co', name: 'GreenLeaf Analytics', official_domain: 'greenleaf.co',
+            ai_extracted: false, people_count: 3, emails_count: 5, pages_count: 8,
+            people: [
+                { full_name: 'Jordan Blake', title: 'CEO & Co-Founder' },
+                { full_name: 'Nina Petrova', title: 'Data Science Lead' },
+                { full_name: 'Tom Hartley', title: 'Sales Director' },
+            ],
+            emails: [
+                { email: 'jordan@greenleaf.co', verify_status: 'valid' },
+                { email: 'nina.p@greenleaf.co', verify_status: 'valid' },
+                { email: 'tom@greenleaf.co', verify_status: 'invalid' },
+                { email: 'info@greenleaf.co', verify_status: 'valid' },
+                { email: 'partnerships@greenleaf.co', verify_status: 'unknown_timeout' },
+            ],
+            pages: [
+                { source_url: 'https://greenleaf.co/about', html_size: 22100 },
+            ]
+        },
+        {
+            id: 5, domain: 'peakperformance.dev', name: 'Peak Performance Labs', official_domain: 'peakperformance.dev',
+            ai_extracted: true, people_count: 5, emails_count: 9, pages_count: 16,
+            people: [
+                { full_name: 'Aisha Williams', title: 'Chief Technology Officer' },
+                { full_name: 'Raj Gupta', title: 'VP of Product' },
+                { full_name: 'Sophie Laurent', title: 'Engineering Manager' },
+                { full_name: 'Michael Chen', title: 'DevOps Lead' },
+                { full_name: 'Hannah Brown', title: 'UX Designer' },
+            ],
+            emails: [
+                { email: 'aisha@peakperformance.dev', verify_status: 'valid' },
+                { email: 'raj.gupta@peakperformance.dev', verify_status: 'valid' },
+                { email: 'sophie@peakperformance.dev', verify_status: 'valid' },
+                { email: 'm.chen@peakperformance.dev', verify_status: 'valid' },
+                { email: 'hannah@peakperformance.dev', verify_status: 'valid' },
+                { email: 'hello@peakperformance.dev', verify_status: 'valid' },
+                { email: 'careers@peakperformance.dev', verify_status: 'valid' },
+                { email: 'security@peakperformance.dev', verify_status: 'risky_catch_all' },
+                { email: 'admin@peakperformance.dev', verify_status: 'invalid' },
+            ],
+            pages: [
+                { source_url: 'https://peakperformance.dev/team', html_size: 41000 },
+                { source_url: 'https://peakperformance.dev/about', html_size: 33500 },
+                { source_url: 'https://peakperformance.dev/careers', html_size: 28900 },
+            ]
+        },
+        {
+            id: 6, domain: 'silverbolt.com', name: 'Silverbolt Consulting', official_domain: 'silverbolt.com',
+            ai_extracted: true, people_count: 4, emails_count: 6, pages_count: 10,
+            people: [
+                { full_name: 'Ethan Morales', title: 'Partner & CEO' },
+                { full_name: 'Lena Schmidt', title: 'Senior Consultant' },
+                { full_name: 'Kwame Asante', title: 'Strategy Director' },
+                { full_name: 'Olivia Park', title: 'Operations Manager' },
+            ],
+            emails: [
+                { email: 'ethan@silverbolt.com', verify_status: 'valid' },
+                { email: 'l.schmidt@silverbolt.com', verify_status: 'valid' },
+                { email: 'kwame@silverbolt.com', verify_status: 'valid' },
+                { email: 'olivia.park@silverbolt.com', verify_status: 'invalid' },
+                { email: 'info@silverbolt.com', verify_status: 'valid' },
+                { email: 'engage@silverbolt.com', verify_status: 'risky_catch_all' },
+            ],
+            pages: [
+                { source_url: 'https://silverbolt.com/our-team', html_size: 26700 },
+                { source_url: 'https://silverbolt.com/contact', html_size: 11200 },
+            ]
+        },
+        {
+            id: 7, domain: 'crestview-tech.com', name: 'Crestview Technologies', official_domain: 'crestview-tech.com',
+            ai_extracted: true, people_count: 6, emails_count: 10, pages_count: 22,
+            people: [
+                { full_name: 'Nathan Brooks', title: 'CEO' },
+                { full_name: 'Mei Lin', title: 'VP of Engineering' },
+                { full_name: 'Robert Fitzgerald', title: 'CFO' },
+                { full_name: 'Anya Ivanova', title: 'Head of Product' },
+                { full_name: 'Derek Chang', title: 'Lead Architect' },
+                { full_name: 'Samira Patel', title: 'HR Director' },
+            ],
+            emails: [
+                { email: 'n.brooks@crestview-tech.com', verify_status: 'valid' },
+                { email: 'mei.lin@crestview-tech.com', verify_status: 'valid' },
+                { email: 'r.fitzgerald@crestview-tech.com', verify_status: 'valid' },
+                { email: 'anya@crestview-tech.com', verify_status: 'valid' },
+                { email: 'd.chang@crestview-tech.com', verify_status: 'valid' },
+                { email: 'samira@crestview-tech.com', verify_status: 'valid' },
+                { email: 'hello@crestview-tech.com', verify_status: 'valid' },
+                { email: 'investor@crestview-tech.com', verify_status: 'risky_catch_all' },
+                { email: 'legal@crestview-tech.com', verify_status: 'unknown_timeout' },
+                { email: 'old-admin@crestview-tech.com', verify_status: 'invalid' },
+            ],
+            pages: [
+                { source_url: 'https://crestview-tech.com/about', html_size: 52100 },
+                { source_url: 'https://crestview-tech.com/leadership', html_size: 38400 },
+                { source_url: 'https://crestview-tech.com/careers', html_size: 44200 },
+            ]
+        },
+        {
+            id: 8, domain: 'axiomdata.io', name: 'Axiom Data Corp', official_domain: 'axiomdata.io',
+            ai_extracted: false, people_count: 3, emails_count: 5, pages_count: 9,
+            people: [
+                { full_name: 'Grace Kim', title: 'Founder' },
+                { full_name: 'Tobias Muller', title: 'Head of Engineering' },
+                { full_name: 'Jessica Lane', title: 'Growth Lead' },
+            ],
+            emails: [
+                { email: 'grace@axiomdata.io', verify_status: 'valid' },
+                { email: 'tobias@axiomdata.io', verify_status: 'valid' },
+                { email: 'jessica@axiomdata.io', verify_status: 'valid' },
+                { email: 'team@axiomdata.io', verify_status: 'valid' },
+                { email: 'demo@axiomdata.io', verify_status: 'invalid' },
+            ],
+            pages: [
+                { source_url: 'https://axiomdata.io/team', html_size: 19800 },
+            ]
+        },
+        {
+            id: 9, domain: 'urbanforge.co', name: 'UrbanForge Design', official_domain: 'urbanforge.co',
+            ai_extracted: true, people_count: 4, emails_count: 7, pages_count: 13,
+            people: [
+                { full_name: 'Lucas Andersson', title: 'Creative Director' },
+                { full_name: 'Zara Mitchell', title: 'Lead Designer' },
+                { full_name: 'Patrick O\'Brien', title: 'Account Manager' },
+                { full_name: 'Naomi Sato', title: 'Brand Strategist' },
+            ],
+            emails: [
+                { email: 'lucas@urbanforge.co', verify_status: 'valid' },
+                { email: 'zara@urbanforge.co', verify_status: 'valid' },
+                { email: 'patrick@urbanforge.co', verify_status: 'valid' },
+                { email: 'naomi.sato@urbanforge.co', verify_status: 'valid' },
+                { email: 'studio@urbanforge.co', verify_status: 'valid' },
+                { email: 'press@urbanforge.co', verify_status: 'risky_catch_all' },
+                { email: 'old-contact@urbanforge.co', verify_status: 'invalid' },
+            ],
+            pages: [
+                { source_url: 'https://urbanforge.co/about', html_size: 35600 },
+                { source_url: 'https://urbanforge.co/team', html_size: 28100 },
+            ]
+        },
+        {
+            id: 10, domain: 'veloxcloud.com', name: 'Velox Cloud Services', official_domain: 'veloxcloud.com',
+            ai_extracted: true, people_count: 3, emails_count: 5, pages_count: 11,
+            people: [
+                { full_name: 'Daniel Okafor', title: 'CEO' },
+                { full_name: 'Mia Torres', title: 'Cloud Architect' },
+                { full_name: 'Henry Walsh', title: 'Sales Engineer' },
+            ],
+            emails: [
+                { email: 'd.okafor@veloxcloud.com', verify_status: 'valid' },
+                { email: 'mia@veloxcloud.com', verify_status: 'valid' },
+                { email: 'henry.walsh@veloxcloud.com', verify_status: 'valid' },
+                { email: 'sales@veloxcloud.com', verify_status: 'valid' },
+                { email: 'noc@veloxcloud.com', verify_status: 'unknown_timeout' },
+            ],
+            pages: [
+                { source_url: 'https://veloxcloud.com/company', html_size: 31200 },
+                { source_url: 'https://veloxcloud.com/contact', html_size: 8900 },
+            ]
+        },
+        {
+            id: 11, domain: 'heritageai.com', name: 'Heritage AI', official_domain: 'heritageai.com',
+            ai_extracted: true, people_count: 5, emails_count: 8, pages_count: 15,
+            people: [
+                { full_name: 'William Cheng', title: 'Co-Founder & CEO' },
+                { full_name: 'Isabelle Durand', title: 'Chief Scientist' },
+                { full_name: 'Ravi Krishnan', title: 'VP of Engineering' },
+                { full_name: 'Chloe Adams', title: 'ML Engineer' },
+                { full_name: 'Samuel Obi', title: 'Partnerships Lead' },
+            ],
+            emails: [
+                { email: 'william@heritageai.com', verify_status: 'valid' },
+                { email: 'isabelle@heritageai.com', verify_status: 'valid' },
+                { email: 'ravi@heritageai.com', verify_status: 'valid' },
+                { email: 'chloe.a@heritageai.com', verify_status: 'valid' },
+                { email: 'samuel@heritageai.com', verify_status: 'valid' },
+                { email: 'research@heritageai.com', verify_status: 'valid' },
+                { email: 'invest@heritageai.com', verify_status: 'risky_catch_all' },
+                { email: 'bounced@heritageai.com', verify_status: 'invalid' },
+            ],
+            pages: [
+                { source_url: 'https://heritageai.com/about', html_size: 40500 },
+                { source_url: 'https://heritageai.com/team', html_size: 36200 },
+                { source_url: 'https://heritageai.com/research', html_size: 28700 },
+            ]
+        },
+        {
+            id: 12, domain: 'trailmark.dev', name: 'TrailMark Software', official_domain: 'trailmark.dev',
+            ai_extracted: false, people_count: 4, emails_count: 7, pages_count: 9,
+            people: [
+                { full_name: 'Anna Kowalski', title: 'CEO' },
+                { full_name: 'Ben Harper', title: 'Lead Developer' },
+                { full_name: 'Leila Farsi', title: 'QA Manager' },
+                { full_name: 'Chris Nwosu', title: 'DevRel' },
+            ],
+            emails: [
+                { email: 'anna@trailmark.dev', verify_status: 'valid' },
+                { email: 'ben.harper@trailmark.dev', verify_status: 'valid' },
+                { email: 'leila@trailmark.dev', verify_status: 'valid' },
+                { email: 'chris@trailmark.dev', verify_status: 'valid' },
+                { email: 'hello@trailmark.dev', verify_status: 'valid' },
+                { email: 'billing@trailmark.dev', verify_status: 'invalid' },
+                { email: 'events@trailmark.dev', verify_status: 'unknown_timeout' },
+            ],
+            pages: [
+                { source_url: 'https://trailmark.dev/about', html_size: 24300 },
+                { source_url: 'https://trailmark.dev/team', html_size: 18900 },
+            ]
+        },
+    ];
+
+    // Flatten people and emails from companies
+    const DEMO_PEOPLE = [];
+    const DEMO_EMAILS = [];
+    let personId = 1, emailId = 1;
+    DEMO_COMPANIES.forEach(c => {
+        c.people.forEach(p => {
+            DEMO_PEOPLE.push({ id: personId++, ...p, company_domain: c.domain });
+        });
+        c.emails.forEach(e => {
+            DEMO_EMAILS.push({ id: emailId++, ...e, company_domain: c.domain });
+        });
+    });
+
+    const DEMO_RUNS = [
+        { id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', status: 'succeeded', domain_count: 5, created_at: '2026-02-05 14:32:00', options: { modes: ['full'] }, progress: { phase: 'done' } },
+        { id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901', status: 'succeeded', domain_count: 3, created_at: '2026-02-04 09:15:00', options: { modes: ['autodiscovery'] }, progress: { phase: 'done' } },
+        { id: 'c3d4e5f6-a7b8-9012-cdef-123456789012', status: 'succeeded', domain_count: 4, created_at: '2026-02-03 16:48:00', options: { modes: ['generate', 'verify'] }, progress: { phase: 'done' } },
+        { id: 'd4e5f6a7-b8c9-0123-defa-234567890123', status: 'failed', domain_count: 2, created_at: '2026-02-02 11:20:00', options: { modes: ['full'] }, progress: { phase: 'crawl' }, error: 'Timeout during crawl phase for 1 domain' },
+        { id: 'e5f6a7b8-c9d0-1234-efab-345678901234', status: 'succeeded', domain_count: 8, created_at: '2026-02-01 08:05:00', options: { modes: ['verify'] }, progress: { phase: 'done' } },
+    ];
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+
+    function getStatusBadge(status) {
+        const badges = {
+            'queued': '<span class="badge badge-info">Queued</span>',
+            'running': '<span class="badge badge-warning">Running</span>',
+            'succeeded': '<span class="badge badge-success">Succeeded</span>',
+            'completed': '<span class="badge badge-success">Completed</span>',
+            'failed': '<span class="badge badge-danger">Failed</span>',
+            'cancelled': '<span class="badge badge-muted">Cancelled</span>',
+        };
+        return badges[status] || `<span class="badge badge-muted">${status || '-'}</span>`;
+    }
+
+    function getVerifyStatusBadge(status) {
+        const badges = {
+            'valid': '<span class="badge badge-success">Valid</span>',
+            'invalid': '<span class="badge badge-danger">Invalid</span>',
+            'risky_catch_all': '<span class="badge badge-warning">Risky</span>',
+            'unknown_timeout': '<span class="badge badge-muted">Unknown</span>',
+        };
+        return badges[status] || '<span class="badge badge-muted">-</span>';
+    }
+
+    function formatPipelineModes(modes) {
+        const list = Array.isArray(modes) ? modes.map(String) : [];
+        const set = new Set(list);
+        if (set.has('full') || set.has('all')) return 'Full';
+        if (set.size === 1 && set.has('autodiscovery')) return 'Autodiscovery';
+        if (set.has('generate') && set.has('verify') && !set.has('autodiscovery')) return 'Generate+Verify';
+        if (set.size === 1 && set.has('verify')) return 'Verify';
+        return list.length ? list.join(',') : '-';
+    }
+
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // =========================================================================
+    // TAB SWITCHING
+    // =========================================================================
+
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            tab.classList.add('active');
+            document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+
+            if (tab.dataset.tab === 'companies') renderCompanies();
+            if (tab.dataset.tab === 'people') renderPeople();
+            if (tab.dataset.tab === 'emails') renderEmails();
+            if (tab.dataset.tab === 'run-history') renderRuns();
+        });
+    });
+
+    // =========================================================================
+    // RENDER FUNCTIONS
+    // =========================================================================
+
+    function renderRecentRuns() {
+        const container = document.getElementById('recent-runs');
+        container.innerHTML = DEMO_RUNS.map(run => `
+            <div style="padding: 12px; border-bottom: 1px solid var(--border);">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span class="mono" style="font-size: 0.85rem;">${run.id.substring(0, 8)}...</span>
+                    ${getStatusBadge(run.status)}
+                </div>
+                <div class="text-muted" style="font-size: 0.85rem; margin-top: 4px;">
+                    ${run.domain_count} domains - ${run.created_at}${run.options?.modes ? ' - Mode: ' + formatPipelineModes(run.options.modes) : ''}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderRuns() {
+        const container = document.getElementById('runs-table');
+        container.innerHTML = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>Run ID</th>
+                        <th>Status</th>
+                        <th>Domains</th>
+                        <th>Mode</th>
+                        <th>Phase</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${DEMO_RUNS.map(run => `
+                        <tr>
+                            <td class="mono">${run.id.substring(0, 8)}...</td>
+                            <td>${getStatusBadge(run.status)}</td>
+                            <td>${run.domain_count}</td>
+                            <td>${formatPipelineModes(run.options?.modes)}</td>
+                            <td>${run.progress?.phase || '-'}</td>
+                            <td class="text-muted">${run.created_at}</td>
+                            <td>
+                                <button class="btn btn-sm btn-secondary" onclick="viewRunDetail('${run.id}')">View</button>
+                            </td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+    }
+
+    function renderCompanies(filter) {
+        const q = (filter || '').toLowerCase();
+        const items = q
+            ? DEMO_COMPANIES.filter(c => (c.domain + ' ' + c.name).toLowerCase().includes(q))
+            : DEMO_COMPANIES;
+
+        const container = document.getElementById('companies-table');
+        if (!items.length) {
+            container.innerHTML = '<div class="text-muted">No companies found.</div>';
+            return;
+        }
+        container.innerHTML = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Domain</th>
+                        <th>Name</th>
+                        <th>AI</th>
+                        <th>People</th>
+                        <th>Emails</th>
+                        <th>Pages</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${items.map(c => `
+                        <tr>
+                            <td>${c.id}</td>
+                            <td class="mono">${escapeHtml(c.domain)}</td>
+                            <td class="truncate">${escapeHtml(c.name)}</td>
+                            <td>${c.ai_extracted ? '<span class="badge badge-success">Yes</span>' : '<span class="badge badge-muted">No</span>'}</td>
+                            <td>${c.people_count}</td>
+                            <td>${c.emails_count}</td>
+                            <td>${c.pages_count}</td>
+                            <td>
+                                <button class="btn btn-sm btn-secondary" onclick="viewCompanyDetail(${c.id})">View</button>
+                            </td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+            <div class="pagination">
+                <div class="pagination-info">Showing ${items.length} of ${items.length} (Page 1 of 1)</div>
+            </div>
+        `;
+    }
+
+    function renderPeople(filter) {
+        const q = (filter || '').toLowerCase();
+        const items = q
+            ? DEMO_PEOPLE.filter(p => ((p.full_name || '') + ' ' + (p.title || '')).toLowerCase().includes(q))
+            : DEMO_PEOPLE;
+
+        const container = document.getElementById('people-table');
+        if (!items.length) {
+            container.innerHTML = '<div class="text-muted">No people found.</div>';
+            return;
+        }
+        container.innerHTML = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Name</th>
+                        <th>Title</th>
+                        <th>Company</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${items.map(p => `
+                        <tr>
+                            <td>${p.id}</td>
+                            <td>${escapeHtml(p.full_name || '-')}</td>
+                            <td class="truncate">${escapeHtml(p.title || '-')}</td>
+                            <td class="mono">${escapeHtml(p.company_domain || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+            <div class="pagination">
+                <div class="pagination-info">Showing ${items.length} of ${items.length} (Page 1 of 1)</div>
+            </div>
+        `;
+    }
+
+    function renderEmails(filter, statusFilter) {
+        const q = (filter || '').toLowerCase();
+        let items = DEMO_EMAILS;
+        if (q) items = items.filter(e => e.email.toLowerCase().includes(q) || (e.company_domain || '').toLowerCase().includes(q));
+        if (statusFilter) items = items.filter(e => e.verify_status === statusFilter);
+
+        const container = document.getElementById('emails-table');
+        if (!items.length) {
+            container.innerHTML = '<div class="text-muted">No emails found.</div>';
+            return;
+        }
+        container.innerHTML = `
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Email</th>
+                        <th>Company</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${items.map(e => `
+                        <tr>
+                            <td>${e.id}</td>
+                            <td class="mono">${escapeHtml(e.email)}</td>
+                            <td class="mono">${escapeHtml(e.company_domain || '-')}</td>
+                            <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+            <div class="pagination">
+                <div class="pagination-info">Showing ${items.length} of ${items.length} (Page 1 of 1)</div>
+            </div>
+        `;
+    }
+
+    // =========================================================================
+    // SEARCH / FILTER HANDLERS
+    // =========================================================================
+
+    function filterCompanies() {
+        renderCompanies(document.getElementById('company-search').value);
+    }
+
+    function filterPeople() {
+        renderPeople(document.getElementById('people-search').value);
+    }
+
+    function filterEmails() {
+        renderEmails(
+            document.getElementById('email-search').value,
+            document.getElementById('email-status-filter').value,
+        );
+    }
+
+    function globalSearch() {
+        const q = document.getElementById('global-search').value.trim().toLowerCase();
+        if (!q) return;
+
+        const container = document.getElementById('search-results');
+        let html = '';
+
+        const companies = DEMO_COMPANIES.filter(c => (c.domain + ' ' + c.name).toLowerCase().includes(q));
+        if (companies.length) {
+            html += `<h3>Companies (${companies.length})</h3>
+                <table>
+                    <thead><tr><th>ID</th><th>Domain</th><th>Name</th></tr></thead>
+                    <tbody>
+                        ${companies.map(c => `
+                            <tr class="clickable" onclick="viewCompanyDetail(${c.id})">
+                                <td>${c.id}</td>
+                                <td class="mono">${escapeHtml(c.domain)}</td>
+                                <td>${escapeHtml(c.name)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        const people = DEMO_PEOPLE.filter(p => ((p.full_name || '') + ' ' + (p.title || '')).toLowerCase().includes(q));
+        if (people.length) {
+            html += `<h3 style="margin-top: 20px;">People (${people.length})</h3>
+                <table>
+                    <thead><tr><th>ID</th><th>Name</th><th>Title</th></tr></thead>
+                    <tbody>
+                        ${people.map(p => `
+                            <tr>
+                                <td>${p.id}</td>
+                                <td>${escapeHtml(p.full_name || '-')}</td>
+                                <td>${escapeHtml(p.title || '-')}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        const emails = DEMO_EMAILS.filter(e => e.email.toLowerCase().includes(q) || (e.company_domain || '').toLowerCase().includes(q));
+        if (emails.length) {
+            html += `<h3 style="margin-top: 20px;">Emails (${emails.length})</h3>
+                <table>
+                    <thead><tr><th>ID</th><th>Email</th><th>Company</th><th>Status</th></tr></thead>
+                    <tbody>
+                        ${emails.map(e => `
+                            <tr>
+                                <td>${e.id}</td>
+                                <td class="mono">${escapeHtml(e.email)}</td>
+                                <td class="mono">${escapeHtml(e.company_domain || '-')}</td>
+                                <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        if (!html) html = '<div class="text-muted">No results found.</div>';
+        container.innerHTML = html;
+    }
+
+    // =========================================================================
+    // DETAIL PANELS
+    // =========================================================================
+
+    function viewCompanyDetail(id) {
+        const data = DEMO_COMPANIES.find(c => c.id === id);
+        if (!data) return;
+
+        document.getElementById('detail-title').textContent = data.domain || data.name || 'Company Details';
+        document.getElementById('detail-title-badge').innerHTML = '';
+        document.getElementById('detail-content').innerHTML = `
+            <div style="margin-bottom: 20px;">
+                <strong>ID:</strong> ${data.id}<br>
+                <strong>Name:</strong> ${escapeHtml(data.name || '-')}<br>
+                <strong>Domain:</strong> ${escapeHtml(data.domain || '-')}<br>
+                <strong>Official Domain:</strong> ${escapeHtml(data.official_domain || '-')}<br>
+                <strong>AI Extracted:</strong> ${data.ai_extracted ? 'Yes' : 'No'}
+            </div>
+
+            <h3>People (${data.people?.length || 0})</h3>
+            ${data.people?.length ? `
+                <table>
+                    <thead><tr><th>Name</th><th>Title</th></tr></thead>
+                    <tbody>
+                        ${data.people.map(p => `
+                            <tr>
+                                <td>${escapeHtml(p.full_name || '-')}</td>
+                                <td>${escapeHtml(p.title || '-')}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<div class="text-muted">No people found.</div>'}
+
+            <h3 style="margin-top: 20px;">Emails (${data.emails?.length || 0})</h3>
+            ${data.emails?.length ? `
+                <table>
+                    <thead><tr><th>Email</th><th>Status</th></tr></thead>
+                    <tbody>
+                        ${data.emails.map(e => `
+                            <tr>
+                                <td class="mono">${escapeHtml(e.email)}</td>
+                                <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<div class="text-muted">No emails found.</div>'}
+
+            <h3 style="margin-top: 20px;">Crawled Pages (${data.pages?.length || 0})</h3>
+            ${data.pages?.length ? `
+                <table>
+                    <thead><tr><th>URL</th><th>Size</th></tr></thead>
+                    <tbody>
+                        ${data.pages.map(pg => `
+                            <tr>
+                                <td class="truncate">${escapeHtml(pg.source_url)}</td>
+                                <td>${Math.round((pg.html_size || 0) / 1024)} KB</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<div class="text-muted">No pages crawled.</div>'}
+        `;
+        openDetail();
+    }
+
+    function viewRunDetail(id) {
+        const data = DEMO_RUNS.find(r => r.id === id);
+        if (!data) return;
+
+        document.getElementById('detail-title').textContent = 'Run Details';
+        document.getElementById('detail-title-badge').innerHTML = '';
+        document.getElementById('detail-content').innerHTML = `
+            <div style="margin-bottom: 20px;">
+                <strong>ID:</strong> <span class="mono">${data.id}</span><br>
+                <strong>Status:</strong> ${getStatusBadge(data.status)}<br>
+                <strong>Created:</strong> ${data.created_at || '-'}<br>
+                <strong>Domains:</strong> ${data.domain_count}
+            </div>
+
+            <h3>Options</h3>
+            <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.options, null, 2)}</pre>
+
+            <h3 style="margin-top: 20px;">Progress</h3>
+            <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.progress, null, 2)}</pre>
+
+            ${data.error ? `
+                <h3 style="margin-top: 20px; color: var(--danger);">Error</h3>
+                <div style="background: rgba(239,68,68,0.1); padding: 12px; border-radius: 6px; color: var(--danger);">${escapeHtml(data.error)}</div>
+            ` : ''}
+        `;
+        openDetail();
+    }
+
+    function openDetail() {
+        document.getElementById('overlay').classList.add('open');
+        document.getElementById('detail-panel').classList.add('open');
+    }
+
+    function closeDetail() {
+        document.getElementById('overlay').classList.remove('open');
+        document.getElementById('detail-panel').classList.remove('open');
+    }
+
+    // =========================================================================
+    // ENTER KEY HANDLERS
+    // =========================================================================
+
+    document.getElementById('company-search').addEventListener('keypress', e => { if (e.key === 'Enter') filterCompanies(); });
+    document.getElementById('people-search').addEventListener('keypress', e => { if (e.key === 'Enter') filterPeople(); });
+    document.getElementById('email-search').addEventListener('keypress', e => { if (e.key === 'Enter') filterEmails(); });
+    document.getElementById('global-search').addEventListener('keypress', e => { if (e.key === 'Enter') globalSearch(); });
+
+    // =========================================================================
+    // INITIAL RENDER
+    // =========================================================================
+
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+    renderRecentRuns();
+
+    </script>
+</body>
+</html>

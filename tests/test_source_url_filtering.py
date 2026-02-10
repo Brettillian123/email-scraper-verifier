@@ -183,7 +183,7 @@ class TestShouldPersistAsPersonWithSourceUrl:
     def test_allows_press_page_candidate(self):
         """Press/newsroom pages are legitimate sources."""
         result = should_persist_as_person(
-            name="Media Contact",
+            name="Sarah Chen",
             email=None,
             title="VP Communications",
             ai_approved=True,

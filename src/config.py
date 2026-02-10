@@ -172,7 +172,7 @@ CRAWL_MAX_PAGES_PER_DOMAIN: int = _getenv_int("CRAWL_MAX_PAGES_PER_DOMAIN", 30)
 CRAWL_MAX_DEPTH: int = _getenv_int("CRAWL_MAX_DEPTH", 2)
 CRAWL_HTML_MAX_BYTES: int = _getenv_int("CRAWL_HTML_MAX_BYTES", 1_500_000)  # ~1.5MB cap
 
-# Network timeouts (seconds) — used by crawler; floats are allowed.
+# Network timeouts (seconds) â€” used by crawler; floats are allowed.
 CRAWL_CONNECT_TIMEOUT_S: float = _getenv_float("CRAWL_CONNECT_TIMEOUT_S", 10.0)
 CRAWL_READ_TIMEOUT_S: float = _getenv_float("CRAWL_READ_TIMEOUT_S", 15.0)
 
@@ -511,10 +511,16 @@ def load_settings() -> AppConfig:
         verify_max_attempts=_getenv_int("VERIFY_MAX_ATTEMPTS", 5),
         verify_base_backoff_seconds=_getenv_int("VERIFY_BASE_BACKOFF_SECONDS", 2),
         verify_max_backoff_seconds=_getenv_int("VERIFY_MAX_BACKOFF_SECONDS", 90),
-        smtp_connect_timeout_seconds=_getenv_int("SMTP_CONNECT_TIMEOUT_SECONDS", 5),
+        # Prefer *_SECONDS variants if set; otherwise fall back to the
+        # canonical module-level SMTP_CONNECT_TIMEOUT / SMTP_COMMAND_TIMEOUT
+        # so operators only need to set those two env vars.
+        smtp_connect_timeout_seconds=_getenv_int(
+            "SMTP_CONNECT_TIMEOUT_SECONDS",
+            SMTP_CONNECT_TIMEOUT,
+        ),
         smtp_cmd_timeout_seconds=_getenv_int(
             "SMTP_CMD_TIMEOUT_SECONDS",
-            _getenv_int("SMTP_COMMAND_TIMEOUT_SECONDS", 10),
+            _getenv_int("SMTP_COMMAND_TIMEOUT_SECONDS", SMTP_COMMAND_TIMEOUT),
         ),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
     )

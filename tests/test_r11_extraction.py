@@ -66,10 +66,10 @@ def test_name_near_link_is_captured():
     """
     Test that names near mailto links are correctly associated.
     """
-    # Use non-placeholder names (avoid doe)
+    # Use non-placeholder names (avoid doe, public, and other stopwords)
     html = """
     <div class="team">
-      <p><a href="mailto:john.public@company.com">John Public, Engineer</a></p>
+      <p><a href="mailto:bob.wilson@company.com">Bob Wilson, Engineer</a></p>
       <p><a href="mailto:alice.smith@company.com">Alice Smith, CTO</a></p>
     </div>
     """
@@ -78,9 +78,9 @@ def test_name_near_link_is_captured():
     )
     d = by_email(cands)
 
-    assert "john.public@company.com" in d
-    assert d["john.public@company.com"].first_name == "John"
-    assert d["john.public@company.com"].last_name == "Public"
+    assert "bob.wilson@company.com" in d
+    assert d["bob.wilson@company.com"].first_name == "Bob"
+    assert d["bob.wilson@company.com"].last_name == "Wilson"
 
     assert "alice.smith@company.com" in d
     assert d["alice.smith@company.com"].first_name == "Alice"
@@ -110,7 +110,7 @@ def test_role_aliases_are_marked_not_filtered():
     """
     html = """
     <footer>
-      <p>General: info@company.com · Sales: sales@company.com</p>
+      <p>General: info@company.com Â· Sales: sales@company.com</p>
     </footer>
     """
     cands = extract_candidates(

@@ -1,0 +1,1717 @@
+<!-- src/api/templates/dashboard.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Email Scraper Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-input: #334155;
+            --border: #475569;
+            --text: #e2e8f0;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #22c55e;
+            --warning: #eab308;
+            --danger: #ef4444;
+            --info: #06b6d4;
+        }
+
+
+
+
+        * { box-sizing: border-box; }
+
+
+
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-dark);
+            color: var(--text);
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+
+
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+
+
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+
+
+
+        h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+        h2 { margin: 0 0 16px; font-size: 1.1rem; font-weight: 600; }
+        h3 { margin: 0 0 12px; font-size: 1rem; font-weight: 500; }
+
+
+
+
+        .subtitle { color: var(--text-muted); font-size: 0.9rem; }
+
+
+
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0;
+        }
+
+
+
+
+        .tab {
+            padding: 10px 20px;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.95rem;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: all 0.2s;
+        }
+
+
+
+
+        .tab:hover { color: var(--text); }
+        .tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+
+
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+
+
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+
+
+
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+
+
+
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+
+
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--primary);
+        }
+
+
+
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+
+
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+
+
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            color: var(--text-muted);
+        }
+
+
+
+
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+
+
+
+
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+
+
+
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: monospace;
+        }
+
+
+
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+
+
+
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+
+
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+
+
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+
+
+
+        .btn-primary:hover { background: var(--primary-hover); }
+
+
+
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+
+
+
+        .btn-secondary:hover { background: var(--border); }
+
+
+
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 0.85rem;
+        }
+
+
+
+
+        /* Tables */
+        .table-container {
+            overflow-x: auto;
+        }
+
+
+
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+
+
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+
+
+
+        th {
+            background: var(--bg-input);
+            font-weight: 500;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+
+
+
+        tr:hover { background: rgba(255,255,255,0.02); }
+
+
+
+
+        /* Status Badges */
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+
+
+
+        .badge-success { background: rgba(34, 197, 94, 0.2); color: var(--success); }
+        .badge-warning { background: rgba(234, 179, 8, 0.2); color: var(--warning); }
+        .badge-danger { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+        .badge-info { background: rgba(6, 182, 212, 0.2); color: var(--info); }
+
+
+        .badge-muted { background: var(--bg-input); color: var(--text-muted); }
+
+
+        /* Title badges (detail panel) */
+        #detail-title-badge { margin-left: 10px; }
+        #detail-title-badge .badge { vertical-align: middle; }
+
+
+
+
+        /* Pagination */
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+
+
+
+        .pagination-info { color: var(--text-muted); }
+
+
+
+
+        .pagination-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+
+
+
+        /* Search */
+        .search-box {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+
+
+
+        .search-box input {
+            flex: 1;
+        }
+
+
+
+
+        /* Grid layouts */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+
+
+
+        @media (max-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+
+
+
+
+        /* Loading */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+
+
+
+
+        /* Utility */
+        .mono { font-family: monospace; }
+        .text-muted { color: var(--text-muted); }
+        .text-success { color: var(--success); }
+        .text-danger { color: var(--danger); }
+        .truncate {
+            max-width: 200px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .clickable { cursor: pointer; }
+        .clickable:hover { text-decoration: underline; }
+
+
+
+
+        /* Alert */
+        .alert {
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+        .alert-success { background: rgba(34, 197, 94, 0.15); border: 1px solid var(--success); }
+        .alert-danger { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); }
+        .alert-info { background: rgba(6, 182, 212, 0.15); border: 1px solid var(--info); }
+
+
+
+
+        /* Detail panel */
+        .detail-panel {
+            position: fixed;
+            right: 0;
+            top: 0;
+            width: 500px;
+            height: 100vh;
+            background: var(--bg-card);
+            border-left: 1px solid var(--border);
+            padding: 20px;
+            overflow-y: auto;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            z-index: 1000;
+        }
+
+
+
+
+        .detail-panel.open { transform: translateX(0); }
+
+
+
+
+        .detail-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+
+
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+
+
+
+        .close-btn:hover { color: var(--text); }
+
+
+
+
+        .overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 999;
+            display: none;
+        }
+
+
+
+
+        .overlay.open { display: block; }
+
+        /* User account dropdown styles */
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .user-dropdown {
+            position: relative;
+        }
+
+        .user-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.15s, border-color 0.15s;
+        }
+
+        .user-btn:hover {
+            background: var(--border);
+        }
+
+        .user-avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: var(--primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.75rem;
+            color: white;
+        }
+
+        .user-email {
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .dropdown-arrow {
+            transition: transform 0.15s;
+        }
+
+        .user-dropdown.open .dropdown-arrow {
+            transform: rotate(180deg);
+        }
+
+        .dropdown-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            right: 0;
+            min-width: 200px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-8px);
+            transition: opacity 0.15s, transform 0.15s, visibility 0.15s;
+            z-index: 100;
+        }
+
+        .user-dropdown.open .dropdown-menu {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .dropdown-header {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .dropdown-header-email {
+            font-size: 0.85rem;
+            color: var(--text);
+            word-break: break-all;
+        }
+
+        .dropdown-header-role {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .dropdown-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            color: var(--text);
+            text-decoration: none;
+            font-size: 0.85rem;
+            transition: background 0.15s;
+        }
+
+        .dropdown-item:hover {
+            background: var(--bg-input);
+        }
+
+        .dropdown-item.danger {
+            color: var(--danger);
+        }
+
+        .dropdown-item.danger:hover {
+            background: rgba(239, 68, 68, 0.1);
+        }
+
+        .dropdown-divider {
+            height: 1px;
+            background: var(--border);
+            margin: 4px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>Email Scraper Dashboard</h1>
+                <div class="subtitle">Multi-tenant control-plane UI (runs, companies, people, emails)</div>
+            </div>
+            <div class="header-right">
+                <div class="text-muted">
+                    Last update: <span id="last-update">-</span>
+                </div>
+                {% if user %}
+                <div class="user-dropdown" id="userDropdown">
+                    <button class="user-btn" onclick="toggleUserDropdown(event)">
+                        <div class="user-avatar">{{ user.email[0]|upper }}</div>
+                        <span class="user-email">{{ user.email }}</span>
+                        <svg class="dropdown-arrow" width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                    </button>
+                    <div class="dropdown-menu">
+                        <div class="dropdown-header">
+                            <div class="dropdown-header-email">{{ user.email }}</div>
+                            <div class="dropdown-header-role">
+                                {% if user.is_superuser %}Superuser{% else %}User{% endif %}
+                            </div>
+                        </div>
+                        {% if user.is_superuser %}
+                        <a href="/admin/users" class="dropdown-item">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/>
+                            </svg>
+                            Manage Users
+                        </a>
+                        {% endif %}
+                        <a href="/admin/" class="dropdown-item">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                            </svg>
+                            Admin Metrics
+                        </a>
+                        <div class="dropdown-divider"></div>
+                        <a href="/auth/logout" class="dropdown-item danger">
+                            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                            </svg>
+                            Sign Out
+                        </a>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </header>
+
+
+
+
+        <!-- Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="stat-companies">0</div>
+                <div class="stat-label">Companies</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-people">0</div>
+                <div class="stat-label">People</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-emails">0</div>
+                <div class="stat-label">Emails</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-verified">0</div>
+                <div class="stat-label">Verifications</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-pages">0</div>
+                <div class="stat-label">Pages</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="stat-runs">0</div>
+                <div class="stat-label">Runs</div>
+            </div>
+        </div>
+
+
+
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" data-tab="create-run">Create Run</button>
+            <button class="tab" data-tab="run-history">Run History</button>
+            <button class="tab" data-tab="companies">Companies</button>
+            <button class="tab" data-tab="people">People</button>
+            <button class="tab" data-tab="emails">Emails</button>
+            <button class="tab" data-tab="search">Search</button>
+        </div>
+
+
+
+
+        <!-- Tab Contents -->
+        <div id="tab-create-run" class="tab-content active">
+            <div class="grid-2">
+                <div class="card">
+                    <h2>Create New Pipeline Run</h2>
+                    <form id="run-form">
+                        <div class="form-group">
+                            <label>Domains (one per line)</label>
+                            <textarea id="domains" placeholder="example.com
+another.com"></textarea>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Pipeline Mode</label>
+                            <select id="pipeline-mode">
+                                <option value="full">Full (crawl + extract + generate + verify)</option>
+                                <option value="autodiscovery">Autodiscovery only</option>
+                                <option value="generate_verify">Generate + Verify</option>
+                                <option value="verify">Verify only</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="ai-enabled" checked>
+                            <label for="ai-enabled" style="margin:0;">Enable AI extraction</label>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="force-discovery">
+                            <label for="force-discovery" style="margin:0;">Force re-discovery (ignore cache)</label>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary" style="width:100%;">Start Run</button>
+                    </form>
+
+                    <div id="run-result" style="margin-top: 16px;"></div>
+                </div>
+
+                <div class="card">
+                    <h2>Recent Runs</h2>
+                    <div id="recent-runs" class="table-container">
+                        <div class="loading">Loading...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+
+
+
+        <!-- Run History Tab -->
+        <div id="tab-run-history" class="tab-content">
+            <div class="card">
+                <h2>All Pipeline Runs</h2>
+                <div id="runs-table" class="table-container">
+                    <div class="loading">Loading...</div>
+                </div>
+                <div id="runs-pagination" class="pagination"></div>
+            </div>
+        </div>
+
+
+
+
+        <!-- Companies Tab -->
+        <div id="tab-companies" class="tab-content">
+            <div class="card">
+                <h2>Companies Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="company-search" placeholder="Search by domain or name...">
+                    <button class="btn btn-secondary" onclick="loadCompanies(1)">Search</button>
+                </div>
+
+                <div class="search-box" style="justify-content:flex-start;">
+                    <button class="btn btn-primary" onclick="exportSelectedCompaniesCsv()">Export selected (valid emails)</button>
+                    <button class="btn btn-secondary" onclick="clearCompanySelection()">Clear selection</button>
+                    <span class="text-muted" id="selected-company-count">0 selected</span>
+                </div>
+                <div id="companies-table" class="table-container">
+                    <div class="loading">Loading...</div>
+                </div>
+                <div id="companies-pagination" class="pagination"></div>
+            </div>
+        </div>
+
+
+
+
+        <!-- People Tab -->
+        <div id="tab-people" class="tab-content">
+            <div class="card">
+                <h2>People Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="people-search" placeholder="Search by name or title...">
+                    <button class="btn btn-secondary" onclick="loadPeople(1)">Search</button>
+                </div>
+                <div id="people-table" class="table-container">
+                    <div class="loading">Loading...</div>
+                </div>
+                <div id="people-pagination" class="pagination"></div>
+            </div>
+        </div>
+
+
+
+
+        <!-- Emails Tab -->
+        <div id="tab-emails" class="tab-content">
+            <div class="card">
+                <h2>Emails Browser</h2>
+                <div class="search-box">
+                    <input type="text" id="email-search" placeholder="Search by email...">
+                    <select id="email-status-filter" style="width: auto; min-width: 150px;">
+                        <option value="">All statuses</option>
+                        <option value="valid">Valid</option>
+                        <option value="invalid">Invalid</option>
+                        <option value="risky_catch_all">Risky (Catch-all)</option>
+                        <option value="unknown_timeout">Unknown/Timeout</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="loadEmails(1)">Search</button>
+                </div>
+                <div id="emails-table" class="table-container">
+                    <div class="loading">Loading...</div>
+                </div>
+                <div id="emails-pagination" class="pagination"></div>
+            </div>
+        </div>
+
+
+
+
+        <!-- Search Tab -->
+        <div id="tab-search" class="tab-content">
+            <div class="card">
+                <h2>Global Search</h2>
+                <div class="search-box">
+                    <input type="text" id="global-search" placeholder="Search companies, people, or emails...">
+                    <button class="btn btn-primary" onclick="globalSearch()">Search</button>
+                </div>
+                <div id="search-results"></div>
+            </div>
+        </div>
+    </div>
+
+
+
+
+    <!-- Detail Panel -->
+    <div class="overlay" id="overlay" onclick="closeDetail()"></div>
+    <div class="detail-panel" id="detail-panel">
+        <div class="detail-panel-header">
+            <h2><span id="detail-title">Details</span><span id="detail-title-badge"></span></h2>
+            <button class="close-btn" onclick="closeDetail()">&times;</button>
+        </div>
+        <div id="detail-content"></div>
+    </div>
+
+
+
+
+    <script>
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+
+
+
+
+                // Load data for tab
+                if (tab.dataset.tab === 'companies') loadCompanies(1);
+                if (tab.dataset.tab === 'people') loadPeople(1);
+                if (tab.dataset.tab === 'emails') loadEmails(1);
+                if (tab.dataset.tab === 'run-history') loadRuns(1);
+            });
+        });
+
+
+
+
+        // --- Company selection (persisted across pages) ---
+        let selectedCompanyIds = new Set();
+        try {
+            const raw = localStorage.getItem('selected_company_ids');
+            const arr = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(arr)) {
+                selectedCompanyIds = new Set(arr.map(n => parseInt(n)).filter(Number.isFinite));
+            }
+        } catch (_) {}
+
+        function updateSelectedCompanyCount() {
+            const el = document.getElementById('selected-company-count');
+            if (el) el.textContent = `${selectedCompanyIds.size} selected`;
+        }
+
+        function persistCompanySelection() {
+            try {
+                localStorage.setItem('selected_company_ids', JSON.stringify(Array.from(selectedCompanyIds)));
+            } catch (_) {}
+            updateSelectedCompanyCount();
+        }
+
+        function toggleCompanySelection(id, checked) {
+            const n = parseInt(id);
+            if (!Number.isFinite(n)) return;
+
+            if (checked) selectedCompanyIds.add(n);
+            else selectedCompanyIds.delete(n);
+
+            persistCompanySelection();
+        }
+
+        function clearCompanySelection() {
+            selectedCompanyIds = new Set();
+            persistCompanySelection();
+            loadCompanies(companiesPage || 1);
+        }
+
+        async function exportSelectedCompaniesCsv() {
+            const ids = Array.from(selectedCompanyIds);
+            if (!ids.length) {
+                alert('Select at least one company first.');
+                return;
+            }
+
+            const url = `/api/browser/companies/export.csv?ids=${encodeURIComponent(ids.join(','))}`;
+
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    const txt = await resp.text();
+                    alert(`Export failed (${resp.status}). ${txt || ''}`);
+                    return;
+                }
+
+                const blob = await resp.blob();
+                const a = document.createElement('a');
+                const href = URL.createObjectURL(blob);
+
+                a.href = href;
+                a.download = `company_people_valid_emails_${new Date().toISOString().slice(0,10)}.csv`;
+                document.body.appendChild(a);
+                a.click();
+
+                setTimeout(() => {
+                    URL.revokeObjectURL(href);
+                    a.remove();
+                }, 0);
+            } catch (e) {
+                alert(`Export failed: ${e && e.message ? e.message : e}`);
+            }
+        }
+
+
+
+
+
+        // User dropdown toggle
+        function toggleUserDropdown(event) {
+            event.stopPropagation();
+            const dropdown = document.getElementById('userDropdown');
+            if (dropdown) {
+                dropdown.classList.toggle('open');
+            }
+        }
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', function(event) {
+            const dropdown = document.getElementById('userDropdown');
+            if (dropdown && !dropdown.contains(event.target)) {
+                dropdown.classList.remove('open');
+            }
+        });
+
+        // Close dropdown on escape key
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                const dropdown = document.getElementById('userDropdown');
+                if (dropdown) {
+                    dropdown.classList.remove('open');
+                }
+            }
+        });
+
+        // Load stats
+        async function loadStats() {
+            try {
+                const resp = await fetch('/api/browser/stats');
+                const data = await resp.json();
+
+
+
+
+                document.getElementById('stat-companies').textContent = data.companies || 0;
+                document.getElementById('stat-people').textContent = data.people || 0;
+                document.getElementById('stat-emails').textContent = data.emails || 0;
+                document.getElementById('stat-verified').textContent = data.verifications || 0;
+                document.getElementById('stat-pages').textContent = data.sources || 0;
+                document.getElementById('stat-runs').textContent = data.runs || 0;
+
+
+
+
+                updateLastUpdate();
+            } catch (e) {
+                console.error('Failed to load stats:', e);
+            }
+        }
+
+
+
+
+        // Update timestamp
+        function updateLastUpdate() {
+            const now = new Date();
+            document.getElementById('last-update').textContent = now.toLocaleTimeString();
+        }
+
+
+
+
+        function getSelectedPipelineModes() {
+            const mode = (document.getElementById('pipeline-mode')?.value || 'full').trim();
+
+            if (mode === 'autodiscovery') return ['autodiscovery'];
+            if (mode === 'generate_verify') return ['generate', 'verify'];
+            if (mode === 'verify') return ['verify'];
+            return ['full'];
+        }
+
+        function formatPipelineModes(modes) {
+            const list = Array.isArray(modes) ? modes.map(String) : [];
+            const set = new Set(list);
+
+            if (set.has('full') || set.has('all')) return 'Full';
+            if (set.size === 1 && set.has('autodiscovery')) return 'Autodiscovery';
+            if (set.has('generate') && set.has('verify') && !set.has('autodiscovery')) return 'Generate+Verify';
+            if (set.size === 1 && set.has('verify')) return 'Verify';
+            return list.length ? list.join(',') : '-';
+        }
+
+        function computeDomainRiskLevel(company) {
+            const emails = Array.isArray(company?.emails) ? company.emails : [];
+            const statuses = emails
+                .map(e => (e?.verify_status ?? '').toString().trim().toLowerCase())
+                .filter(Boolean);
+
+            // "risky_*" implies domain-level risk (e.g., catch-all or other risky classification)
+            if (statuses.some(s => s.startsWith('risky'))) return 'risky';
+
+            // If there are no tested statuses yet, treat as unknown/untested
+            if (statuses.length === 0) return 'unknown';
+
+            // Any unknown/temporary outcome implies domain is still inconclusive
+            if (statuses.some(s => s.startsWith('unknown') || s.startsWith('temp_fail') || s === 'tempfail')) return 'unknown';
+
+            return null;
+        }
+
+        function getDomainWarningBadge(level, { compact = false } = {}) {
+            if (level === 'risky') {
+                return `<span class="badge badge-warning" title="Domain is risky (e.g., catch-all or risky deliverability)">!${compact ? '' : ' risky'}</span>`;
+            }
+            if (level === 'unknown') {
+                return `<span class="badge badge-info" title="Domain is unknown (untested or inconclusive)">!${compact ? '' : ' unknown'}</span>`;
+            }
+            return '';
+        }
+
+
+
+
+        // Create run
+        document.getElementById('run-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const domains = document.getElementById('domains').value.split('\n')
+                .map(d => d.trim())
+                .filter(d => d);
+
+            if (domains.length === 0) {
+                alert('Please enter at least one domain.');
+                return;
+            }
+
+            const payload = {
+                domains,
+                ai_enabled: document.getElementById('ai-enabled').checked,
+                force_discovery: document.getElementById('force-discovery').checked,
+                modes: getSelectedPipelineModes(),
+            };
+
+            const resultDiv = document.getElementById('run-result');
+            resultDiv.innerHTML = '<div class="loading">Starting run...</div>';
+
+            try {
+                const resp = await fetch('/api/browser/runs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                const data = await resp.json();
+
+                if (data.ok) {
+                    resultDiv.innerHTML = `
+                        <div class="alert alert-success">
+                            Run created successfully!<br>
+                            <strong>Run ID:</strong> <span class="mono">${data.run_id}</span><br>
+                            <strong>Domains:</strong> ${data.domain_count}
+                        </div>
+                    `;
+                    document.getElementById('domains').value = '';
+                    loadRecentRuns();
+                    loadStats();
+                } else {
+                    resultDiv.innerHTML = `<div class="alert alert-danger">Error: ${data.detail || 'Unknown error'}</div>`;
+                }
+            } catch (e) {
+                resultDiv.innerHTML = `<div class="alert alert-danger">Error: ${e.message}</div>`;
+            }
+        });
+
+
+
+
+        // Load recent runs
+        async function loadRecentRuns() {
+            try {
+                const resp = await fetch('/api/browser/runs?page=1&page_size=10');
+                const data = await resp.json();
+
+                const container = document.getElementById('recent-runs');
+
+                if (!data.items || data.items.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No runs yet.</div>';
+                    return;
+                }
+
+                container.innerHTML = data.items.map(run => `
+                    <div style="padding: 12px; border-bottom: 1px solid var(--border);">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span class="mono" style="font-size: 0.85rem;">${run.id.substring(0, 8)}...</span>
+                            ${getStatusBadge(run.status)}
+                        </div>
+                        <div class="text-muted" style="font-size: 0.85rem; margin-top: 4px;">
+                            ${run.domain_count} domains - ${run.created_at || ''}${run.options?.modes ? ' - Mode: ' + formatPipelineModes(run.options.modes) : ''}
+                        </div>
+                        ${run.progress?.phase ? `<div class="text-muted" style="font-size: 0.8rem;">Phase: ${run.progress.phase}</div>` : ''}
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Failed to load recent runs:', e);
+            }
+        }
+
+
+
+
+        // Load all runs
+        let runsPage = 1;
+        async function loadRuns(page) {
+            runsPage = page;
+            try {
+                const resp = await fetch(`/api/browser/runs?page=${page}&page_size=20`);
+                const data = await resp.json();
+
+                const container = document.getElementById('runs-table');
+
+                if (!data.items || data.items.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No runs found.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Run ID</th>
+                                <th>Status</th>
+                                <th>Domains</th>
+                                <th>Mode</th>
+                                <th>Phase</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.items.map(run => `
+                                <tr>
+                                    <td class="mono">${run.id.substring(0, 8)}...</td>
+                                    <td>${getStatusBadge(run.status)}</td>
+                                    <td>${run.domain_count}</td>
+                                    <td>${formatPipelineModes(run.options?.modes)}</td>
+                                    <td>${run.progress?.phase || '-'}</td>
+                                    <td class="text-muted">${run.created_at || ''}</td>
+                                    <td>
+                                        <button class="btn btn-sm btn-secondary" onclick="viewRunDetail('${run.id}')">View</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                renderPagination('runs-pagination', data, loadRuns);
+            } catch (e) {
+                console.error('Failed to load runs:', e);
+            }
+        }
+
+
+
+
+        // Load companies
+        let companiesPage = 1;
+        async function loadCompanies(page) {
+            companiesPage = page;
+            const search = document.getElementById('company-search').value;
+
+            try {
+                const params = new URLSearchParams({ page, page_size: 50 });
+                if (search) params.append('search', search);
+
+                const resp = await fetch(`/api/browser/companies?${params}`);
+                const data = await resp.json();
+
+                const container = document.getElementById('companies-table');
+
+                if (!data.items || data.items.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No companies found.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Select</th>
+                                <th>ID</th>
+                                <th>Domain</th>
+                                <th>Name</th>
+                                <th>AI</th>
+                                <th>People</th>
+                                <th>Emails</th>
+                                <th>Pages</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.items.map(c => `
+                                <tr>
+                                    <td>
+                                        <input type="checkbox"
+                                            ${selectedCompanyIds.has(Number(c.id)) ? 'checked' : ''}
+                                            onchange="toggleCompanySelection(${c.id}, this.checked)">
+                                    </td>
+                                    <td>${c.id}</td>
+                                    <td class="mono">${c.domain || c.official_domain || '-'}</td>
+                                    <td class="truncate">${c.name || '-'}</td>
+                                    <td>${c.ai_extracted ? '<span class="badge badge-success">Yes</span>' : '<span class="badge badge-muted">No</span>'}</td>
+                                    <td>${c.people_count}</td>
+                                    <td>${c.emails_count}</td>
+                                    <td>${c.pages_count}</td>
+                                    <td>
+                                        <button class="btn btn-sm btn-secondary" onclick="viewCompanyDetail(${c.id})">View</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                updateSelectedCompanyCount();
+
+                renderPagination('companies-pagination', data, loadCompanies);
+            } catch (e) {
+                console.error('Failed to load companies:', e);
+            }
+        }
+
+
+
+
+        // Load people
+        let peoplePage = 1;
+        async function loadPeople(page) {
+            peoplePage = page;
+            const search = document.getElementById('people-search').value;
+
+            try {
+                const params = new URLSearchParams({ page, page_size: 50 });
+                if (search) params.append('search', search);
+
+                const resp = await fetch(`/api/browser/people?${params}`);
+                const data = await resp.json();
+
+                const container = document.getElementById('people-table');
+
+                if (!data.items || data.items.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No people found.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Title</th>
+                                <th>Company</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.items.map(p => `
+                                <tr>
+                                    <td>${p.id}</td>
+                                    <td>${p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-'}</td>
+                                    <td class="truncate">${p.title || '-'}</td>
+                                    <td class="mono">${p.company_domain || '-'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                renderPagination('people-pagination', data, loadPeople);
+            } catch (e) {
+                console.error('Failed to load people:', e);
+            }
+        }
+
+
+
+
+        // Load emails
+        let emailsPage = 1;
+        async function loadEmails(page) {
+            emailsPage = page;
+            const search = document.getElementById('email-search').value;
+            const status = document.getElementById('email-status-filter').value;
+
+            try {
+                const params = new URLSearchParams({ page, page_size: 50 });
+                if (search) params.append('search', search);
+                if (status) params.append('status', status);
+
+                const resp = await fetch(`/api/browser/emails?${params}`);
+                const data = await resp.json();
+
+                const container = document.getElementById('emails-table');
+
+                if (!data.items || data.items.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No emails found.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Email</th>
+                                <th>Company</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.items.map(e => `
+                                <tr>
+                                    <td>${e.id}</td>
+                                    <td class="mono">${e.email}</td>
+                                    <td class="mono">${e.company_domain || '-'}</td>
+                                    <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                renderPagination('emails-pagination', data, loadEmails);
+            } catch (e) {
+                console.error('Failed to load emails:', e);
+            }
+        }
+
+
+
+
+        // Global search
+        async function globalSearch() {
+            const q = document.getElementById('global-search').value.trim();
+            if (!q) return;
+
+            const container = document.getElementById('search-results');
+            container.innerHTML = '<div class="loading">Searching...</div>';
+
+            try {
+                const resp = await fetch(`/api/browser/search?q=${encodeURIComponent(q)}`);
+                const data = await resp.json();
+
+                let html = '';
+
+                if (data.companies?.length) {
+                    html += `<h3>Companies (${data.companies.length})</h3>
+                        <table>
+                            <thead><tr><th>ID</th><th>Domain</th><th>Name</th></tr></thead>
+                            <tbody>
+                                ${data.companies.map(c => `
+                                    <tr class="clickable" onclick="viewCompanyDetail(${c.id})">
+                                        <td>${c.id}</td>
+                                        <td class="mono">${c.domain || '-'}</td>
+                                        <td>${c.name || '-'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>`;
+                }
+
+                if (data.people?.length) {
+                    html += `<h3 style="margin-top: 20px;">People (${data.people.length})</h3>
+                        <table>
+                            <thead><tr><th>ID</th><th>Name</th><th>Title</th></tr></thead>
+                            <tbody>
+                                ${data.people.map(p => `
+                                    <tr>
+                                        <td>${p.id}</td>
+                                        <td>${p.full_name || '-'}</td>
+                                        <td>${p.title || '-'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>`;
+                }
+
+                if (data.emails?.length) {
+                    html += `<h3 style="margin-top: 20px;">Emails (${data.emails.length})</h3>
+                        <table>
+                            <thead><tr><th>ID</th><th>Email</th><th>Company</th><th>Status</th></tr></thead>
+                            <tbody>
+                                ${data.emails.map(e => `
+                                    <tr>
+                                        <td>${e.id}</td>
+                                        <td class="mono">${e.email}</td>
+                                        <td class="mono">${e.company_domain || '-'}</td>
+                                        <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>`;
+                }
+
+                if (!html) {
+                    html = '<div class="text-muted">No results found.</div>';
+                }
+
+                container.innerHTML = html;
+            } catch (e) {
+                console.error('Search failed:', e);
+            }
+        }
+
+
+
+
+        // View company detail
+        async function viewCompanyDetail(id) {
+            try {
+                const resp = await fetch(`/api/browser/companies/${id}`);
+                const data = await resp.json();
+
+                const domainRiskLevel = computeDomainRiskLevel(data);
+
+                document.getElementById('detail-title').textContent = data.domain || data.name || 'Company Details';
+                document.getElementById('detail-title-badge').innerHTML = getDomainWarningBadge(domainRiskLevel, { compact: true });
+                document.getElementById('detail-content').innerHTML = `
+                    <div style="margin-bottom: 20px;">
+                        <strong>ID:</strong> ${data.id}<br>
+                        <strong>Name:</strong> ${data.name || '-'}<br>
+                        <strong>Domain:</strong> ${data.domain || '-'} ${getDomainWarningBadge(domainRiskLevel)}<br>
+                        <strong>Official Domain:</strong> ${data.official_domain || '-'}<br>
+                        <strong>AI Extracted:</strong> ${data.attrs?.ai_people_extracted ? 'Yes' : 'No'}
+                    </div>
+
+                    <h3>People (${data.people?.length || 0})</h3>
+                    ${data.people?.length ? `
+                        <table>
+                            <thead><tr><th>Name</th><th>Title</th></tr></thead>
+                            <tbody>
+                                ${data.people.map(p => `
+                                    <tr>
+                                        <td>${p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-'}</td>
+                                        <td>${p.title || '-'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<div class="text-muted">No people found.</div>'}
+
+                    <h3 style="margin-top: 20px;">Emails (${data.emails?.length || 0})</h3>
+                    ${data.emails?.length ? `
+                        <table>
+                            <thead><tr><th>Email</th><th>Status</th></tr></thead>
+                            <tbody>
+                                ${data.emails.map(e => `
+                                    <tr>
+                                        <td class="mono">${e.email}</td>
+                                        <td>${getVerifyStatusBadge(e.verify_status)}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<div class="text-muted">No emails found.</div>'}
+
+                    <h3 style="margin-top: 20px;">Crawled Pages (${data.pages?.length || 0})</h3>
+                    ${data.pages?.length ? `
+                        <table>
+                            <thead><tr><th>URL</th><th>Size</th></tr></thead>
+                            <tbody>
+                                ${data.pages.map(pg => `
+                                    <tr>
+                                        <td class="truncate">${pg.source_url}</td>
+                                        <td>${Math.round((pg.html_size || 0) / 1024)} KB</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<div class="text-muted">No pages crawled.</div>'}
+                `;
+
+                openDetail();
+            } catch (e) {
+                console.error('Failed to load company detail:', e);
+            }
+        }
+
+
+
+
+        // View run detail
+        async function viewRunDetail(id) {
+            try {
+                const resp = await fetch(`/api/browser/runs/${id}`);
+                const data = await resp.json();
+
+                document.getElementById('detail-title').textContent = 'Run Details';
+                document.getElementById('detail-title-badge').innerHTML = '';
+                document.getElementById('detail-content').innerHTML = `
+                    <div style="margin-bottom: 20px;">
+                        <strong>ID:</strong> <span class="mono">${data.id}</span><br>
+                        <strong>Status:</strong> ${getStatusBadge(data.status)}<br>
+                        <strong>Created:</strong> ${data.created_at || '-'}<br>
+                        <strong>Started:</strong> ${data.started_at || '-'}<br>
+                        <strong>Finished:</strong> ${data.finished_at || '-'}
+                    </div>
+
+                    <h3>Options</h3>
+                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.options, null, 2)}</pre>
+
+                    <h3 style="margin-top: 20px;">Progress</h3>
+                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.progress, null, 2)}</pre>
+
+                    <h3 style="margin-top: 20px;">Domains (${data.domains?.length || 0})</h3>
+                    <div style="max-height: 200px; overflow-y: auto; background: var(--bg-input); padding: 12px; border-radius: 6px;">
+                        ${data.domains?.map(d => `<div class="mono">${d}</div>`).join('') || '-'}
+                    </div>
+
+                    ${data.error ? `
+                        <h3 style="margin-top: 20px; color: var(--danger);">Error</h3>
+                        <div style="background: rgba(239,68,68,0.1); padding: 12px; border-radius: 6px; color: var(--danger);">${data.error}</div>
+                    ` : ''}
+                `;
+
+                openDetail();
+            } catch (e) {
+                console.error('Failed to load run detail:', e);
+            }
+        }
+
+
+
+
+        // Detail panel
+        function openDetail() {
+            document.getElementById('overlay').classList.add('open');
+            document.getElementById('detail-panel').classList.add('open');
+        }
+
+        function closeDetail() {
+            document.getElementById('overlay').classList.remove('open');
+            document.getElementById('detail-panel').classList.remove('open');
+            const badgeEl = document.getElementById('detail-title-badge');
+            if (badgeEl) badgeEl.innerHTML = '';
+        }
+
+
+
+
+        // Helpers
+        function getStatusBadge(status) {
+            const badges = {
+                'queued': '<span class="badge badge-info">Queued</span>',
+                'running': '<span class="badge badge-warning">Running</span>',
+                'succeeded': '<span class="badge badge-success">Succeeded</span>',
+                'completed': '<span class="badge badge-success">Completed</span>',
+                'failed': '<span class="badge badge-danger">Failed</span>',
+                'cancelled': '<span class="badge badge-muted">Cancelled</span>',
+            };
+            return badges[status] || `<span class="badge badge-muted">${status || '-'}</span>`;
+        }
+
+        function getVerifyStatusBadge(status) {
+            const badges = {
+                'valid': '<span class="badge badge-success">Valid</span>',
+                'invalid': '<span class="badge badge-danger">Invalid</span>',
+                'risky_catch_all': '<span class="badge badge-warning">Risky</span>',
+                'unknown_timeout': '<span class="badge badge-muted">Unknown</span>',
+            };
+            return badges[status] || '<span class="badge badge-muted">-</span>';
+        }
+
+        function renderPagination(containerId, data, loadFn) {
+            const container = document.getElementById(containerId);
+            container.innerHTML = `
+                <div class="pagination-info">
+                    Showing ${data.items.length} of ${data.total} (Page ${data.page} of ${data.total_pages})
+                </div>
+                <div class="pagination-buttons">
+                    <button class="btn btn-sm btn-secondary" ${data.page <= 1 ? 'disabled' : ''} onclick="${loadFn.name}(${data.page - 1})">< Prev</button>
+                    <button class="btn btn-sm btn-secondary" ${data.page >= data.total_pages ? 'disabled' : ''} onclick="${loadFn.name}(${data.page + 1})">Next ></button>
+                </div>
+            `;
+        }
+
+
+
+
+        // Enter key handlers
+        document.getElementById('company-search').addEventListener('keypress', e => { if (e.key === 'Enter') loadCompanies(1); });
+        document.getElementById('people-search').addEventListener('keypress', e => { if (e.key === 'Enter') loadPeople(1); });
+        document.getElementById('email-search').addEventListener('keypress', e => { if (e.key === 'Enter') loadEmails(1); });
+        document.getElementById('global-search').addEventListener('keypress', e => { if (e.key === 'Enter') globalSearch(); });
+
+
+
+
+        // Initial load
+        loadStats();
+        loadRecentRuns();
+        updateSelectedCompanyCount();
+
+
+
+
+        // Auto-refresh stats
+        setInterval(() => {
+            loadStats();
+            loadRecentRuns();
+        }, 10000);
+    </script>
+</body>
+</html>

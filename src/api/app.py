@@ -14,11 +14,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from src.api import admin as admin_routes
+from src.api import browser as browser_routes
 from src.api.middleware.body_limit import BodySizeLimitMiddleware
+from src.auth import routes as auth_routes
+from src.auth.middleware import RequireAuthMiddleware
 from src.search.backend import SearchBackend, SearchResult, SqliteFtsBackend
 from src.search.indexing import LeadSearchParams
 
@@ -62,8 +66,87 @@ app = FastAPI(title="Email Scraper API")
 # Register early so limits apply to all routes
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=BODY_LIMIT_BYTES)
 
+# Require authentication for all routes except auth, API (uses its own auth), static, health
+app.add_middleware(
+    RequireAuthMiddleware,
+    exclude_paths=[
+        "/auth/",  # Login, register, logout, etc.
+        "/api/",  # API routes use header/JWT auth via AuthContext
+        "/leads/",  # Lead search uses AuthContext (header/JWT auth)
+        "/admin/",  # Admin routes use require_admin dependency
+        "/static/",  # Static files
+        "/health",  # Health checks
+        "/favicon.ico",
+        "/demo",  # Public demo page (no auth required)
+    ],
+    login_url="/auth/login",
+    pending_url="/auth/pending",
+)
+
+
 # R24: admin UI + metrics JSON
 app.include_router(admin_routes.router)
+
+# Auth routes for session-based authentication
+app.include_router(auth_routes.router)
+
+# Browser/dashboard API routes
+app.include_router(browser_routes.router)
+
+# ---------------------------------------------------------------------------
+# Dashboard Route (Main UI at root)
+# ---------------------------------------------------------------------------
+
+# Templates for dashboard
+dashboard_templates = Jinja2Templates(directory="src/api/templates")
+
+
+def _get_current_user_from_session(request: Request):
+    """Get the current user from session cookie if available."""
+    try:
+        from src.auth.core import SESSION_COOKIE_NAME, get_session
+
+        session_id = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_id:
+            return None
+
+        session, user = get_session(session_id)
+        return user
+    except Exception:
+        return None
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard_page(request: Request) -> HTMLResponse:
+    """
+    Main dashboard UI accessible at root URL.
+    """
+    user = _get_current_user_from_session(request)
+    return dashboard_templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "user": user,
+        },
+    )
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def demo_page(request: Request) -> HTMLResponse:
+    """
+    Public demo dashboard with fake data.
+
+    Identical layout to the real dashboard but uses hardcoded sample
+    companies, people, and emails.  Run creation is disabled.
+    No authentication required.
+    """
+    return dashboard_templates.TemplateResponse(
+        "demo.html",
+        {
+            "request": request,
+        },
+    )
+
 
 # --------------------------------------------------------------------------------------
 # Error helpers

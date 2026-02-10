@@ -28,9 +28,14 @@ def api_test_env(monkeypatch) -> Generator[SimpleNamespace, None, None]:
     Uses FastAPI's dependency_overrides to ensure our backend is used.
     """
     import src.api.app as app_mod
+    import src.api.deps as deps_mod
     import src.db as db_mod
     import src.search.backend as backend_mod
     import src.search.indexing as indexing_mod
+
+    # Ensure auth is in dev mode regardless of environment (.env may set session).
+    monkeypatch.setattr(app_mod, "AUTH_MODE", "dev")
+    monkeypatch.setattr(deps_mod, "AUTH_MODE", "dev")
 
     # CRITICAL: Clear any stale backend from previous tests first.
     app.state.search_backend = None
@@ -493,7 +498,7 @@ def test_malformed_cursor_returns_400(api_client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# O26 — verify_label + primary/alternate enrichment tests (API surface)
+# O26 â€” verify_label + primary/alternate enrichment tests (API surface)
 # ---------------------------------------------------------------------------
 
 
@@ -547,6 +552,13 @@ def test_api_primary_and_alternate_labels_for_multiple_valids(monkeypatch) -> No
     from unittest.mock import patch
 
     monkeypatch.setenv("LEAD_SEARCH_CACHE_ENABLED", "0")
+
+    # Ensure auth is in dev mode regardless of environment (.env may set session).
+    import src.api.app as app_mod
+    import src.api.deps as deps_mod
+
+    monkeypatch.setattr(app_mod, "AUTH_MODE", "dev")
+    monkeypatch.setattr(deps_mod, "AUTH_MODE", "dev")
 
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")

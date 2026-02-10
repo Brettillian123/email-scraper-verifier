@@ -1,59 +1,42 @@
-logs/
-*.bin
-dev.db*
-# venv & OS
-.venv/
-$ENV
-*.log
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
-# Local data
+# Virtual environments
+.venv/
+venv/
+$ENV
+
+# Local data / databases
 *.db
 *.sqlite
 data/
+logs/
+*.log
+*.bin
+dev.db*
 
-*.egg-info/
-
-.env
-
---db
-
-# Local-only artifacts
+# IDE / editor
 .cache/
-local_backups/
-venv/
-.venv/
-__pycache__/
 .pytest_cache/
 .ruff_cache/
 *.swp
 *.swo
-*.bak
-*.bak.*
-*.save
 
-# Local-only artifacts (do not commit)
-.env
-.cache/
-local_backups/
-venv/
-.venv/
-__pycache__/
-.pytest_cache/
-.ruff_cache/
-*.swp
-*.swo
+# Backups (never commit)
 *.bak
 *.bak.*
 *.save
 *.save.*
-tmp/
+local_backups/
 
-metrics
-new
-phase
+# Secrets
+.env
+
+# Temp files
+tmp/
+tmp*.py
+tmp_*.py

@@ -932,6 +932,64 @@ another.com"></textarea>
 
 
 
+        // --- Utility: HTML escaping & IDN display ---
+        function esc(s) {
+            if (s == null) return '';
+            const d = document.createElement('div');
+            d.textContent = String(s);
+            return d.innerHTML;
+        }
+
+        function displayDomain(d) {
+            if (!d) return '-';
+            try {
+                // Convert punycode (xn--...) labels to Unicode for display
+                return d.split('.').map(label => {
+                    if (label.startsWith('xn--')) {
+                        try { return punycode_decode(label.slice(4)); }
+                        catch (_) { return label; }
+                    }
+                    return label;
+                }).join('.');
+            } catch (_) { return d; }
+        }
+
+        // Minimal punycode decoder (RFC 3492 bootstring)
+        function punycode_decode(input) {
+            const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700, initialBias = 72, initialN = 128;
+            let output = [], i = 0, n = initialN, bias = initialBias;
+            let basic = input.lastIndexOf('-');
+            if (basic < 0) basic = 0;
+            for (let j = 0; j < basic; j++) output.push(input.charCodeAt(j));
+            let idx = basic > 0 ? basic + 1 : 0;
+            while (idx < input.length) {
+                let oldi = i, w = 1;
+                for (let k = base; ; k += base) {
+                    if (idx >= input.length) throw Error('invalid');
+                    let c = input.charCodeAt(idx++);
+                    let digit = c >= 97 ? c - 97 : c >= 48 ? c - 22 : -1;
+                    if (digit < 0 || digit >= base) throw Error('invalid');
+                    i += digit * w;
+                    let t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+                    if (digit < t) break;
+                    w *= base - t;
+                }
+                let out = output.length + 1;
+                let delta = oldi === 0 ? Math.floor(i / damp) : Math.floor((i - oldi) / 2);
+                delta += Math.floor(delta / out);
+                let k = 0;
+                while (delta > Math.floor((base - tMin) * tMax / 2)) {
+                    delta = Math.floor(delta / (base - tMin));
+                    k += base;
+                }
+                bias = k + Math.floor((base - tMin + 1) * delta / (delta + skew));
+                n += Math.floor(i / out);
+                i %= out;
+                output.splice(i++, 0, n);
+            }
+            return String.fromCodePoint(...output);
+        }
+
         // --- Company selection (persisted across pages) ---
         let selectedCompanyIds = new Set();
         try {
@@ -1307,17 +1365,17 @@ another.com"></textarea>
                                     <td>
                                         <input type="checkbox"
                                             ${selectedCompanyIds.has(Number(c.id)) ? 'checked' : ''}
-                                            onchange="toggleCompanySelection(${c.id}, this.checked)">
+                                            onchange="toggleCompanySelection(${parseInt(c.id) || 0}, this.checked)">
                                     </td>
-                                    <td>${c.id}</td>
-                                    <td class="mono">${c.domain || c.official_domain || '-'}</td>
-                                    <td class="truncate">${c.name || '-'}</td>
+                                    <td>${parseInt(c.id) || ''}</td>
+                                    <td class="mono" title="${esc(c.domain || c.official_domain || '')}">${esc(displayDomain(c.domain || c.official_domain || '-'))}</td>
+                                    <td class="truncate">${esc(c.name || '-')}</td>
                                     <td>${c.ai_extracted ? '<span class="badge badge-success">Yes</span>' : '<span class="badge badge-muted">No</span>'}</td>
-                                    <td>${c.people_count}</td>
-                                    <td>${c.emails_count}</td>
-                                    <td>${c.pages_count}</td>
+                                    <td>${parseInt(c.people_count) || 0}</td>
+                                    <td>${parseInt(c.emails_count) || 0}</td>
+                                    <td>${parseInt(c.pages_count) || 0}</td>
                                     <td>
-                                        <button class="btn btn-sm btn-secondary" onclick="viewCompanyDetail(${c.id})">View</button>
+                                        <button class="btn btn-sm btn-secondary" onclick="viewCompanyDetail(${parseInt(c.id) || 0})">View</button>
                                     </td>
                                 </tr>
                             `).join('')}
@@ -1369,10 +1427,10 @@ another.com"></textarea>
                         <tbody>
                             ${data.items.map(p => `
                                 <tr>
-                                    <td>${p.id}</td>
-                                    <td>${p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-'}</td>
-                                    <td class="truncate">${p.title || '-'}</td>
-                                    <td class="mono">${p.company_domain || '-'}</td>
+                                    <td>${parseInt(p.id) || ''}</td>
+                                    <td>${esc(p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-')}</td>
+                                    <td class="truncate">${esc(p.title || '-')}</td>
+                                    <td class="mono">${esc(displayDomain(p.company_domain || '-'))}</td>
                                 </tr>
                             `).join('')}
                         </tbody>
@@ -1423,9 +1481,9 @@ another.com"></textarea>
                         <tbody>
                             ${data.items.map(e => `
                                 <tr>
-                                    <td>${e.id}</td>
-                                    <td class="mono">${e.email}</td>
-                                    <td class="mono">${e.company_domain || '-'}</td>
+                                    <td>${parseInt(e.id) || ''}</td>
+                                    <td class="mono">${esc(e.email)}</td>
+                                    <td class="mono">${esc(displayDomain(e.company_domain || '-'))}</td>
                                     <td>${getVerifyStatusBadge(e.verify_status)}</td>
                                 </tr>
                             `).join('')}
@@ -1462,10 +1520,10 @@ another.com"></textarea>
                             <thead><tr><th>ID</th><th>Domain</th><th>Name</th></tr></thead>
                             <tbody>
                                 ${data.companies.map(c => `
-                                    <tr class="clickable" onclick="viewCompanyDetail(${c.id})">
-                                        <td>${c.id}</td>
-                                        <td class="mono">${c.domain || '-'}</td>
-                                        <td>${c.name || '-'}</td>
+                                    <tr class="clickable" onclick="viewCompanyDetail(${parseInt(c.id) || 0})">
+                                        <td>${parseInt(c.id) || ''}</td>
+                                        <td class="mono">${esc(displayDomain(c.domain || '-'))}</td>
+                                        <td>${esc(c.name || '-')}</td>
                                     </tr>
                                 `).join('')}
                             </tbody>
@@ -1479,9 +1537,9 @@ another.com"></textarea>
                             <tbody>
                                 ${data.people.map(p => `
                                     <tr>
-                                        <td>${p.id}</td>
-                                        <td>${p.full_name || '-'}</td>
-                                        <td>${p.title || '-'}</td>
+                                        <td>${parseInt(p.id) || ''}</td>
+                                        <td>${esc(p.full_name || '-')}</td>
+                                        <td>${esc(p.title || '-')}</td>
                                     </tr>
                                 `).join('')}
                             </tbody>
@@ -1495,9 +1553,9 @@ another.com"></textarea>
                             <tbody>
                                 ${data.emails.map(e => `
                                     <tr>
-                                        <td>${e.id}</td>
-                                        <td class="mono">${e.email}</td>
-                                        <td class="mono">${e.company_domain || '-'}</td>
+                                        <td>${parseInt(e.id) || ''}</td>
+                                        <td class="mono">${esc(e.email)}</td>
+                                        <td class="mono">${esc(displayDomain(e.company_domain || '-'))}</td>
                                         <td>${getVerifyStatusBadge(e.verify_status)}</td>
                                     </tr>
                                 `).join('')}
@@ -1530,10 +1588,10 @@ another.com"></textarea>
                 document.getElementById('detail-title-badge').innerHTML = getDomainWarningBadge(domainRiskLevel, { compact: true });
                 document.getElementById('detail-content').innerHTML = `
                     <div style="margin-bottom: 20px;">
-                        <strong>ID:</strong> ${data.id}<br>
-                        <strong>Name:</strong> ${data.name || '-'}<br>
-                        <strong>Domain:</strong> ${data.domain || '-'} ${getDomainWarningBadge(domainRiskLevel)}<br>
-                        <strong>Official Domain:</strong> ${data.official_domain || '-'}<br>
+                        <strong>ID:</strong> ${parseInt(data.id) || ''}<br>
+                        <strong>Name:</strong> ${esc(data.name || '-')}<br>
+                        <strong>Domain:</strong> ${esc(displayDomain(data.domain || '-'))} ${getDomainWarningBadge(domainRiskLevel)}<br>
+                        <strong>Official Domain:</strong> ${esc(displayDomain(data.official_domain || '-'))}<br>
                         <strong>AI Extracted:</strong> ${data.attrs?.ai_people_extracted ? 'Yes' : 'No'}
                     </div>
 
@@ -1544,8 +1602,8 @@ another.com"></textarea>
                             <tbody>
                                 ${data.people.map(p => `
                                     <tr>
-                                        <td>${p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-'}</td>
-                                        <td>${p.title || '-'}</td>
+                                        <td>${esc(p.full_name || [p.first_name, p.last_name].filter(Boolean).join(' ') || '-')}</td>
+                                        <td>${esc(p.title || '-')}</td>
                                     </tr>
                                 `).join('')}
                             </tbody>
@@ -1559,7 +1617,7 @@ another.com"></textarea>
                             <tbody>
                                 ${data.emails.map(e => `
                                     <tr>
-                                        <td class="mono">${e.email}</td>
+                                        <td class="mono">${esc(e.email)}</td>
                                         <td>${getVerifyStatusBadge(e.verify_status)}</td>
                                     </tr>
                                 `).join('')}
@@ -1574,7 +1632,7 @@ another.com"></textarea>
                             <tbody>
                                 ${data.pages.map(pg => `
                                     <tr>
-                                        <td class="truncate">${pg.source_url}</td>
+                                        <td class="truncate">${esc(pg.source_url)}</td>
                                         <td>${Math.round((pg.html_size || 0) / 1024)} KB</td>
                                     </tr>
                                 `).join('')}
@@ -1602,27 +1660,27 @@ another.com"></textarea>
                 document.getElementById('detail-title-badge').innerHTML = '';
                 document.getElementById('detail-content').innerHTML = `
                     <div style="margin-bottom: 20px;">
-                        <strong>ID:</strong> <span class="mono">${data.id}</span><br>
+                        <strong>ID:</strong> <span class="mono">${esc(data.id)}</span><br>
                         <strong>Status:</strong> ${getStatusBadge(data.status)}<br>
-                        <strong>Created:</strong> ${data.created_at || '-'}<br>
-                        <strong>Started:</strong> ${data.started_at || '-'}<br>
-                        <strong>Finished:</strong> ${data.finished_at || '-'}
+                        <strong>Created:</strong> ${esc(data.created_at || '-')}<br>
+                        <strong>Started:</strong> ${esc(data.started_at || '-')}<br>
+                        <strong>Finished:</strong> ${esc(data.finished_at || '-')}
                     </div>
 
                     <h3>Options</h3>
-                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.options, null, 2)}</pre>
+                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${esc(JSON.stringify(data.options, null, 2))}</pre>
 
                     <h3 style="margin-top: 20px;">Progress</h3>
-                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(data.progress, null, 2)}</pre>
+                    <pre style="background: var(--bg-input); padding: 12px; border-radius: 6px; overflow-x: auto;">${esc(JSON.stringify(data.progress, null, 2))}</pre>
 
                     <h3 style="margin-top: 20px;">Domains (${data.domains?.length || 0})</h3>
                     <div style="max-height: 200px; overflow-y: auto; background: var(--bg-input); padding: 12px; border-radius: 6px;">
-                        ${data.domains?.map(d => `<div class="mono">${d}</div>`).join('') || '-'}
+                        ${data.domains?.map(d => `<div class="mono">${esc(displayDomain(d))}</div>`).join('') || '-'}
                     </div>
 
                     ${data.error ? `
                         <h3 style="margin-top: 20px; color: var(--danger);">Error</h3>
-                        <div style="background: rgba(239,68,68,0.1); padding: 12px; border-radius: 6px; color: var(--danger);">${data.error}</div>
+                        <div style="background: rgba(239,68,68,0.1); padding: 12px; border-radius: 6px; color: var(--danger);">${esc(data.error)}</div>
                     ` : ''}
                 `;
 

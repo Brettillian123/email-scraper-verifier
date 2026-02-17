@@ -452,6 +452,91 @@ def get_company_health_stats(conn: Any) -> CompanyHealthStats:
     return stats
 
 
+def get_zero_candidate_companies(conn: Any) -> list[dict[str, Any]]:
+    """
+    Return companies that have crawled pages in ``sources`` but zero rows
+    in ``people``.  Each result includes the company's crawled page URLs
+    so the admin can inspect what was fetched.
+
+    Returns a list of dicts:
+        {
+            "company_id": int,
+            "company_name": str,
+            "domain": str,
+            "page_count": int,
+            "pages": [{"source_url": str, "fetched_at": str | None}, ...],
+        }
+    Ordered by page_count DESC (most-crawled first).
+    """
+    # Step 1: identify companies with pages but no people
+    company_rows = _safe_fetchall(
+        conn,
+        """
+        SELECT
+            c.id           AS company_id,
+            c.name         AS company_name,
+            COALESCE(c.official_domain, c.domain, c.user_supplied_domain, '') AS domain,
+            COUNT(s.id)    AS page_count
+        FROM companies c
+        JOIN sources s ON s.company_id = c.id
+        WHERE c.id NOT IN (
+            SELECT DISTINCT company_id
+            FROM people
+            WHERE company_id IS NOT NULL
+        )
+        GROUP BY c.id, c.name
+        ORDER BY page_count DESC
+        """,
+    )
+
+    if not company_rows:
+        return []
+
+    # Step 2: batch-fetch page URLs for these companies
+    company_ids = [row["company_id"] for row in company_rows]
+
+    placeholders = ", ".join("?" for _ in company_ids)
+    page_rows = _safe_fetchall(
+        conn,
+        f"""
+        SELECT company_id, source_url, fetched_at
+        FROM sources
+        WHERE company_id IN ({placeholders})
+        ORDER BY company_id, fetched_at DESC
+        """,
+        tuple(company_ids),
+    )
+
+    # Group pages by company_id
+    pages_by_company: dict[int, list[dict[str, Any]]] = {}
+    for pr in page_rows:
+        cid = pr.get("company_id")
+        if cid is None:
+            continue
+        pages_by_company.setdefault(int(cid), []).append(
+            {
+                "source_url": pr.get("source_url", ""),
+                "fetched_at": pr.get("fetched_at"),
+            }
+        )
+
+    # Step 3: assemble results
+    result: list[dict[str, Any]] = []
+    for row in company_rows:
+        cid = int(row["company_id"])
+        result.append(
+            {
+                "company_id": cid,
+                "company_name": row.get("company_name") or "",
+                "domain": row.get("domain") or "",
+                "page_count": _row_int(row, "page_count"),
+                "pages": pages_by_company.get(cid, []),
+            }
+        )
+
+    return result
+
+
 def get_run_status_breakdown(conn: Any) -> RunStatusBreakdown:
     """Get breakdown of run statuses."""
     breakdown = RunStatusBreakdown()

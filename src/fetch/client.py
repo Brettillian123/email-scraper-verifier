@@ -28,10 +28,19 @@ base_backoff_s = float(os.getenv("THROTTLE_BASE_BACKOFF_SECONDS", "3.0"))
 # Module configuration
 # --------------------------------------------------------------------------------------------------
 
-FETCH_USER_AGENT = os.getenv(
-    "FETCH_USER_AGENT",
-    "Email-Scraper/0.1 (+contact: verifier@crestwellpartners.com)",
-)
+# Import the canonical UA from config to ensure consistency with robots.txt checks.
+# Previously this module had its own default ("Email-Scraper/0.1") which diverged
+# from config.py's "EmailVerifierBot/0.9", causing robots.txt group mismatches.
+try:
+    from src.config import FETCH_USER_AGENT
+except ImportError:
+    FETCH_USER_AGENT = os.getenv(
+        "FETCH_USER_AGENT",
+        (
+            "EmailVerifierBot/0.9 (+https://verifier.crestwellpartners.com; "
+            "contact: banderson@crestwellpartners.com)"
+        ),
+    )
 
 # httpx client tuning
 CONNECT_TIMEOUT_S = float(os.getenv("FETCH_CONNECT_TIMEOUT_S", "5.0"))

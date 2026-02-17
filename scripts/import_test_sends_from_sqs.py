@@ -1,10 +1,11 @@
+# scripts/import_test_sends_from_sqs.py
 from __future__ import annotations
 
 """
 O26 — Import SES test-send bounces from SQS and apply to verification_results.
 
 This script:
-  - Connects to the SQLite database.
+  - Connects to the database (PostgreSQL or SQLite).
   - Polls an AWS SQS queue that receives SES bounce notifications (via SNS).
   - For each "Bounce" notification:
       * Tries to extract the token from mail.tags['iq_test_token'].
@@ -34,13 +35,16 @@ Configuration is loaded from .env via src.config:
 Usage (PowerShell):
 
   .venv\\Scripts\\Activate.ps1
-  python .\\scripts\\import_test_sends_from_sqs.py `
-    --db data\\dev.db `
-    --max-messages 20
+  python .\\scripts\\import_test_sends_from_sqs.py --max-messages 20
+
+  # Legacy SQLite mode (explicit --db):
+  python .\\scripts\\import_test_sends_from_sqs.py --db data\\dev.db --max-messages 20
 """
 
 import argparse
 import json
+import logging
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -63,6 +67,8 @@ from src.verify.test_send import (
     request_test_send,
 )
 
+log = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class SqsBounceSettings:
@@ -71,10 +77,46 @@ class SqsBounceSettings:
     bounce_prefix: str
 
 
+# ---------------------------------------------------------------------------
+# Database connection (PostgreSQL + SQLite)
+# ---------------------------------------------------------------------------
+
+
+def _is_postgres_configured() -> bool:
+    """Check if DATABASE_URL points to PostgreSQL."""
+    url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    return url.startswith("postgres://") or url.startswith("postgresql://")
+
+
+def _get_db_connection(db_path: str | None = None):
+    """
+    Get a database connection.
+
+    - If DATABASE_URL points to PostgreSQL, uses src.db.get_conn() (ignores db_path).
+    - Otherwise, falls back to sqlite3.connect(db_path) for legacy mode.
+    """
+    if _is_postgres_configured():
+        from src.db import get_conn
+
+        log.info("Using PostgreSQL connection via get_conn()")
+        return get_conn()
+
+    path = db_path or os.getenv("DB_PATH") or "data/dev.db"
+    _ensure_db_exists(path)
+    log.info("Using SQLite connection: %s", path)
+    conn = sqlite3.connect(path)
+    return conn
+
+
 def _ensure_db_exists(db_path: str) -> None:
     p = Path(db_path)
     if not p.exists():
         raise SystemExit(f"Database not found: {p}")
+
+
+# ---------------------------------------------------------------------------
+# SQS / SES settings
+# ---------------------------------------------------------------------------
 
 
 def _load_sqs_settings_from_config() -> SqsBounceSettings:
@@ -103,6 +145,11 @@ def _create_sqs_client(aws_cfg: AwsSesConfig) -> Any:
         kwargs["aws_access_key_id"] = aws_cfg.access_key_id
         kwargs["aws_secret_access_key"] = aws_cfg.secret_access_key
     return boto3.client("sqs", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Token extraction helpers
+# ---------------------------------------------------------------------------
 
 
 def _extract_token_from_tags(mail: dict[str, Any]) -> str | None:
@@ -142,87 +189,42 @@ def _extract_token_from_return_path(
 
     prefix, token = local_part.split("+", 1)
     if prefix != expected_prefix:
-        # Not one of our test-send bounce addresses.
         return None
-
-    token = token.strip()
-    return token or None
+    return token.strip() or None
 
 
 def _try_extract_token_from_mail_fields(
     mail: dict[str, Any],
     expected_prefix: str,
 ) -> str | None:
-    """
-    Try multiple mail fields that might contain the bounce+TOKEN@... address:
-      - commonHeaders.returnPath
-      - source
-      - headers[name == 'Return-Path']
-    """
-    candidates: list[str] = []
-
+    """Try structured return-path-like fields."""
     common_headers = mail.get("commonHeaders") or {}
-    rp_ch = common_headers.get("returnPath")
-    if isinstance(rp_ch, str) and rp_ch:
-        candidates.append(rp_ch)
-
-    source = mail.get("source")
-    if isinstance(source, str) and source:
-        candidates.append(source)
-
-    headers = mail.get("headers") or []
-    for h in headers:
-        try:
-            name = str(h.get("name", "")).lower()
-            if name == "return-path":
-                value = h.get("value")
-                if isinstance(value, str) and value:
-                    candidates.append(value.strip("<> "))
-                    break
-        except Exception:  # pragma: no cover - defensive
-            continue
-
-    for rp in candidates:
-        token = _extract_token_from_return_path(rp, expected_prefix)
+    for field in ("returnPath", "source"):
+        val = common_headers.get(field) or mail.get(field)
+        token = _extract_token_from_return_path(val, expected_prefix)
         if token:
             return token
-
     return None
 
 
 def _try_extract_token_from_subject(mail: dict[str, Any]) -> str | None:
-    """
-    Fallback: try to extract token from the Subject line, which we format as:
-      "... Email verification (token=vr123-ABC...)"
-
-    We do NOT assume any particular token pattern here; we just grab whatever
-    appears after 'token=' up to the next ')' or whitespace.
-    """
+    """Try Subject '(token=...)'."""
     common_headers = mail.get("commonHeaders") or {}
-    subject = common_headers.get("subject")
-    if not isinstance(subject, str) or not subject:
-        return None
-
-    m = re.search(r"token=([^\s)]+)", subject)
-    if not m:
-        return None
-    return m.group(1).strip()
+    subject = common_headers.get("subject") or ""
+    m = re.search(r"\(token=([^)]+)\)", subject)
+    return m.group(1).strip() if m else None
 
 
-def _try_extract_token_from_body_text(
-    body: str,
-    expected_prefix: str,
-) -> str | None:
-    """
-    Last-resort fallback: scan the raw JSON body for 'bounce+TOKEN@domain'.
-    """
-    pattern = rf"{re.escape(expected_prefix)}\+([A-Za-z0-9_\-~=]+)@([^\s\"'>]+)"
+def _try_extract_token_from_body_text(body: str, expected_prefix: str) -> str | None:
+    """Scan raw body for bounce+TOKEN@domain."""
+    pattern = re.escape(expected_prefix) + r"\+([A-Za-z0-9_-]+)@"
     m = re.search(pattern, body)
-    if not m:
-        return None
+    return m.group(1).strip() if m else None
 
-    addr = f"{expected_prefix}+{m.group(1)}@{m.group(2)}"
-    return _extract_token_from_return_path(addr, expected_prefix)
+
+# ---------------------------------------------------------------------------
+# Bounce parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_ses_bounce(
@@ -230,7 +232,7 @@ def _parse_ses_bounce(
     expected_prefix: str,
 ) -> tuple[str | None, str | None, bool, str | None, str | None] | None:
     """
-    Parse an SES SNS bounce payload carried in an SQS message.
+    Parse a single SQS message body into bounce components.
 
     Returns (recipient_email, token, is_hard, status_code, reason) or None
     if the message is not a bounce.
@@ -241,9 +243,6 @@ def _parse_ses_bounce(
         print("WARN: Unable to decode SQS message body as JSON; skipping.")
         return None
 
-    # Typical SES -> SNS -> SQS flow:
-    #   SQS body is an SNS notification object with "Message" containing
-    #   the SES event JSON as a string.
     ses_event: dict[str, Any]
     message_field = outer.get("Message")
     if isinstance(message_field, str):
@@ -263,7 +262,6 @@ def _parse_ses_bounce(
     mail = ses_event.get("mail") or {}
     bounce = ses_event.get("bounce") or {}
 
-    # 0) Always capture the primary bounced recipient email.
     bounced_recipients = bounce.get("bouncedRecipients") or []
     recipient_info = bounced_recipients[0] if bounced_recipients else {}
     recipient_email = recipient_info.get("emailAddress")
@@ -290,8 +288,6 @@ def _parse_ses_bounce(
     reason = recipient_info.get("diagnosticCode") or bounce.get("bounceSubType")
 
     if not token:
-        # We return recipient_email + other details; the caller can attempt
-        # DB-based resolution of the token using the bounced email address.
         common_headers = mail.get("commonHeaders") or {}
         print(
             "WARN: Bounce without direct token; "
@@ -305,19 +301,15 @@ def _parse_ses_bounce(
     return recipient_email, token, is_hard, status_code, reason
 
 
-def _lookup_token_for_recipient(
-    conn: sqlite3.Connection,
-    recipient_email: str,
-) -> str | None:
+# ---------------------------------------------------------------------------
+# DB lookups
+# ---------------------------------------------------------------------------
+
+
+def _lookup_token_for_recipient(conn: Any, recipient_email: str) -> str | None:
     """
     Fallback resolver: given a bounced recipient email address, try to map
     it to the most recent active test-send row and return its token.
-
-    We look for verification_results rows where:
-      - emails.email = recipient_email
-      - test_send_token IS NOT NULL
-      - test_send_status IN ('sent', 'pending')
-    and choose the most recent by test_send_at / id.
     """
     cur = conn.execute(
         """
@@ -342,10 +334,7 @@ def _lookup_token_for_recipient(
     return str(token) if token is not None else None
 
 
-def _lookup_email_id_for_token(
-    conn: sqlite3.Connection,
-    token: str,
-) -> int | None:
+def _lookup_email_id_for_token(conn: Any, token: str) -> int | None:
     """
     Given a test-send token, return the associated emails.id, if any.
     """
@@ -364,8 +353,13 @@ def _lookup_email_id_for_token(
     return int(email_id) if email_id is not None else None
 
 
+# ---------------------------------------------------------------------------
+# Message handler
+# ---------------------------------------------------------------------------
+
+
 def _handle_sqs_message(
-    conn: sqlite3.Connection,
+    conn: Any,
     settings: SqsBounceSettings,
     sqs_client: Any,
     message: dict[str, Any],
@@ -378,10 +372,13 @@ def _handle_sqs_message(
         # Not a bounce; delete to avoid clogging the queue.
         receipt_handle = message.get("ReceiptHandle")
         if receipt_handle and not dry_run:
-            sqs_client.delete_message(
-                QueueUrl=settings.queue_url,
-                ReceiptHandle=receipt_handle,
-            )
+            try:
+                sqs_client.delete_message(
+                    QueueUrl=settings.queue_url,
+                    ReceiptHandle=receipt_handle,
+                )
+            except Exception:
+                log.debug("Failed to delete non-bounce SQS message", exc_info=True)
         return False
 
     recipient_email, token, is_hard, status_code, reason = parsed
@@ -399,10 +396,13 @@ def _handle_sqs_message(
         )
         receipt_handle = message.get("ReceiptHandle")
         if receipt_handle and not dry_run:
-            sqs_client.delete_message(
-                QueueUrl=settings.queue_url,
-                ReceiptHandle=receipt_handle,
-            )
+            try:
+                sqs_client.delete_message(
+                    QueueUrl=settings.queue_url,
+                    ReceiptHandle=receipt_handle,
+                )
+            except Exception:
+                log.debug("Failed to delete unresolvable SQS message", exc_info=True)
         return False
 
     print(
@@ -448,25 +448,32 @@ def _handle_sqs_message(
                             f"token={new_token}",
                         )
                     except Exception as exc:  # pragma: no cover - defensive
-                        # Do not fail bounce handling if enqueue fails;
-                        # callers can inspect logs and retry separately.
                         print(
                             "ERROR: Failed to enqueue follow-up test-send "
                             f"for email_id={next_cand.email_id}: {exc}",
                         )
 
-        receipt_handle = message.get("ReceiptHandle")
-        if receipt_handle:
+        # Commit after processing each message (for both PG and SQLite)
+        try:
+            conn.commit()
+        except Exception:
+            log.debug("Commit after bounce processing failed", exc_info=True)
+
+    receipt_handle = message.get("ReceiptHandle")
+    if receipt_handle and not dry_run:
+        try:
             sqs_client.delete_message(
                 QueueUrl=settings.queue_url,
                 ReceiptHandle=receipt_handle,
             )
+        except Exception:
+            log.debug("Failed to delete processed SQS message", exc_info=True)
 
     return True
 
 
 def _poll_sqs_once(
-    conn: sqlite3.Connection,
+    conn: Any,
     settings: SqsBounceSettings,
     sqs_client: Any,
     *,
@@ -512,14 +519,21 @@ def _poll_sqs_once(
     return processed
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Import SES test-send bounces from SQS (O26).",
     )
     parser.add_argument(
         "--db",
-        required=True,
-        help="Path to SQLite database, e.g. data/dev.db",
+        default=None,
+        help="Path to SQLite database (legacy mode). "
+        "Ignored when DATABASE_URL points to PostgreSQL. "
+        "Defaults to data/dev.db in SQLite mode.",
     )
     parser.add_argument(
         "--max-messages",
@@ -540,8 +554,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    _ensure_db_exists(args.db)
-
     try:
         settings = _load_sqs_settings_from_config()
     except ValueError as exc:
@@ -549,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sqs_client = _create_sqs_client(settings.aws_cfg)
 
-    conn = sqlite3.connect(args.db)
+    conn = _get_db_connection(args.db)
     try:
         updated = _poll_sqs_once(
             conn,
@@ -562,7 +574,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Completed. Applied {updated} bounce(s).")
         return 0
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            log.debug("Error closing DB connection", exc_info=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

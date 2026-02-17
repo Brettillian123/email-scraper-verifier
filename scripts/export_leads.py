@@ -4,11 +4,42 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
+import os
 from collections.abc import Iterable
 from pathlib import Path
 
-from src.db import get_connection
 from src.export.exporter import ExportLead, iter_exportable_leads
+
+log = logging.getLogger(__name__)
+
+
+def _get_db_connection(db_path: str | None = None):
+    """
+    Get a database connection, supporting both PostgreSQL and SQLite.
+
+    - If DATABASE_URL points to PostgreSQL, uses src.db.get_conn() (ignores db_path).
+    - Otherwise, falls back to src.db.get_connection(db_path) for SQLite legacy mode.
+    """
+    url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    is_pg = url.startswith("postgres://") or url.startswith("postgresql://")
+
+    if is_pg:
+        from src.db import get_conn
+
+        log.info("Using PostgreSQL connection via get_conn()")
+        return get_conn()
+
+    # SQLite legacy path
+    from src.db import get_connection
+
+    path = db_path or os.getenv("DB_PATH") or "data/dev.db"
+    log.info("Using SQLite connection: %s", path)
+    return get_connection(path)
+
+
+# Public alias — tests monkeypatch this name
+get_connection = _get_db_connection
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -16,7 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--db",
         default="data/dev.db",
-        help="Path to SQLite DB file (default: data/dev.db).",
+        help="Path to SQLite DB file (default: data/dev.db). "
+        "Ignored when DATABASE_URL points to PostgreSQL.",
     )
     parser.add_argument(
         "--policy",
@@ -50,11 +82,14 @@ def main(argv: list[str] | None = None) -> None:
         else:
             _write_jsonl(out_path, leads)
     finally:
-        # Be defensive so tests can monkeypatch get_connection to return
+        # Be defensive so tests can monkeypatch to return
         # a simple dummy object without a close() method.
         close = getattr(conn, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                log.debug("Error closing DB connection", exc_info=True)
 
 
 def _write_csv(path: Path, leads: Iterable[ExportLead]) -> None:

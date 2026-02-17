@@ -50,7 +50,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 templates = Jinja2Templates(directory="src/auth/templates")
 
 # Configuration
-APP_NAME = os.getenv("APP_NAME", "Email Scraper")
+APP_NAME = os.getenv("APP_NAME", "CrestwellIQ")
 APP_URL = os.getenv("APP_URL", "http://localhost:8000")
 REGISTRATION_ENABLED = os.getenv("REGISTRATION_ENABLED", "true").lower() == "true"
 DEFAULT_TENANT_ID = os.getenv("DEFAULT_TENANT_ID", os.getenv("DEV_TENANT_ID", "dev"))
@@ -642,6 +642,7 @@ async def api_register(request: Request, body: RegisterRequest):
         tenant_id=DEFAULT_TENANT_ID,
         display_name=body.display_name,
         is_verified=False,
+        ip_address=_get_client_ip(request),
     )
 
     if not user:

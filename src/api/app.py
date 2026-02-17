@@ -23,7 +23,7 @@ from src.api import browser as browser_routes
 from src.api.middleware.body_limit import BodySizeLimitMiddleware
 from src.auth import routes as auth_routes
 from src.auth.middleware import RequireAuthMiddleware
-from src.search.backend import SearchBackend, SearchResult, SqliteFtsBackend
+from src.search.backend import SearchBackend, SearchResult
 from src.search.indexing import LeadSearchParams
 
 # --------------------------------------------------------------------------------------
@@ -32,7 +32,10 @@ from src.search.indexing import LeadSearchParams
 
 # Configurable via env; default 5 MiB
 BODY_LIMIT_BYTES = int(os.getenv("BODY_LIMIT_BYTES", str(5 * 1024 * 1024)))
-DB_PATH = os.getenv("DB_PATH", "data/dev.db")
+# NOTE: Database access uses src.db.get_conn() which reads DATABASE_URL.
+# The legacy DB_PATH env var is no longer used by the API layer.
+# If you need the DB_PATH for backwards compatibility in other scripts,
+# use: os.getenv("DB_PATH", "data/dev.db")
 
 
 def _is_postgres_configured() -> bool:
@@ -508,23 +511,17 @@ def _get_search_backend(request: Request) -> SearchBackend:
     if backend is not None:
         return backend
 
-    # Prevent accidental backend mixing: /leads/search is still SQLite-only.
-    if _is_postgres_configured():
+    # Use the backend factory which handles both PostgreSQL and SQLite.
+    from src.search.backend import build_search_backend
+
+    try:
+        backend = build_search_backend()
+    except Exception as exc:
         raise HTTPException(
-            status_code=501,
-            detail=(
-                "/leads/search is SQLite-FTS-only (SqliteFtsBackend). "
-                "You are configured for Postgres via DATABASE_URL/DB_URL. "
-                "Implement a Postgres-backed search backend (Phase 3) "
-                "or run with SQLite for now."
-            ),
-        )
+            status_code=503,
+            detail=f"Search backend unavailable: {exc}",
+        ) from exc
 
-    # Import here to avoid circular import issues at module import time.
-    from src.db import get_connection  # type: ignore[import]
-
-    conn = get_connection(DB_PATH)
-    backend = SqliteFtsBackend(conn)
     request.app.state.search_backend = backend
     return backend
 

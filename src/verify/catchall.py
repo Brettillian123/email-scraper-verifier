@@ -121,13 +121,23 @@ def _is_fresh(checked_at: str | None) -> bool:
     return delta.total_seconds() < CATCHALL_TTL_SECONDS
 
 
-def get_connection() -> sqlite3.Connection:
+def get_connection():
     """
-    R17 helper: return a SQLite connection.
+    R17 helper: return a DB connection (PostgreSQL or SQLite).
+
     Tests monkeypatch this to point at an in-memory DB.
 
-    Default: uses DATABASE_PATH or data/dev.db.
+    - If DATABASE_URL points to PostgreSQL, uses src.db.get_conn()
+      (returns CompatConnection which translates ? placeholders to %s).
+    - Otherwise falls back to SQLite via DATABASE_PATH or data/dev.db.
     """
+    db_url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    if db_url.startswith("postgres://") or db_url.startswith("postgresql://"):
+        from src.db import get_conn
+
+        return get_conn()
+
+    # SQLite fallback (dev/test only)
     db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
     return sqlite3.connect(db_path)
 
@@ -369,10 +379,15 @@ def check_catchall_for_domain(
         )
 
     # --- Fresh probe path ---------------------------------------------------
-    db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
+    # Pass db_path only for SQLite; get_or_resolve_mx uses get_conn() on PG.
+    _db_url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    _is_pg = _db_url.startswith("postgres://") or _db_url.startswith("postgresql://")
+    mx_kwargs: dict = {"force": force}
+    if not _is_pg:
+        mx_kwargs["db_path"] = os.getenv("DATABASE_PATH") or "data/dev.db"
 
     try:
-        mx_res = get_or_resolve_mx(dom, force=force, db_path=db_path)
+        mx_res = get_or_resolve_mx(dom, **mx_kwargs)
     except Exception as exc:
         status: CatchallStatus = "error"
         _update_cached_state(

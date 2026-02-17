@@ -149,7 +149,8 @@ _BLOG_ALLOW_KEYWORDS_RE = re.compile(
 _STRONG_EMPLOYEE_PATH_RE = re.compile(
     r"/("
     r"team|teams|leadership|executive(?:s)?|management|people|staff|"
-    r"board|directors?|governance|advisors?|bios?|who[-_]?we[-_]?are|our[-_]?team"
+    r"board|directors?|governance|advisors?|bios?|who[-_]?we[-_]?are|our[-_]?team|"
+    r"company"
     r")(?:/|$)",
     re.IGNORECASE,
 )
@@ -163,6 +164,7 @@ _ALLOWED_URL_PATTERNS: list[tuple[str, str]] = [
     # Standard about/people pages
     ("about", r"/about(?:/|$)"),
     ("about_us", r"/about[-_]us(?:/|$)"),
+    ("company", r"/company(?:/|$)"),
     ("company_about", r"/company/(?:about|team|leadership)(?:/|$)"),
     ("team", r"/team(?:/|$)"),
     ("teams", r"/teams(?:/|$)"),
@@ -299,7 +301,7 @@ def _extract_heading_blob(text: str) -> str:
     h2_hits: list[str] = []
     for m in _H2_RE.finditer(text[:200_000]):
         h2_hits.append(_strip_tags(m.group(1)))
-        if len(h2_hits) >= 3:
+        if len(h2_hits) >= 6:
             break
     h2_joined = " | ".join([h for h in h2_hits if h])
 

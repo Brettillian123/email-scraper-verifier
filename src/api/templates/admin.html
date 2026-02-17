@@ -4,7 +4,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>Email Scraper – Admin Dashboard</title>
+    <title>CrestwellIQ – Admin Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
         :root {
@@ -546,6 +546,48 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Zero-candidate companies -->
+            <div class="card" id="zero-candidates-card">
+                <div class="card-header">
+                    <h3>🔍 Pages Crawled, Zero Candidates</h3>
+                    <span class="badge badge-warn" id="zero-cand-count-badge">loading…</span>
+                </div>
+                <p style="font-size:0.8rem; color:#9ca3af; margin:0 0 10px;">
+                    Companies with crawled pages but no people extracted — may indicate
+                    extraction gaps or sites that don't expose employee info.
+                    Select companies and optionally individual page URLs to export.
+                </p>
+                <!-- Selection toolbar -->
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
+                    <button onclick="exportZeroCandCsv()" style="padding:6px 14px; border-radius:6px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.82rem; font-weight:500;">
+                        📥 Export CSV
+                    </button>
+                    <button onclick="zcSelectAll()" style="padding:6px 12px; border-radius:6px; border:1px solid #475569; background:transparent; color:#e5e7eb; cursor:pointer; font-size:0.8rem;">
+                        Select All
+                    </button>
+                    <button onclick="zcDeselectAll()" style="padding:6px 12px; border-radius:6px; border:1px solid #475569; background:transparent; color:#e5e7eb; cursor:pointer; font-size:0.8rem;">
+                        Clear
+                    </button>
+                    <span id="zc-selection-count" style="font-size:0.78rem; color:#9ca3af;">0 companies selected</span>
+                </div>
+                <div class="table-scroll" style="max-height:400px;">
+                    <table id="zero-cand-table">
+                        <thead>
+                            <tr>
+                                <th style="width:36px;"><input type="checkbox" id="zc-select-all-cb" title="Select / deselect all" onchange="zcToggleAllCheckbox(this.checked)"></th>
+                                <th style="width:40px;"></th>
+                                <th>Company</th>
+                                <th>Domain</th>
+                                <th>Pages</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr><td colspan="5" class="muted">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <!-- Tab: User Activity -->
@@ -977,6 +1019,264 @@
                 now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
         }
 
+        // ----- Zero-candidate companies: state -----
+        let _zeroCandData = [];
+        // Selection maps: { companyId: Set<source_url> | 'all' }
+        // 'all' means the company is selected with ALL its pages
+        let _zcSelected = {};   // companyId → true (company selected)
+        let _zcPageSel  = {};   // companyId → Set of selected source_urls
+
+        function _zcUpdateSelectionCount() {
+            const ids = Object.keys(_zcSelected).filter(k => _zcSelected[k]);
+            const el = document.getElementById('zc-selection-count');
+            if (el) {
+                const pageCount = ids.reduce((n, id) => {
+                    const s = _zcPageSel[id];
+                    return n + (s ? s.size : 0);
+                }, 0);
+                const parts = [ids.length + ' companies'];
+                if (pageCount > 0) parts.push(pageCount + ' pages');
+                el.textContent = parts.join(', ') + ' selected';
+            }
+            // Sync the header checkbox
+            const allCb = document.getElementById('zc-select-all-cb');
+            if (allCb) {
+                const total = _zeroCandData.length;
+                allCb.checked = total > 0 && ids.length === total;
+                allCb.indeterminate = ids.length > 0 && ids.length < total;
+            }
+        }
+
+        function zcToggleCompany(cid, checked) {
+            if (checked) {
+                _zcSelected[cid] = true;
+                // Auto-select all pages for this company
+                const c = _zeroCandData.find(x => x.company_id === cid);
+                if (c && c.pages) {
+                    _zcPageSel[cid] = new Set(c.pages.map(p => p.source_url).filter(Boolean));
+                } else {
+                    _zcPageSel[cid] = new Set();
+                }
+                // Sync page checkboxes if expanded
+                document.querySelectorAll(`input[data-zc-page-company="${cid}"]`).forEach(cb => { cb.checked = true; });
+            } else {
+                delete _zcSelected[cid];
+                delete _zcPageSel[cid];
+                document.querySelectorAll(`input[data-zc-page-company="${cid}"]`).forEach(cb => { cb.checked = false; });
+            }
+            _zcUpdateSelectionCount();
+        }
+
+        function zcTogglePage(cid, cbEl) {
+            const url = cbEl.getAttribute('data-zc-url') || '';
+            const checked = cbEl.checked;
+            if (!_zcPageSel[cid]) _zcPageSel[cid] = new Set();
+            if (checked) {
+                _zcPageSel[cid].add(url);
+                // If at least one page is selected, also mark the company selected
+                _zcSelected[cid] = true;
+                const companyCb = document.getElementById('zc-cb-' + cid);
+                if (companyCb) companyCb.checked = true;
+            } else {
+                _zcPageSel[cid].delete(url);
+                // If no pages left, deselect company too
+                if (_zcPageSel[cid].size === 0) {
+                    delete _zcSelected[cid];
+                    delete _zcPageSel[cid];
+                    const companyCb = document.getElementById('zc-cb-' + cid);
+                    if (companyCb) companyCb.checked = false;
+                }
+            }
+            _zcUpdateSelectionCount();
+        }
+
+        function zcToggleAllCheckbox(checked) {
+            _zeroCandData.forEach(c => {
+                zcToggleCompany(c.company_id, checked);
+                const cb = document.getElementById('zc-cb-' + c.company_id);
+                if (cb) cb.checked = checked;
+            });
+        }
+
+        function zcSelectAll() {
+            zcToggleAllCheckbox(true);
+            const allCb = document.getElementById('zc-select-all-cb');
+            if (allCb) allCb.checked = true;
+        }
+
+        function zcDeselectAll() {
+            zcToggleAllCheckbox(false);
+            const allCb = document.getElementById('zc-select-all-cb');
+            if (allCb) { allCb.checked = false; allCb.indeterminate = false; }
+        }
+
+        // ----- CSV export -----
+        function _csvEscape(val) {
+            const s = String(val ?? '');
+            if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+                return '"' + s.replace(/"/g, '""') + '"';
+            }
+            return s;
+        }
+
+        function exportZeroCandCsv() {
+            const selectedIds = Object.keys(_zcSelected).filter(k => _zcSelected[k]).map(Number);
+            if (selectedIds.length === 0) {
+                alert('Select at least one company first.');
+                return;
+            }
+
+            const rows = [['company_name', 'domain', 'source_url', 'fetched_at']];
+
+            selectedIds.forEach(cid => {
+                const c = _zeroCandData.find(x => x.company_id === cid);
+                if (!c) return;
+
+                const pageSel = _zcPageSel[cid];
+                const selectedPages = (c.pages || []).filter(p => pageSel && pageSel.has(p.source_url));
+
+                if (selectedPages.length > 0) {
+                    // One row per selected page
+                    selectedPages.forEach(p => {
+                        rows.push([
+                            c.company_name || '',
+                            c.domain || '',
+                            p.source_url || '',
+                            p.fetched_at || '',
+                        ]);
+                    });
+                } else {
+                    // Company selected but no specific pages — one row with domain only
+                    rows.push([
+                        c.company_name || '',
+                        c.domain || '',
+                        '',
+                        '',
+                    ]);
+                }
+            });
+
+            const csv = rows.map(r => r.map(_csvEscape).join(',')).join('\r\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'zero_candidate_companies_' + new Date().toISOString().slice(0, 10) + '.csv';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+        }
+
+        // ----- Expand/collapse -----
+        function toggleZeroCandPages(companyId) {
+            const detailRow = document.getElementById('zc-pages-' + companyId);
+            const arrow = document.getElementById('zc-arrow-' + companyId);
+            if (!detailRow) return;
+            const hidden = detailRow.style.display === 'none';
+            detailRow.style.display = hidden ? 'table-row' : 'none';
+            if (arrow) arrow.textContent = hidden ? '▾' : '▸';
+        }
+
+        // ----- Render table -----
+        function renderZeroCandTable(companies) {
+            _zeroCandData = companies || [];
+            // Reset selection
+            _zcSelected = {};
+            _zcPageSel = {};
+
+            const badge = document.getElementById('zero-cand-count-badge');
+            badge.textContent = _zeroCandData.length + ' companies';
+            badge.className = 'badge ' + (_zeroCandData.length > 0 ? 'badge-warn' : 'badge-ok');
+
+            const tbody = document.querySelector('#zero-cand-table tbody');
+            if (_zeroCandData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="muted">All companies with pages have candidates ✓</td></tr>';
+                _zcUpdateSelectionCount();
+                return;
+            }
+
+            let html = '';
+            _zeroCandData.forEach(c => {
+                const cid = c.company_id;
+                // Summary row: checkbox + expand arrow
+                html += `
+                    <tr>
+                        <td onclick="event.stopPropagation();">
+                            <input type="checkbox" id="zc-cb-${cid}"
+                                   onchange="zcToggleCompany(${cid}, this.checked)"
+                                   title="Select ${escAttr(c.company_name || '')}">
+                        </td>
+                        <td style="cursor:pointer;" onclick="toggleZeroCandPages(${cid})">
+                            <span id="zc-arrow-${cid}" style="font-size:0.9rem;">▸</span>
+                        </td>
+                        <td style="cursor:pointer;" onclick="toggleZeroCandPages(${cid})">${escHtml(c.company_name || '(unnamed)')}</td>
+                        <td class="mono" style="cursor:pointer;" onclick="toggleZeroCandPages(${cid})">${escHtml(c.domain || '-')}</td>
+                        <td class="mono" style="cursor:pointer;" onclick="toggleZeroCandPages(${cid})">${c.page_count}</td>
+                    </tr>
+                `;
+                // Expandable detail row with page-level checkboxes
+                let pagesHtml = '';
+                (c.pages || []).forEach((p, pi) => {
+                    const url = p.source_url || '';
+                    const fetched = p.fetched_at ? formatDate(p.fetched_at) : '-';
+                    const cbId = 'zc-page-' + cid + '-' + pi;
+                    pagesHtml += `
+                        <div style="display:flex; align-items:center; gap:8px; padding:3px 0; border-bottom:1px solid #1e293b;">
+                            <input type="checkbox" id="${cbId}"
+                                   data-zc-page-company="${cid}"
+                                   data-zc-url="${escAttr(url)}"
+                                   onchange="zcTogglePage(${cid}, this)"
+                                   title="Include this page in export">
+                            <a href="${escAttr(url)}" target="_blank" rel="noopener"
+                               style="color:#60a5fa; text-decoration:none; word-break:break-all; font-size:0.78rem; flex:1;" onclick="event.stopPropagation();">
+                                ${escHtml(url)}
+                            </a>
+                            <span style="white-space:nowrap; color:#6b7280; font-size:0.75rem; margin-left:12px;">${fetched}</span>
+                        </div>
+                    `;
+                });
+                html += `
+                    <tr id="zc-pages-${cid}" style="display:none;">
+                        <td colspan="5" style="background:#0f172a; padding:8px 16px;">
+                            <div style="font-size:0.78rem; color:#9ca3af; margin-bottom:4px;">
+                                Crawled pages (${c.page_count}) — check pages to include in export:
+                            </div>
+                            ${pagesHtml || '<span class="muted">No page URLs recorded.</span>'}
+                        </td>
+                    </tr>
+                `;
+            });
+            tbody.innerHTML = html;
+            _zcUpdateSelectionCount();
+        }
+
+        // Minimal HTML-escape helpers (prevent XSS from company names / URLs)
+        function escHtml(s) {
+            const d = document.createElement('div');
+            d.appendChild(document.createTextNode(s));
+            return d.innerHTML;
+        }
+        function escAttr(s) {
+            return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        async function fetchZeroCandidates() {
+            try {
+                const resp = await fetch('/admin/zero-candidate-companies', {
+                    headers: { 'Accept': 'application/json' }
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                renderZeroCandTable(data.companies || []);
+            } catch (err) {
+                console.error('Failed to load zero-candidate companies:', err);
+                const tbody = document.querySelector('#zero-cand-table tbody');
+                tbody.innerHTML = '<tr><td colspan="5" class="err">Failed to load.</td></tr>';
+            }
+        }
+
+        // ----- Data fetching -----
+
         async function fetchMetrics() {
             const resp = await fetch('/admin/metrics', {
                 headers: { 'Accept': 'application/json' }
@@ -1007,11 +1307,17 @@
             updateErrors(data.error_breakdown || {});
         }
 
+        let _zeroCandLoaded = false;
+
         async function refreshAll() {
             const errorBanner = document.getElementById('error-banner');
             try {
                 await fetchMetrics();
                 await fetchAnalytics();
+                if (!_zeroCandLoaded) {
+                    await fetchZeroCandidates();
+                    _zeroCandLoaded = true;
+                }
                 updateLastUpdate();
                 errorBanner.classList.add('hidden');
             } catch (err) {

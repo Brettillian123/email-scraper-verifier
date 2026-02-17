@@ -950,15 +950,30 @@ def _extract_name_near_node(node: Tag | NavigableString) -> str | None:
 def _local_part_role_like(local: str) -> bool:
     """
     Heuristic: does this local-part look like a role/alias inbox?
+
+    Uses token-boundary matching to avoid false positives from substring
+    checks (e.g., "info" matching "bioinformatics", "sales" matching
+    "wholesale"). Splits the local part on non-alpha boundaries and
+    checks each token against ROLE_ALIASES.
     """
     local_lower = local.lower()
+
+    # Exact match is always a hit
     if local_lower in ROLE_ALIASES:
         return True
-    # Also handle e.g. "sales-team", "info_us", "support-emea"
-    stripped = re.sub(r"[^a-z]", "", local_lower)
-    for alias in ROLE_ALIASES:
-        if alias and alias in stripped:
+
+    # Split on non-alpha chars (hyphens, underscores, dots, digits)
+    # e.g., "sales-team" -> ["sales", "team"]
+    # e.g., "info_us"    -> ["info", "us"]
+    # e.g., "support2"   -> ["support"]
+    tokens = re.split(r"[^a-z]+", local_lower)
+    tokens = [t for t in tokens if t]  # remove empty strings
+
+    # Check if any individual token is a role alias
+    for token in tokens:
+        if token in ROLE_ALIASES:
             return True
+
     return False
 
 
@@ -1122,14 +1137,18 @@ def _should_run_people_cards_page(
 
     if classify_page_for_people_extraction is not None:
         try:
-            ok, reason = classify_page_for_people_extraction(  # type: ignore[misc]
-                url=url,
-                html=html,
-                official_domain=effective_domain,
+            verdict = classify_page_for_people_extraction(  # type: ignore[misc]
+                url,
+                html,
             )
-            if not ok:
-                return False, f"skip:classifier:{reason}"
-            return True, f"allow:classifier:{reason}"
+            # classify_page_for_people_extraction returns a PageClassification
+            # dataclass with .ok, .score, .reasons — NOT a plain tuple.
+            v_ok = getattr(verdict, "ok", False)
+            v_reasons = getattr(verdict, "reasons", ("unknown",))
+            reason_str = ",".join(str(r) for r in v_reasons) if v_reasons else "unknown"
+            if not v_ok:
+                return False, f"skip:classifier:{reason_str}"
+            return True, f"allow:classifier:{reason_str}"
         except Exception:
             pass
 

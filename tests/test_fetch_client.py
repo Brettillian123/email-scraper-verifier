@@ -4,17 +4,12 @@ Fetch Client Tests
 
 Tests the HTTP fetch client with robots.txt enforcement.
 
-NOTE: The robots blocking test is SKIPPED due to User-Agent mismatch:
+FIXED: Previously SKIPPED due to User-Agent mismatch:
 - Configured UA: "EmailVerifierBot/0.9 (+https://verifier.crestwellpartners.com; ...)"
-- Test expects: "Email-Scraper"
+- Tests previously used: "Email-Scraper"
 
-The robots.txt used in tests has rules for "Email-Scraper" user agent,
-but the system is configured to use "EmailVerifierBot". This causes the
-robots.txt parser to fall back to the wildcard (*) group.
-
-To fix, either:
-1. Update src/config.py to use "Email-Scraper" in the User-Agent, OR
-2. Update tests to use robots.txt rules for "EmailVerifierBot"
+Now aligned: robots.txt rules in tests use the configured UA's bot name
+(extracted dynamically) so tests pass regardless of config changes.
 """
 
 from __future__ import annotations
@@ -31,7 +26,9 @@ except ImportError:
     HAS_CLIENT = False
     client_mod = None  # type: ignore
 
-# Check configured User-Agent
+# Extract the bot name from the configured User-Agent for use in test robots.txt.
+# This avoids hardcoding "Email-Scraper" or "EmailVerifierBot" and ensures tests
+# always match the actual configured UA.
 try:
     import src.config as config
 
@@ -41,7 +38,24 @@ try:
 except ImportError:
     CONFIGURED_UA = ""
 
-_UA_IS_EMAIL_SCRAPER = "email-scraper" in CONFIGURED_UA.lower()
+
+def _extract_bot_name(ua: str) -> str:
+    """
+    Extract the bot product name from a User-Agent string.
+
+    Examples:
+        "EmailVerifierBot/0.9 (+https://...)" -> "EmailVerifierBot"
+        "Email-Scraper/1.0" -> "Email-Scraper"
+        "" -> "*"
+    """
+    if not ua:
+        return "*"
+    # Take the first token before '/' or space
+    token = ua.split("/")[0].split(" ")[0].strip()
+    return token or "*"
+
+
+BOT_NAME = _extract_bot_name(CONFIGURED_UA)
 
 
 def _host_path(url: str) -> tuple[str, str]:
@@ -70,25 +84,22 @@ def test_basic_fetch_returns_content():
 
 
 @pytest.mark.skipif(not HAS_CLIENT, reason="Fetch client not available")
-@pytest.mark.skip(
-    reason="UA MISMATCH: Configured UA is 'EmailVerifierBot', test expects 'Email-Scraper'"
-)
 @respx.mock
 def test_robots_block_prevents_network_fetch():
     """
     Test that robots.txt blocking returns 451 status.
 
-    NOTE: This test is SKIPPED because the User-Agent doesn't match.
-    The test robots.txt has rules for "Email-Scraper" but the system
-    is configured to use "EmailVerifierBot".
+    Uses the configured bot name dynamically so this test works
+    regardless of whether UA is "EmailVerifierBot" or "Email-Scraper".
     """
     url = "https://blocked.test/secret"
     host, _path = _host_path(url)
 
+    # Use the actual configured bot name in the Disallow rule
     respx.get(f"https://{host}/robots.txt").mock(
         return_value=Response(
             200,
-            text="User-agent: Email-Scraper\nDisallow: /\n",
+            text=f"User-agent: {BOT_NAME}\nDisallow: /\n",
         )
     )
 
@@ -138,3 +149,51 @@ def test_robots_404_allows_fetch():
 
     assert res.status == 200
     assert b"page content" in res.body
+
+
+@pytest.mark.skipif(not HAS_CLIENT, reason="Fetch client not available")
+@respx.mock
+def test_robots_partial_block_allows_other_paths():
+    """
+    Test that a Disallow on /secret still allows /public.
+
+    Uses the configured bot name for the robots.txt rules.
+    """
+    host = "partial.test"
+
+    respx.get(f"https://{host}/robots.txt").mock(
+        return_value=Response(
+            200,
+            text=f"User-agent: {BOT_NAME}\nDisallow: /secret\nAllow: /\n",
+        )
+    )
+
+    respx.get(f"https://{host}/public").mock(return_value=Response(200, text="public ok"))
+    respx.get(f"https://{host}/secret").mock(return_value=Response(200, text="should-not-hit"))
+
+    with client_mod.FetcherClient() as fc:
+        public_res = fc.fetch(f"https://{host}/public")
+        secret_res = fc.fetch(f"https://{host}/secret")
+
+    assert public_res.status == 200
+    assert b"public ok" in public_res.body
+    assert secret_res.status == 451
+
+
+@pytest.mark.skipif(not HAS_CLIENT, reason="Fetch client not available")
+@respx.mock
+def test_robots_server_error_denies_all():
+    """Test that 5xx on robots.txt results in deny-all (conservative)."""
+    host = "error.test"
+
+    respx.get(f"https://{host}/robots.txt").mock(
+        return_value=Response(500, text="Internal Server Error")
+    )
+
+    respx.get(f"https://{host}/page").mock(return_value=Response(200, text="should-not-hit"))
+
+    with client_mod.FetcherClient() as fc:
+        res = fc.fetch(f"https://{host}/page")
+
+    # 5xx on robots.txt → deny_all → 451
+    assert res.status == 451

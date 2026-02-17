@@ -1,6 +1,7 @@
 # src/db.py
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Sequence
@@ -17,6 +18,8 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration / env
 # ---------------------------------------------------------------------------
+
+_db_log = logging.getLogger(__name__)
 
 # SQLite is no longer a production backend. The only supported system of record is Postgres.
 # SQLite support is available only as an explicit dev escape hatch for legacy workflows.
@@ -400,6 +403,7 @@ class CompatCursor:
         try:
             return self._cursor.close()
         except Exception:
+            _db_log.debug("CompatCursor.close() failed", exc_info=True)
             return None
 
 
@@ -433,19 +437,19 @@ class CompatConnection:
         try:
             self._conn.commit()
         except Exception:
-            pass
+            _db_log.debug("CompatConnection.commit() failed", exc_info=True)
 
     def rollback(self) -> None:
         try:
             self._conn.rollback()
         except Exception:
-            pass
+            _db_log.debug("CompatConnection.rollback() failed", exc_info=True)
 
     def close(self) -> None:
         try:
             self._conn.close()
         except Exception:
-            pass
+            _db_log.debug("CompatConnection.close() failed", exc_info=True)
 
     def __enter__(self):
         return self
@@ -455,16 +459,16 @@ class CompatConnection:
             try:
                 self.commit()
             except Exception:
-                pass
+                _db_log.debug("CompatConnection.__exit__ commit failed", exc_info=True)
         else:
             try:
                 self.rollback()
             except Exception:
-                pass
+                _db_log.debug("CompatConnection.__exit__ rollback failed", exc_info=True)
         try:
             self.close()
         except Exception:
-            pass
+            _db_log.debug("CompatConnection.__exit__ close failed", exc_info=True)
         return False
 
     # ---------------- Postgres introspection emulation ----------------

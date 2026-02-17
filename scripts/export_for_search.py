@@ -3,21 +3,65 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
+import logging
+import os
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
-
-def get_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+log = logging.getLogger(__name__)
 
 
-def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Database connection (PostgreSQL + SQLite)
+# ---------------------------------------------------------------------------
+
+
+def _is_postgres_configured() -> bool:
+    """Check if DATABASE_URL points to PostgreSQL."""
+    url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip().lower()
+    return url.startswith("postgres://") or url.startswith("postgresql://")
+
+
+def _get_db_connection(db_path: str | None = None):
+    """
+    Get a database connection, supporting both PostgreSQL and SQLite.
+
+    - If DATABASE_URL points to PostgreSQL, uses src.db.get_conn() (ignores db_path).
+    - Otherwise, falls back to SQLite via src.db.get_connection() or sqlite3.connect().
+    """
+    if _is_postgres_configured():
+        from src.db import get_conn
+
+        log.info("Using PostgreSQL connection via get_conn()")
+        return get_conn()
+
+    # SQLite legacy path
+    path = db_path or os.getenv("DB_PATH") or "data/dev.db"
+
+    try:
+        from src.db import get_connection
+
+        log.info("Using SQLite connection via get_connection(): %s", path)
+        return get_connection(path)
+    except (ImportError, RuntimeError):
+        # Fallback: direct sqlite3 if src.db isn't available or ALLOW_SQLITE_DEV is off
+        import sqlite3
+
+        log.info("Using direct sqlite3 connection: %s", path)
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
+
+
+# ---------------------------------------------------------------------------
+# Lead document iteration
+# ---------------------------------------------------------------------------
+
+
+def iter_leads_for_search(conn: Any) -> Iterator[dict[str, Any]]:
     """
     Yield JSON-serializable lead documents suitable for a search engine mirror.
 
@@ -45,9 +89,6 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
 
     This is intentionally close to what R22/R23's /leads/search will want.
     """
-    # Select from v_emails_latest + people + companies. We keep the SQL as
-    # simple and forgiving as possible: if some columns are missing in older
-    # DBs, you can adjust the query to match your actual schema.
     sql = """
         SELECT
           ve.email          AS email,
@@ -82,7 +123,6 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
 
     cur = conn.execute(sql)
     for row in cur:
-        # Base identity fields
         email = row["email"]
 
         full_name = row["full_name"]
@@ -96,7 +136,6 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
         company_name = row["company_name_norm"] or row["company_name_raw"]
         domain = row["company_domain_official"] or row["company_domain_raw"]
 
-        # Prefer the most specific source_url we have.
         source_url = (
             row["email_source_url"] or row["person_source_url"] or row["company_website_url"]
         )
@@ -116,12 +155,9 @@ def iter_leads_for_search(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
                     if isinstance(tk, list):
                         tech_keywords = [str(x) for x in tk]
             except (TypeError, ValueError):
-                # If attrs isn't valid JSON, we just leave the derived fields as None.
                 pass
 
         doc: dict[str, Any] = {
-            # Use the email itself as the stable ID. Since ux_emails_email exists,
-            # emails are unique.
             "id": f"email:{email}",
             "email": email,
             "first_name": row["first_name"],
@@ -160,7 +196,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--db",
         dest="db_path",
         default="data/dev.db",
-        help="Path to SQLite database (default: data/dev.db)",
+        help="Path to SQLite database (default: data/dev.db). "
+        "Ignored when DATABASE_URL points to PostgreSQL.",
     )
     parser.add_argument(
         "--out",
@@ -174,10 +211,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    db_file = Path(args.db_path)
-    print(f"[O13] Using SQLite database at: {db_file}", file=sys.stderr)
+    db_label = "PostgreSQL" if _is_postgres_configured() else f"SQLite at {args.db_path}"
+    print(f"[O13] Using database: {db_label}", file=sys.stderr)
 
-    conn = get_connection(str(db_file))
+    conn = _get_db_connection(args.db_path)
     try:
         docs = iter_leads_for_search(conn)
 
@@ -192,7 +229,10 @@ def main(argv: list[str] | None = None) -> int:
 
         print("[O13] Export completed.", file=sys.stderr)
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            log.debug("Error closing DB connection", exc_info=True)
 
     return 0
 

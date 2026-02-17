@@ -752,7 +752,24 @@ def _extract_from_linkedin_anchors(
         name_text = anchor.get_text(strip=True)
         title = None
 
-        # If anchor text is empty or not a valid name, look in adjacent elements
+        # If anchor text is empty or not a valid name, check child elements
+        # individually (Framer pattern: <a href="li_url"><img><p>Name</p><p>Title</p></a>)
+        if not name_text or not _looks_like_person_name(name_text):
+            for child in anchor.children:
+                if not hasattr(child, "get_text"):
+                    continue
+                child_text = child.get_text(strip=True)
+                if child_text and _looks_like_person_name(child_text):
+                    name_text = child_text
+                    # Look for title in the next child element
+                    next_child = child.find_next_sibling()
+                    if next_child:
+                        next_text = next_child.get_text(strip=True)
+                        if next_text and _looks_like_title(next_text):
+                            title = next_text
+                    break
+
+        # Final fallback: look in adjacent elements outside the anchor
         if not name_text or not _looks_like_person_name(name_text):
             name_text, title = _find_name_near_linkedin_anchor(anchor)
 
@@ -994,7 +1011,7 @@ def _extract_from_repeated_siblings(
             if hasattr(c, "name") and c.name in ("div", "li", "article")
         ]
 
-        if len(children) < 3:
+        if len(children) < 2:
             continue
 
         child_structures = []
@@ -1164,14 +1181,53 @@ def _extract_name_title_from_parent(parent: Any) -> tuple[str | None, str | None
 
 
 def _extract_name_from_next_sibling(img: Any) -> str | None:
+    """Find a person name in the next sibling of img or its parent.
+
+    Webflow pattern: <div class="photo"><img></div><div class="info">Name</div>
+    The img has no direct sibling — the *parent* div has a next sibling.
+    """
     if not img:
         return None
-    next_sib = img.find_next_sibling()
-    if not next_sib:
-        return None
 
-    sib_text = next_sib.get_text(strip=True) if hasattr(next_sib, "get_text") else str(next_sib)
-    return sib_text if _looks_like_person_name(sib_text) else None
+    # Strategy 1: direct next sibling of the img element
+    next_sib = img.find_next_sibling()
+    if next_sib:
+        sib_text = next_sib.get_text(strip=True) if hasattr(next_sib, "get_text") else str(next_sib)
+        if _looks_like_person_name(sib_text):
+            return sib_text
+
+    # Strategy 2: parent's next sibling (Webflow wrapper pattern)
+    parent = getattr(img, "parent", None)
+    if parent is not None:
+        parent_sib = parent.find_next_sibling()
+        if parent_sib:
+            # Check the sibling element's direct text
+            psib_text = (
+                parent_sib.get_text(strip=True)
+                if hasattr(parent_sib, "get_text")
+                else str(parent_sib)
+            )
+            if _looks_like_person_name(psib_text):
+                return psib_text
+            # Also check first child string (headings inside the sibling)
+            if hasattr(parent_sib, "stripped_strings"):
+                for s in parent_sib.stripped_strings:
+                    if _looks_like_person_name(s):
+                        return s
+                    break  # only check first meaningful string
+
+    # Strategy 3: grandparent's next sibling (deeper nesting)
+    if parent is not None:
+        grandparent = getattr(parent, "parent", None)
+        if grandparent is not None:
+            gp_sib = grandparent.find_next_sibling()
+            if gp_sib and hasattr(gp_sib, "stripped_strings"):
+                for s in gp_sib.stripped_strings:
+                    if _looks_like_person_name(s):
+                        return s
+                    break
+
+    return None
 
 
 def _extract_from_image_text_patterns(
@@ -1197,6 +1253,21 @@ def _extract_from_image_text_patterns(
 
         name_text = alt_name or adj_name or sib_name
         title_text = alt_title or adj_title
+
+        # If we found a name from a sibling but no title, look for title
+        # in the same sibling container (Webflow: name and title colocated).
+        if name_text and not title_text and (not alt_name and not adj_name):
+            parent = getattr(img, "parent", None)
+            if parent is not None:
+                parent_sib = parent.find_next_sibling()
+                if parent_sib and hasattr(parent_sib, "stripped_strings"):
+                    strings = list(parent_sib.stripped_strings)
+                    for i, s in enumerate(strings):
+                        if s.strip().lower() == name_text.strip().lower() and i + 1 < len(strings):
+                            potential = strings[i + 1].strip()
+                            if _looks_like_title(potential):
+                                title_text = potential
+                            break
 
         if not name_text:
             continue

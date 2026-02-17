@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <title>Email Scraper Dashboard</title>
+    <title>CrestwellIQ Main Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
         :root {
@@ -652,8 +652,8 @@
     <div class="container">
         <header>
             <div>
-                <h1>Email Scraper Dashboard</h1>
-                <div class="subtitle">Multi-tenant control-plane UI (runs, companies, people, emails)</div>
+                <h1>CrestwellIQ Main Dashboard</h1>
+                <div class="subtitle">Lead intelligence platform — runs, companies, people, emails</div>
             </div>
             <div class="header-right">
                 <div class="text-muted">
@@ -823,7 +823,14 @@ another.com"></textarea>
                 </div>
 
                 <div class="search-box" style="justify-content:flex-start;">
-                    <button class="btn btn-primary" onclick="exportSelectedCompaniesCsv()">Export selected (valid emails)</button>
+                    <select id="export-status-filter" style="width: auto; min-width: 150px;">
+                        <option value="">All people</option>
+                        <option value="valid">Valid emails only</option>
+                        <option value="risky_catch_all">Risky (catch-all)</option>
+                        <option value="invalid">Invalid only</option>
+                        <option value="unknown_timeout">Unknown/Timeout</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="exportSelectedCompaniesCsv()">Export CSV</button>
                     <button class="btn btn-secondary" onclick="clearCompanySelection()">Clear selection</button>
                     <span class="text-muted" id="selected-company-count">0 selected</span>
                 </div>
@@ -1035,7 +1042,9 @@ another.com"></textarea>
                 return;
             }
 
-            const url = `/api/browser/companies/export.csv?ids=${encodeURIComponent(ids.join(','))}`;
+            const statusFilter = document.getElementById('export-status-filter')?.value || '';
+            let url = `/api/browser/companies/export.csv?ids=${encodeURIComponent(ids.join(','))}`;
+            if (statusFilter) url += `&status=${encodeURIComponent(statusFilter)}`;
 
             try {
                 const resp = await fetch(url);
@@ -1050,7 +1059,8 @@ another.com"></textarea>
                 const href = URL.createObjectURL(blob);
 
                 a.href = href;
-                a.download = `company_people_valid_emails_${new Date().toISOString().slice(0,10)}.csv`;
+                const suffix = statusFilter ? `_${statusFilter}` : '';
+                a.download = `company_people${suffix}_${new Date().toISOString().slice(0,10)}.csv`;
                 document.body.appendChild(a);
                 a.click();
 

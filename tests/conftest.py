@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -279,16 +280,76 @@ def temp_db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def db_conn():
+def db_conn(monkeypatch: pytest.MonkeyPatch):
     """
-    Fixture providing a database connection.
+    Fixture providing a database connection with transaction rollback isolation.
 
-    Uses src.db.get_conn() which works for both PostgreSQL and SQLite.
+    PostgreSQL:
+      - Opens a single connection and creates a SAVEPOINT before the test.
+      - Monkeypatches src.db.get_conn() (and get_connection()) so ALL code
+        paths under test use this same isolated connection.
+      - Intercepts conn.commit() to release/re-create the savepoint,
+        so the outer transaction is never actually committed.
+      - Intercepts conn.close() to prevent premature closure by code under test.
+      - On teardown, ROLLBACK undoes ALL changes — nothing persists
+        in the real database, even if the test errors out.
+
+    SQLite (legacy dev mode):
+      - Uses src.db.get_conn() directly (already isolated by temp file).
     """
-    from src.db import get_conn
+    import src.db as db_mod
 
-    conn = get_conn()
+    conn = db_mod.get_conn()
+
+    # Detect if this is a PostgreSQL CompatConnection
+    is_pg = getattr(conn, "is_postgres", False)
+
+    if is_pg:
+        # Save originals before patching
+        _original_commit = conn.commit
+        _original_close = conn.close
+
+        # Create a savepoint so we can roll back everything on teardown.
+        try:
+            conn.execute("SAVEPOINT _test_isolation")
+        except Exception:
+            pass
+
+        def _savepoint_commit():
+            """Replace real commit with savepoint cycle."""
+            try:
+                conn.execute("RELEASE SAVEPOINT _test_isolation")
+            except Exception:
+                pass
+            try:
+                conn.execute("SAVEPOINT _test_isolation")
+            except Exception:
+                pass
+
+        def _noop_close():
+            """Prevent code under test from closing our shared connection."""
+            pass
+
+        conn.commit = _savepoint_commit  # type: ignore[assignment]
+        conn.close = _noop_close  # type: ignore[assignment]
+
+        # Monkeypatch get_conn and get_connection so ALL code paths use
+        # this same isolated connection instead of opening new ones.
+        monkeypatch.setattr(db_mod, "get_conn", lambda: conn)
+        if hasattr(db_mod, "get_connection"):
+            monkeypatch.setattr(db_mod, "get_connection", lambda *a, **kw: conn)
+
     yield conn
+
+    if is_pg:
+        # Restore originals and ROLLBACK everything
+        conn.commit = _original_commit  # type: ignore[assignment]  # noqa: F821
+        conn.close = _original_close  # type: ignore[assignment]  # noqa: F821
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+
     try:
         conn.close()
     except Exception:
@@ -304,19 +365,27 @@ def clean_db(db_conn):
     """
     yield db_conn
 
+    # Whitelist of tables that are safe to clean.
+    # SECURITY: Never interpolate table names from external input without validation.
+    _CLEANABLE_TABLES = frozenset({"emails", "people", "companies"})
+
     # Clean up test data (order matters due to foreign keys)
     tables = ["emails", "people", "companies"]
     for table in tables:
+        # Validate table name against whitelist (defense-in-depth)
+        assert table in _CLEANABLE_TABLES, f"Table {table!r} not in cleanup whitelist"
+        assert re.match(r"^[a-z_]+$", table), f"Invalid table name: {table!r}"
+
         try:
-            # Delete non-essential test data (preserve tenants)
             db_conn.execute(f"DELETE FROM {table} WHERE tenant_id = 'dev'")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Log instead of silently swallowing — helps debug test failures
+            print(f"[clean_db] Warning: failed to clean {table}: {exc}")
 
     try:
         db_conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[clean_db] Warning: commit failed: {exc}")
 
 
 @pytest.fixture(scope="session")

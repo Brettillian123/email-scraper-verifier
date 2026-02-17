@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from src.admin.audit import log_admin_action
-from src.admin.metrics import get_admin_summary, get_analytics_summary
+from src.admin.metrics import get_admin_summary, get_analytics_summary, get_zero_candidate_companies
 from src.api.deps import require_admin
 
 if TYPE_CHECKING:
@@ -89,7 +89,7 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
                 SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
-                WHERE is_approved = FALSE
+                WHERE is_approved = FALSE AND is_verified = TRUE
                 ORDER BY created_at DESC
                 """
             )
@@ -99,6 +99,7 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
                 SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
+                WHERE is_verified = TRUE
                 ORDER BY created_at DESC
                 """
             )
@@ -315,6 +316,34 @@ def admin_analytics(
     )
 
     return analytics
+
+
+@router.get("/zero-candidate-companies")
+def admin_zero_candidate_companies(request: Request) -> dict[str, object]:
+    """
+    Companies that have crawled pages but produced 0 candidate people.
+
+    Useful for diagnosing extraction gaps — the admin can inspect which
+    URLs were crawled and decide whether the pages are worth re-processing
+    or if the site simply doesn't expose employee info.
+    """
+    from src.db import get_conn
+
+    conn = get_conn()
+    try:
+        companies = get_zero_candidate_companies(conn)
+    finally:
+        conn.close()
+
+    remote_ip = request.client.host if request.client else None
+    log_admin_action(
+        action="view_zero_candidate_companies",
+        user_id=None,
+        remote_ip=remote_ip,
+        metadata={"path": "/admin/zero-candidate-companies", "count": len(companies)},
+    )
+
+    return {"companies": companies, "count": len(companies)}
 
 
 # ---------------------------------------------------------------------------

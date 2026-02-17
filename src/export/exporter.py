@@ -225,12 +225,17 @@ def iter_exportable_leads(
 
 def _escape_cell(value: str | None) -> str | None:
     """
-    Guard against Excel/Sheets "formula injection" by prefixing any cell that
-    starts with =, +, -, or @ with a single quote.
+    Guard against Excel/Sheets "formula injection" (CSV Injection / DDE attacks).
+
+    Prefixes any cell starting with a dangerous character with a single quote.
+    Dangerous characters per OWASP CSV Injection guidance:
+      =  +  -  @  \t (tab)  \r (carriage return)
+
+    Reference: https://owasp.org/www-community/attacks/CSV_Injection
     """
     if value is None:
         return None
-    if value and value[0] in ("=", "+", "-", "@"):
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + value
     return value
 

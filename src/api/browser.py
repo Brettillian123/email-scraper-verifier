@@ -130,6 +130,7 @@ class PaginatedResponse(BaseModel):
 # --------------------------------------------------------------------------------------
 
 _ALLOWED_MODES = {"full", "autodiscovery", "generate", "verify"}
+_ALLOWED_EXPORT_STATUS_FILTERS = {"valid", "invalid", "risky_catch_all", "unknown_timeout"}
 
 
 def _normalize_modes(modes: Iterable[str] | None) -> list[str]:
@@ -334,6 +335,188 @@ def _iter_fetchmany(cur: Any, batch_size: int = 1000):
             yield row
 
 
+def _export_name_expr() -> str:
+    return (
+        "COALESCE("
+        "NULLIF(p.full_name, ''), "
+        "NULLIF(BTRIM(COALESCE(p.first_name,'') || ' ' || COALESCE(p.last_name,'')), '')"
+        ")"
+    )
+
+
+def _export_vr_expr(vr_has_fallback: bool) -> tuple[str, str]:
+    if vr_has_fallback:
+        return "COALESCE(vr.verify_status, vr.status, vr.fallback_status, '')", (
+            "verify_status, status, fallback_status, verified_at, id"
+        )
+    return "COALESCE(vr.verify_status, vr.status, '')", "verify_status, status, verified_at, id"
+
+
+def _export_status_filter_clause(
+    *,
+    status_filter: str,
+    vr_status_expr: str,
+    where_parts: list[str],
+) -> tuple[str, list[Any]]:
+    if status_filter not in _ALLOWED_EXPORT_STATUS_FILTERS:
+        return "", []
+
+    if status_filter == "valid":
+        status_where = f"AND LOWER({vr_status_expr}) LIKE %s"
+        status_params: list[Any] = ["valid%"]
+    else:
+        status_where = f"AND LOWER({vr_status_expr}) = %s"
+        status_params = [status_filter]
+
+    where_parts.append("e.id IS NOT NULL")
+    where_parts.append("vr.id IS NOT NULL")
+    return status_where, status_params
+
+
+def _export_join_tenant_clauses(
+    *,
+    tenant_id: str,
+    emails_has_tenant: bool,
+    vr_has_tenant: bool,
+) -> tuple[str, list[Any], str, list[Any]]:
+    e_tenant_clause = ""
+    e_tenant_params: list[Any] = []
+    if emails_has_tenant:
+        e_tenant_clause = "AND e.tenant_id = %s"
+        e_tenant_params = [tenant_id]
+
+    vr_tenant_clause = ""
+    vr_tenant_params: list[Any] = []
+    if vr_has_tenant and emails_has_tenant:
+        vr_tenant_clause = "AND vr.tenant_id = e.tenant_id"
+    elif vr_has_tenant:
+        vr_tenant_clause = "AND vr.tenant_id = %s"
+        vr_tenant_params = [tenant_id]
+
+    return e_tenant_clause, e_tenant_params, vr_tenant_clause, vr_tenant_params
+
+
+def _export_selected_companies_sql(
+    con: Any,
+    *,
+    tenant_id: str,
+    company_ids: list[int],
+    status_filter: str,
+) -> tuple[str, tuple[Any, ...]]:
+    companies_has_tenant = _has_column(con, "companies", "tenant_id")
+    people_has_tenant = _has_column(con, "people", "tenant_id")
+    emails_has_tenant = _has_column(con, "emails", "tenant_id")
+    vr_has_tenant = _has_column(con, "verification_results", "tenant_id")
+    vr_has_fallback = _has_column(con, "verification_results", "fallback_status")
+
+    name_expr = _export_name_expr()
+    vr_status_expr, vr_select_cols = _export_vr_expr(vr_has_fallback)
+
+    placeholders = ",".join(["%s"] * len(company_ids))
+    where_parts: list[str] = [f"c.id IN ({placeholders})"]
+    where_params: list[Any] = list(company_ids)
+
+    if companies_has_tenant:
+        where_parts.append("c.tenant_id = %s")
+        where_params.append(tenant_id)
+    if people_has_tenant:
+        where_parts.append("p.tenant_id = %s")
+        where_params.append(tenant_id)
+
+    where_parts.append(f"{name_expr} IS NOT NULL AND {name_expr} <> ''")
+
+    status_where, status_params = _export_status_filter_clause(
+        status_filter=status_filter,
+        vr_status_expr=vr_status_expr,
+        where_parts=where_parts,
+    )
+
+    where_clause = " AND ".join(where_parts)
+
+    (
+        e_tenant_clause,
+        e_tenant_params,
+        vr_tenant_clause,
+        vr_tenant_params,
+    ) = _export_join_tenant_clauses(
+        tenant_id=tenant_id,
+        emails_has_tenant=emails_has_tenant,
+        vr_has_tenant=vr_has_tenant,
+    )
+
+    sql = f"""
+        SELECT DISTINCT ON (c.id, p.id)
+            COALESCE(NULLIF(c.domain,''), NULLIF(c.official_domain,'')) AS company_domain,
+            {name_expr} AS full_name,
+            p.title AS title,
+            e.email AS email,
+            CASE WHEN e.id IS NOT NULL AND vr.id IS NOT NULL
+                 THEN LOWER({vr_status_expr})
+                 ELSE ''
+            END AS verify_status
+        FROM companies c
+        JOIN people p
+          ON p.company_id = c.id
+        LEFT JOIN emails e
+          ON e.company_id = c.id
+         AND e.person_id = p.id
+         AND e.email IS NOT NULL
+         AND e.email <> ''
+         {e_tenant_clause}
+        LEFT JOIN LATERAL (
+            SELECT {vr_select_cols}
+            FROM verification_results vr
+            WHERE vr.email_id = e.id
+              {vr_tenant_clause}
+            ORDER BY vr.verified_at DESC NULLS LAST, vr.id DESC
+            LIMIT 1
+        ) vr ON e.id IS NOT NULL
+        WHERE {where_clause}
+        {status_where}
+        ORDER BY c.id, p.id, vr.verified_at DESC NULLS LAST, vr.id DESC, e.id DESC
+    """
+
+    all_params = tuple(e_tenant_params + vr_tenant_params + where_params + status_params)
+    return sql, all_params
+
+
+def _export_selected_companies_csv_generator(con: Any, cur: Any):
+    try:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+
+        writer.writerow(["company_domain", "full_name", "title", "email", "verify_status"])
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+
+        for row in _iter_fetchmany(cur, batch_size=1000):
+            writer.writerow(
+                [
+                    row[0] or "",  # company_domain
+                    row[1] or "",  # full_name
+                    row[2] or "",  # title
+                    row[3] or "",  # email
+                    row[4] or "",  # verify_status
+                ]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _export_selected_companies_filename(status_filter: str) -> str:
+    filename = "companies_export"
+    if status_filter:
+        filename += f"_{status_filter}"
+    return f"{filename}.csv"
+
+
 # --------------------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------------------
@@ -371,12 +554,13 @@ def get_stats(auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[s
             if _has_column(con, "verification_results", "tenant_id"):
                 where += " AND tenant_id = %s"
                 params.append(tenant_id)
-            rows = con.execute(
+
+            sql = (
                 "SELECT verify_status, COUNT(*) "
                 f"FROM verification_results {where} "
-                "GROUP BY verify_status",
-                tuple(params),
-            ).fetchall()
+                "GROUP BY verify_status"
+            )
+            rows = con.execute(sql, tuple(params)).fetchall()
             stats["verification_breakdown"] = {r[0]: r[1] for r in rows}
         except Exception:
             stats["verification_breakdown"] = {}
@@ -522,16 +706,18 @@ def list_companies(
 def export_selected_companies_csv(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
     ids: str = Query(..., description="Comma-separated company IDs"),
+    status: str = Query(
+        "",
+        description="Filter: valid, invalid, risky_catch_all, or empty for all",
+    ),
 ) -> StreamingResponse:
     """
-    Export selected companies' people with VALID emails only.
+    Export selected companies' people as CSV.
 
-    CSV columns (exact):
-      - company_domain
-      - full_name
-      - email
+    Default: ALL people (even those without emails yet).
+    Pass ?status=valid to restrict to verified-valid emails only.
 
-    Source of truth for validity: latest verification_results for each email.
+    CSV columns: company_domain, full_name, title, email, verify_status
     """
     company_ids = _parse_company_ids(ids)
     if not company_ids:
@@ -541,128 +727,47 @@ def export_selected_companies_csv(
         )
 
     tenant_id = auth.tenant_id
+    status_filter = (status or "").strip().lower()
 
     con = _get_conn()
-    cur = None
     try:
-        companies_has_tenant = _has_column(con, "companies", "tenant_id")
-        people_has_tenant = _has_column(con, "people", "tenant_id")
-        emails_has_tenant = _has_column(con, "emails", "tenant_id")
-        vr_has_tenant = _has_column(con, "verification_results", "tenant_id")
-
-        # Person name normalization (used in SELECT and WHERE)
-        name_expr = (
-            "COALESCE("
-            "NULLIF(p.full_name, ''), "
-            "NULLIF(BTRIM(COALESCE(p.first_name,'') || ' ' || COALESCE(p.last_name,'')), '')"
-            ")"
+        sql, params = _export_selected_companies_sql(
+            con,
+            tenant_id=tenant_id,
+            company_ids=company_ids,
+            status_filter=status_filter,
         )
+        try:
+            cur = con.execute(sql, params)
+        except Exception as exc:
+            try:
+                con.close()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"CSV export query failed: {exc}",
+            ) from exc
 
-        # We want one row per person: pick the "best" valid email using DISTINCT ON.
-        placeholders = ",".join(["%s"] * len(company_ids))
+        filename = _export_selected_companies_filename(status_filter)
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
 
-        where_parts: list[str] = [f"c.id IN ({placeholders})"]
-        params: list[Any] = list(company_ids)
-
-        if companies_has_tenant:
-            where_parts.append("c.tenant_id = %s")
-            params.append(tenant_id)
-        if people_has_tenant:
-            where_parts.append("p.tenant_id = %s")
-            params.append(tenant_id)
-        if emails_has_tenant:
-            where_parts.append("e.tenant_id = %s")
-            params.append(tenant_id)
-
-        where_parts.append("e.person_id IS NOT NULL")
-        where_parts.append("e.email IS NOT NULL AND e.email <> ''")
-        where_parts.append(f"{name_expr} IS NOT NULL AND {name_expr} <> ''")
-
-        # Status filter via bound parameter (pattern contains %)
-        where_parts.append(
-            "LOWER(COALESCE(vr.verify_status, vr.status, vr.fallback_status, '')) LIKE %s"
+        return StreamingResponse(
+            _export_selected_companies_csv_generator(con, cur),
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
         )
-        params.append("valid%")
-
-        # CRITICAL: do not place a %s placeholder inside the LATERAL
-        # block unless it is the FIRST param.
-        # Preferred: correlate tenant via emails if both tables have
-        # tenant_id.
-        vr_tenant_clause = ""
-        vr_params_prefix: list[Any] = []
-        if vr_has_tenant and emails_has_tenant:
-            vr_tenant_clause = "AND vr.tenant_id = e.tenant_id"
-        elif vr_has_tenant:
-            # emails table doesn't have tenant_id, so filter
-            # verification_results by tenant explicitly.
-            # Because this placeholder appears before the outer
-            # WHERE placeholders, its param MUST be first.
-            vr_tenant_clause = "AND vr.tenant_id = %s"
-            vr_params_prefix = [tenant_id]
-
-        where_clause = " AND ".join(where_parts)
-
-        sql = f"""
-            SELECT DISTINCT ON (c.id, p.id)
-                COALESCE(NULLIF(c.domain,''), NULLIF(c.official_domain,'')) AS company_domain,
-                {name_expr} AS full_name,
-                e.email AS email
-            FROM companies c
-            JOIN people p
-              ON p.company_id = c.id
-            JOIN emails e
-              ON e.company_id = c.id
-             AND e.person_id = p.id
-            JOIN LATERAL (
-                SELECT verify_status, status, fallback_status, verified_at, id
-                FROM verification_results vr
-                WHERE vr.email_id = e.id
-                  {vr_tenant_clause}
-                ORDER BY vr.verified_at DESC NULLS LAST, vr.id DESC
-                LIMIT 1
-            ) vr ON TRUE
-            WHERE {where_clause}
-            ORDER BY c.id, p.id, vr.verified_at DESC NULLS LAST, vr.id DESC, e.id DESC
-        """
-
-        # Preflight execute here so SQL errors return a proper 4xx/5xx (not a 200 with empty body).
-        cur = con.execute(sql, tuple(vr_params_prefix + params))
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         try:
             con.close()
         except Exception:
             pass
         raise HTTPException(
             status_code=500,
-            detail=f"CSV export query failed: {e}",
-        ) from e
-
-    def generate():
-        nonlocal con, cur
-        try:
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-
-            writer.writerow(["company_domain", "full_name", "email"])
-            yield buf.getvalue()
-            buf.seek(0)
-            buf.truncate(0)
-
-            for company_domain, full_name, email in _iter_fetchmany(cur, batch_size=1000):
-                writer.writerow([company_domain or "", full_name or "", email or ""])
-                yield buf.getvalue()
-                buf.seek(0)
-                buf.truncate(0)
-        finally:
-            try:
-                con.close()
-            except Exception:
-                pass
-
-    headers = {
-        "Content-Disposition": 'attachment; filename="companies_export.csv"',
-    }
-    return StreamingResponse(generate(), media_type="text/csv; charset=utf-8", headers=headers)
+            detail=f"CSV export failed: {exc}",
+        ) from exc
 
 
 @router.get("/companies/{company_id}")
@@ -749,12 +854,12 @@ def get_company(
             pages_where += " AND tenant_id = %s"
             pages_params.append(tenant_id)
 
-        pages = con.execute(
-            "SELECT id, source_url, LENGTH(html), fetched_at"
-            f" FROM sources {pages_where}"
-            " ORDER BY fetched_at DESC",
-            tuple(pages_params),
-        ).fetchall()
+        pages_sql = (
+            "SELECT id, source_url, LENGTH(html), fetched_at "
+            f"FROM sources {pages_where} "
+            "ORDER BY fetched_at DESC"
+        )
+        pages = con.execute(pages_sql, tuple(pages_params)).fetchall()
 
         risk_map = _domain_risk_levels_for_company_ids(
             con,
@@ -1034,6 +1139,9 @@ def list_runs(
 
         items: list[dict[str, Any]] = []
         for r in rows:
+            domains: list[Any]
+            options: dict[str, Any]
+            progress: dict[str, Any]
             domains, options, progress = [], {}, {}
             try:
                 domains = json.loads(r[3]) if r[3] else []
@@ -1197,19 +1305,19 @@ def create_run(
                 "domain_count": len(domains),
                 "modes": modes,
             }
-        except Exception as e:
+        except Exception as exc:
             try:
                 con.execute(
                     "UPDATE runs SET status = 'failed', error = %s WHERE id = %s",
-                    (f"Failed to enqueue: {e}", run_id),
+                    (f"Failed to enqueue: {exc}", run_id),
                 )
                 con.commit()
             except Exception:
                 pass
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to enqueue run: {e}",
-            ) from e
+                detail=f"Failed to enqueue run: {exc}",
+            ) from exc
     finally:
         try:
             con.close()

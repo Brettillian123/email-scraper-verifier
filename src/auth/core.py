@@ -58,6 +58,10 @@ LOCKOUT_DURATION_MINUTES = int(os.getenv("LOCKOUT_DURATION_MINUTES", "15"))
 # Password requirements
 MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", "8"))
 
+# Registration rate limiting (unverified re-registration)
+REGISTRATION_MAX_ATTEMPTS = int(os.getenv("REGISTRATION_MAX_ATTEMPTS", "3"))
+REGISTRATION_WINDOW_DAYS = int(os.getenv("REGISTRATION_WINDOW_DAYS", "7"))
+
 
 # ---------------------------------------------------------------------------
 # Password Hashing (bcrypt via hashlib fallback if bcrypt unavailable)
@@ -302,9 +306,14 @@ def create_user(
     display_name: str | None = None,
     is_verified: bool = False,
     is_approved: bool = False,
+    ip_address: str | None = None,
 ) -> tuple[User | None, str | None]:
     """
     Create a new user.
+
+    If an unverified user already exists with the same email, the old record
+    is replaced (allowing re-registration). This is rate-limited to
+    REGISTRATION_MAX_ATTEMPTS per REGISTRATION_WINDOW_DAYS to prevent abuse.
 
     Args:
         email: User's email address
@@ -313,6 +322,7 @@ def create_user(
         display_name: Optional display name
         is_verified: Whether email is verified (default False)
         is_approved: Whether user is approved to access the app (default False)
+        ip_address: Client IP for rate-limit tracking
 
     Returns (user, error_message).
     """
@@ -330,7 +340,18 @@ def create_user(
     # Check if user exists
     existing = get_user_by_email(email)
     if existing:
-        return None, "An account with this email already exists"
+        if existing.is_verified:
+            # Verified account — cannot re-register
+            return None, "An account with this email already exists"
+
+        # Unverified account — allow re-registration with rate limiting
+        rate_ok, rate_err = _check_registration_rate_limit(email)
+        if not rate_ok:
+            return None, rate_err
+
+        # Delete old unverified user + cascade cleanup
+        _delete_unverified_user(existing.id)
+        logger.info("Replaced unverified user for re-registration: %s", email)
 
     user_id = _generate_user_id()
     password_hash = hash_password(password)
@@ -378,6 +399,9 @@ def create_user(
             (user_id, tenant_id, now, now),
         )
 
+        # Track registration attempt for rate limiting
+        _record_registration_attempt(conn, email, ip_address)
+
         conn.commit()
 
         user = get_user_by_id(user_id)
@@ -387,6 +411,105 @@ def create_user(
         conn.rollback()
         logger.exception("Failed to create user")
         return None, f"Failed to create account: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Registration Rate Limiting
+# ---------------------------------------------------------------------------
+
+
+def _check_registration_rate_limit(email: str) -> tuple[bool, str | None]:
+    """
+    Check if email has exceeded registration attempts (3 per 7 days).
+
+    Returns (is_allowed, error_message).
+    """
+    conn = _get_conn()
+    try:
+        window_start = (_utc_now() - timedelta(days=REGISTRATION_WINDOW_DAYS)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # Check registration_attempts table (if it exists)
+        try:
+            cur = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM registration_attempts
+                WHERE LOWER(email) = %s AND created_at > %s
+                """,
+                (email.lower().strip(), window_start),
+            )
+            row = cur.fetchone()
+            count = row["cnt"] if row else 0
+        except Exception:
+            # Table may not exist yet (pre-migration); allow registration
+            return True, None
+
+        if count >= REGISTRATION_MAX_ATTEMPTS:
+            remaining_days = REGISTRATION_WINDOW_DAYS
+            return False, (
+                f"Too many registration attempts for this email. "
+                f"Please wait up to {remaining_days} days before trying again, "
+                f"or verify the code sent to your email."
+            )
+
+        return True, None
+    finally:
+        conn.close()
+
+
+def _record_registration_attempt(conn: Any, email: str, ip_address: str | None = None) -> None:
+    """Record a registration attempt for rate-limit tracking."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO registration_attempts (email, ip_address, created_at)
+            VALUES (%s, %s, %s)
+            """,
+            (email.lower().strip(), ip_address, _utc_now_iso()),
+        )
+    except Exception:
+        # Table may not exist yet; don't block registration
+        logger.debug("registration_attempts table not available, skipping tracking")
+
+
+def _delete_unverified_user(user_id: str) -> None:
+    """
+    Delete an unverified user and all associated records.
+
+    This allows the email to be re-registered with a fresh account.
+    Only deletes if the user is NOT verified (safety check).
+    """
+    conn = _get_conn()
+    try:
+        # Safety: only delete unverified users
+        cur = conn.execute(
+            "SELECT id FROM users WHERE id = %s AND is_verified = FALSE",
+            (user_id,),
+        )
+        if not cur.fetchone():
+            logger.warning("Refusing to delete verified user %s", user_id)
+            return
+
+        # Delete in dependency order
+        for table in [
+            "email_verification_tokens",
+            "sessions",
+            "user_limits",
+        ]:
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+            except Exception:
+                pass  # Table may not exist
+
+        conn.execute("DELETE FROM users WHERE id = %s AND is_verified = FALSE", (user_id,))
+        conn.commit()
+        logger.info("Deleted unverified user %s for re-registration", user_id)
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to delete unverified user %s", user_id)
     finally:
         conn.close()
 

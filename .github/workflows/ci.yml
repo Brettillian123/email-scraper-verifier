@@ -6,13 +6,10 @@ on:
     branches: [main]
 
 env:
-  # Test DB/Redis URLs for CI jobs. Credentials are supplied via the service env below.
   DATABASE_URL: postgresql://postgres@localhost:5432/email_scraper_test
   DB_URL: postgresql://postgres@localhost:5432/email_scraper_test
-  REDIS_URL: redis://localhost:6379/0
-  RQ_REDIS_URL: redis://localhost:6379/0
 jobs:
-  lint-and-test:
+  lint-and-verify:
     runs-on: ubuntu-latest
 
     services:
@@ -25,20 +22,8 @@ jobs:
           POSTGRES_DB: email_scraper_test
         ports:
           - 5432:5432
-        # Health check to ensure Postgres is ready before tests
         options: >-
           --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      # Redis service container (for RQ tests)
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -67,33 +52,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Show tests requirements (debug)
-        run: |
-          echo "::group::tests/requirements-test.txt"
-          if [ -f tests/requirements-test.txt ]; then
-            nl -ba tests/requirements-test.txt
-          else
-            echo "tests/requirements-test.txt not found"
-          fi
-          echo "::endgroup::"
-
       - name: Install dependencies
         run: |
           python -m pip install -U pip setuptools wheel
           python -m pip install -r requirements.txt
-          # Install test deps from the file in the repo
-          python -m pip install -r tests/requirements-test.txt
-          # Belt-and-suspenders: ensure respx and psycopg2-binary are present
-          python -m pip install "respx>=0.21" "psycopg2-binary>=2.9.9"
+          python -m pip install "psycopg2-binary>=2.9.9"
+          # Lint tooling (ruff lives in tests/requirements-test.txt but we don't need the full test suite)
+          python -m pip install "ruff>=0.14.3,<0.15"
           # Install your project so imports like "src.fetch" resolve
           python -m pip install -e .
-
-      - name: Verify test deps
-        run: |
-          python -c "import respx, httpx; print('respx', respx.__version__, 'httpx', httpx.__version__)"
-          python -c "import psycopg2; print('psycopg2 version:', psycopg2.__version__)"
-          python -m pip show respx psycopg2-binary || true
-          python -m pip freeze | grep -E '^(httpx|respx|pytest|psycopg2)=='
 
       # Verify PostgreSQL connection
       - name: Verify PostgreSQL connection

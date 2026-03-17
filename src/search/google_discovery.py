@@ -227,6 +227,52 @@ def parse_name_from_title(title: str) -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
+# Result validation
+# ---------------------------------------------------------------------------
+
+
+def _company_keywords(company_name: str, domain: str) -> list[str]:
+    """
+    Build a list of keywords to check search results against.
+
+    For company_name="Traba" and domain="traba.work" this returns
+    ["traba"] (deduplicated, lowercased, no TLD junk).
+    """
+    keywords: list[str] = []
+
+    # From company name: split on whitespace, keep words 2+ chars
+    for word in company_name.lower().split():
+        word = word.strip(".,;:!?\"'()-")
+        if len(word) >= 2 and word not in _SLUG_STRIP_WORDS:
+            keywords.append(word)
+
+    # From domain: strip TLD, split on dots/hyphens
+    domain_base = domain.lower().split(".")[0] if "." in domain else domain.lower()
+    for part in re.split(r"[-.]", domain_base):
+        if len(part) >= 2 and part not in keywords:
+            keywords.append(part)
+
+    return keywords
+
+
+def _result_mentions_company(
+    item: dict,
+    keywords: list[str],
+) -> bool:
+    """
+    Check if a search result's title or snippet actually mentions the company.
+
+    This filters out results where the person is at a different company but
+    happened to appear in the search (e.g. someone who previously worked there).
+    """
+    if not keywords:
+        return True  # Can't validate, let it through
+
+    text = (item.get("title", "") + " " + item.get("snippet", "")).lower()
+    return any(kw in text for kw in keywords)
+
+
+# ---------------------------------------------------------------------------
 # Company-level discovery
 # ---------------------------------------------------------------------------
 
@@ -244,6 +290,7 @@ def discover_people_for_company(
     api_key = _get_api_key()
     target_roles = roles or CSUITE_ROLES
     result = CompanyDiscoveryResult(company_name=company_name, domain=domain)
+    keywords = _company_keywords(company_name, domain)
 
     seen_urls: set[str] = set()
     seen_names: set[str] = set()
@@ -254,11 +301,16 @@ def discover_people_for_company(
                 company_name,
                 role,
                 api_key=api_key,
-                num_results=2,  # Top 2 results per role to keep budget low
+                num_results=3,
             )
             result.queries_used += 1
 
+            accepted_for_role = 0
             for item in items:
+                # Only take the top matching result per role
+                if accepted_for_role >= 1:
+                    break
+
                 link = item.get("link", "")
 
                 # Skip non-LinkedIn URLs
@@ -269,6 +321,16 @@ def discover_people_for_company(
                 if link in seen_urls:
                     continue
                 seen_urls.add(link)
+
+                # Validate: result must actually mention the company
+                if not _result_mentions_company(item, keywords):
+                    log.debug(
+                        "Skipping result (no company match): %s for %s %s",
+                        link,
+                        company_name,
+                        role,
+                    )
+                    continue
 
                 # Try to extract name from URL slug first (highest confidence)
                 name = parse_linkedin_name(link)
@@ -299,6 +361,7 @@ def discover_people_for_company(
                         raw_snippet=item.get("snippet", ""),
                     )
                 )
+                accepted_for_role += 1
 
         except Exception as exc:
             result.errors.append(f"{role}: {exc}")

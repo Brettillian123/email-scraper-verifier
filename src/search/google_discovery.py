@@ -136,11 +136,10 @@ def search_linkedin_for_role(
 ) -> list[dict]:
     """
     Search Google via Serper for LinkedIn profiles:
-      site:linkedin.com/in trycents.com CEO
+      site:linkedin.com/in trycents.com CEO OR Chief Executive Officer
 
-    The company name is NOT quoted so Google can match flexibly (the domain
-    won't appear literally on LinkedIn but Google knows what it refers to).
-    The role IS quoted to force exact match.
+    Nothing is quoted — Google matches flexibly and still returns the
+    right LinkedIn profiles.
 
     Returns a list of result dicts with 'title', 'link', 'snippet' keys
     matching the shape expected by downstream code.
@@ -149,12 +148,11 @@ def search_linkedin_for_role(
     expansion = _ROLE_EXPANSIONS.get(role.upper(), [])
     expanded = expansion[1] if len(expansion) >= 2 else ""
 
-    # Company name unquoted (Google resolves the domain to the company),
-    # role quoted to force exact match
+    # Nothing quoted — let Google match flexibly
     if expanded:
-        query = f'site:linkedin.com/in {company_name} ("{role}" OR "{expanded}")'
+        query = f"site:linkedin.com/in {company_name} {role} OR {expanded}"
     else:
-        query = f'site:linkedin.com/in {company_name} "{role}"'
+        query = f"site:linkedin.com/in {company_name} {role}"
     headers = {
         "X-API-KEY": api_key,
         "Content-Type": "application/json",

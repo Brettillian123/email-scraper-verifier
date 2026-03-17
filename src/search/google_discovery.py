@@ -136,21 +136,25 @@ def search_linkedin_for_role(
 ) -> list[dict]:
     """
     Search Google via Serper for LinkedIn profiles:
-      site:linkedin.com/in "Acme Corp" "CEO"
+      site:linkedin.com/in trycents.com CEO
+
+    The company name is NOT quoted so Google can match flexibly (the domain
+    won't appear literally on LinkedIn but Google knows what it refers to).
+    The role IS quoted to force exact match.
 
     Returns a list of result dicts with 'title', 'link', 'snippet' keys
     matching the shape expected by downstream code.
     """
-    # Get the expanded title form (e.g. CEO → "Chief Executive Officer")
+    # Get the expanded title form (e.g. CEO -> "Chief Executive Officer")
     expansion = _ROLE_EXPANSIONS.get(role.upper(), [])
     expanded = expansion[1] if len(expansion) >= 2 else ""
 
-    # Search with both the abbreviation and the expanded form for better recall
-    # Quote the role to force exact match
+    # Company name unquoted (Google resolves the domain to the company),
+    # role quoted to force exact match
     if expanded:
-        query = f'site:linkedin.com/in "{company_name}" ("{role}" OR "{expanded}")'
+        query = f'site:linkedin.com/in {company_name} ("{role}" OR "{expanded}")'
     else:
-        query = f'site:linkedin.com/in "{company_name}" "{role}"'
+        query = f'site:linkedin.com/in {company_name} "{role}"'
     headers = {
         "X-API-KEY": api_key,
         "Content-Type": "application/json",
@@ -251,78 +255,39 @@ def parse_name_from_title(title: str) -> tuple[str, str] | None:
 # Result validation
 # ---------------------------------------------------------------------------
 
-# TLDs that are meaningful English words and likely part of the company name.
-# e.g. camber.health → "Camber Health", stainless.ai → "Stainless"
-_MEANINGFUL_TLDS = frozenset(
-    {
-        "health",
-        "energy",
-        "finance",
-        "capital",
-        "studio",
-        "media",
-        "group",
-        "global",
-        "digital",
-        "design",
-        "space",
-        "systems",
-        "solutions",
-        "partners",
-        "consulting",
-        "construction",
-        "agency",
-        "legal",
-        "life",
-        "care",
-        "bio",
-        "tech",
-        "labs",
-        "works",
-        "build",
-        "money",
-        "insurance",
-        "properties",
-        "ventures",
-        "supply",
-        "security",
-        "education",
-        "academy",
-    }
-)
-
 
 def _derive_search_name(company_name: str, domain: str) -> str:
     """
     Derive the best company name to use in the Serper search query.
 
-    If the company name looks like just a domain or a single word, try to
-    build a better name from the domain parts including meaningful TLDs.
+    If the company name is a real multi-word name, use it as-is.
+    Otherwise use the full domain (including .com) since Google still
+    finds the right results — e.g. "ceo trycents.com" works fine.
 
     Examples:
-      ("camber.health", "camber.health") → "Camber Health"
-      ("Stainless", "stainlessapi.com") → "Stainless"
+      ("trycents.com", "trycents.com") → "trycents.com"
+      ("camber.health", "camber.health") → "camber.health"
       ("Goldman Sachs", "goldmansachs.com") → "Goldman Sachs"
     """
-    # If company_name looks like a real multi-word name, use it as-is
-    name_clean = company_name.strip().lower()
-    # Strip domain-like suffixes if the name IS the domain
-    for tld in (".com", ".org", ".net", ".io", ".ai", ".co", ".dev"):
-        name_clean = name_clean.removesuffix(tld)
+    name_lower = company_name.strip().lower()
 
-    parts = domain.lower().split(".")
-    tld = parts[-1] if len(parts) >= 2 else ""
+    # Check if the company name is a real multi-word name (not a domain).
+    # Strip any TLD first to compare.
+    name_no_tld = name_lower
+    for tld in (".com", ".org", ".net", ".io", ".ai", ".co", ".dev", ".work"):
+        name_no_tld = name_no_tld.removesuffix(tld)
+    # Also strip the domain's TLD
+    for tld in ("." + domain.lower().split(".")[-1],) if "." in domain else ():
+        name_no_tld = name_no_tld.removesuffix(tld)
 
-    # If the TLD is a meaningful word, append it to the base name
-    if tld in _MEANINGFUL_TLDS:
-        base = parts[0] if parts else name_clean
-        # Remove common suffixes like "api", "app", "hq" from the base
-        for suffix in ("api", "app", "hq", "io", "inc", "co"):
-            if base.endswith(suffix) and len(base) > len(suffix) + 1:
-                base = base[: -len(suffix)]
-        return f"{base.capitalize()} {tld.capitalize()}"
+    domain_base = domain.lower().split(".")[0] if "." in domain else domain.lower()
 
-    return company_name
+    # If the name has spaces and doesn't look like the domain, it's a proper name
+    if " " in name_no_tld and name_no_tld.replace(" ", "") != domain_base:
+        return company_name.strip()
+
+    # The name is basically the domain — use the full domain as the search term
+    return domain.lower()
 
 
 def _company_keywords(company_name: str, domain: str) -> list[str]:
@@ -330,22 +295,31 @@ def _company_keywords(company_name: str, domain: str) -> list[str]:
     Build a list of keywords to check search results against.
 
     For company_name="Camber Health" and domain="camber.health" this returns
-    ["camber", "health"] — both must be checked.
+    ["camber", "health"].
+    For company_name="trycents.com" and domain="trycents.com" this returns
+    ["trycents"].
     """
     keywords: list[str] = []
 
-    # From the search name (which may include TLD words)
+    # Common TLDs that are useless as matching keywords
+    _skip_tlds = {"com", "org", "net", "io", "ai", "co", "dev", "work", "app"}
+
+    # From the search name (multi-word company names)
     search_name = _derive_search_name(company_name, domain)
-    for word in search_name.lower().split():
+    for word in search_name.lower().replace(".", " ").split():
         word = word.strip(".,;:!?\"'()-")
-        if len(word) >= 2 and word not in _SLUG_STRIP_WORDS and word not in keywords:
+        if (
+            len(word) >= 2
+            and word not in _SLUG_STRIP_WORDS
+            and word not in _skip_tlds
+            and word not in keywords
+        ):
             keywords.append(word)
 
-    # From domain base as fallback
+    # Domain base as fallback
     domain_base = domain.lower().split(".")[0] if "." in domain else domain.lower()
-    for part in re.split(r"[-.]", domain_base):
-        if len(part) >= 2 and part not in keywords:
-            keywords.append(part)
+    if len(domain_base) >= 2 and domain_base not in keywords:
+        keywords.append(domain_base)
 
     return keywords
 

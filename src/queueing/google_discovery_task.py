@@ -137,7 +137,7 @@ def _insert_discovered_person(
     try:
         cur = con.execute(
             "INSERT INTO people (tenant_id, company_id, first_name, last_name, "
-            "full_name, title_raw, source_url, created_at, updated_at) "
+            "full_name, title, source_url, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
             (
                 tenant_id,

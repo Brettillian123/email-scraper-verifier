@@ -576,6 +576,8 @@ def list_companies(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     search: str = Query(None),
+    min_people: int = Query(None, ge=0),
+    exported: str = Query(None),
 ) -> PaginatedResponse:
     con = _get_conn()
     try:
@@ -593,6 +595,17 @@ def list_companies(
             )
             params.extend([st, st, st])
 
+        # Filter: min_people — hide companies with fewer than N people
+        if min_people is not None and min_people > 0:
+            where_parts.append("(SELECT COUNT(*) FROM people p WHERE p.company_id = c.id) >= %s")
+            params.append(min_people)
+
+        # Filter: exported — "yes" = only exported, "no" = only not exported
+        if exported == "yes":
+            where_parts.append("c.exported_at IS NOT NULL")
+        elif exported == "no":
+            where_parts.append("c.exported_at IS NULL")
+
         where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
         total = con.execute(
@@ -609,7 +622,8 @@ def list_companies(
                 (SELECT COUNT(*) FROM emails e
                  WHERE e.company_id = c.id),
                 (SELECT COUNT(*) FROM sources s
-                 WHERE s.company_id = c.id)
+                 WHERE s.company_id = c.id),
+                c.exported_at
             FROM companies c
             {where_clause}
             ORDER BY c.id DESC
@@ -639,6 +653,7 @@ def list_companies(
                     "people_count": r[6],
                     "emails_count": r[7],
                     "pages_count": r[8],
+                    "exported_at": r[9],
                 }
             )
 
@@ -709,6 +724,18 @@ def export_selected_companies_csv(
                 status_code=500,
                 detail=f"CSV export query failed: {exc}",
             ) from exc
+
+        # Mark exported companies
+        try:
+            placeholders = ",".join(["%s"] * len(company_ids))
+            con.execute(
+                f"UPDATE companies SET exported_at = NOW() "
+                f"WHERE id IN ({placeholders}) AND exported_at IS NULL",
+                tuple(company_ids),
+            )
+            con.commit()
+        except Exception:
+            pass  # best-effort: don't block export if marking fails
 
         filename = _export_selected_companies_filename(status_filter)
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}

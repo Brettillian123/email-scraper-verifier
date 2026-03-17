@@ -2014,11 +2014,16 @@ def _task_probe_email_impl(  # noqa: C901
         fallback_status, fallback_raw = _maybe_run_fallback(email_str, "unknown")
 
         payload: dict[str, Any] = {
-            "ok": False, "category": "unknown", "code": None,
-            "mx_host": mx_host, "domain": dom, "email_id": int(email_id),
+            "ok": False,
+            "category": "unknown",
+            "code": None,
+            "mx_host": mx_host,
+            "domain": dom,
+            "email_id": int(email_id),
             "email": email_str,
             "elapsed_ms": int((time.perf_counter() - start) * 1000),
-            "error": "tcp25_blocked", "preflight": pre,
+            "error": "tcp25_blocked",
+            "preflight": pre,
         }
 
         if fallback_status is not None:
@@ -2026,10 +2031,16 @@ def _task_probe_email_impl(  # noqa: C901
             payload["fallback_raw"] = fallback_raw
 
         v_status, v_reason, v_mx, v_at, _vr_id = _persist_probe_result_r18(
-            db_path=db_path, email_id=int(email_id), email=email_str,
-            domain=dom, mx_host=mx_host, category=payload["category"],
-            code=None, error=payload["error"],
-            fallback_status=fallback_status, fallback_raw=fallback_raw,
+            db_path=db_path,
+            email_id=int(email_id),
+            email=email_str,
+            domain=dom,
+            mx_host=mx_host,
+            category=payload["category"],
+            code=None,
+            error=payload["error"],
+            fallback_status=fallback_status,
+            fallback_raw=fallback_raw,
             tcp25_ok=False,
         )
         if v_status is not None:
@@ -2058,8 +2069,13 @@ def _task_probe_email_impl(  # noqa: C901
         if throttle_error is not None:
             log.info(
                 "R16: throttled, skipping probe (no result persisted)",
-                extra={"email_id": email_id, "email": email_str, "domain": dom,
-                        "mx_host": mx_host, "reason": throttle_error.get("error")},
+                extra={
+                    "email_id": email_id,
+                    "email": email_str,
+                    "domain": dom,
+                    "mx_host": mx_host,
+                    "reason": throttle_error.get("error"),
+                },
             )
             return throttle_error
 

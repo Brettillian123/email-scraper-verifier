@@ -1,7 +1,6 @@
 # tests/test_manual_candidates.py
 """
 Tests for manual candidate submission feature.
-
 Covers:
   - Pydantic validation (names, emails, batch limits)
   - Audit trail persistence after person/email cleanup
@@ -16,12 +15,12 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def mca_table(db_conn):
     """Ensure the manual_candidate_attempts table exists for tests."""
@@ -67,8 +66,6 @@ def seed_company(mca_table):
 # ---------------------------------------------------------------------------
 # Pydantic validation
 # ---------------------------------------------------------------------------
-
-
 class TestManualCandidateValidation:
     def test_valid_name_only(self):
         from src.api.browser import ManualCandidateInput
@@ -86,7 +83,7 @@ class TestManualCandidateValidation:
     def test_email_without_at_rejected(self):
         from src.api.browser import ManualCandidateInput
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ManualCandidateInput(first_name="Jane", email="notanemail")
 
     def test_whitespace_only_becomes_none(self):
@@ -102,27 +99,24 @@ class TestManualCandidateValidation:
         candidates = [
             ManualCandidateInput(first_name=f"Person{i}", last_name="Test") for i in range(51)
         ]
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ManualCandidateRequest(candidates=candidates)
 
     def test_empty_batch_rejected(self):
         from src.api.browser import ManualCandidateRequest
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ManualCandidateRequest(candidates=[])
 
 
 # ---------------------------------------------------------------------------
 # Audit trail persistence
 # ---------------------------------------------------------------------------
-
-
 class TestAuditTrail:
     def test_audit_survives_person_delete(self, seed_company, mca_table):
         """Audit row must remain after the person row is deleted."""
         con = mca_table
         batch_id = str(uuid.uuid4())
-
         person_row = con.execute(
             "INSERT INTO people (tenant_id, company_id, full_name, source_url)"
             " VALUES ('dev', ?, 'Test Person', 'manual:user_added')"
@@ -130,7 +124,6 @@ class TestAuditTrail:
             (seed_company,),
         ).fetchone()
         person_id = int(person_row[0])
-
         con.execute(
             "INSERT INTO manual_candidate_attempts"
             " (tenant_id, company_id, batch_id, full_name, outcome, person_id)"
@@ -138,11 +131,9 @@ class TestAuditTrail:
             (seed_company, batch_id, person_id),
         )
         con.commit()
-
         # Simulate cleanup: delete person
         con.execute("DELETE FROM people WHERE id = ?", (person_id,))
         con.commit()
-
         # Audit row should still exist
         audit = con.execute(
             "SELECT outcome, full_name FROM manual_candidate_attempts WHERE batch_id = ?",
@@ -156,7 +147,6 @@ class TestAuditTrail:
         """Audit row remembers submitted_email even after cleanup."""
         con = mca_table
         batch_id = str(uuid.uuid4())
-
         con.execute(
             "INSERT INTO manual_candidate_attempts"
             " (tenant_id, company_id, batch_id, full_name, submitted_email, outcome)"
@@ -164,7 +154,6 @@ class TestAuditTrail:
             (seed_company, batch_id),
         )
         con.commit()
-
         audit = con.execute(
             "SELECT submitted_email FROM manual_candidate_attempts WHERE batch_id = ?",
             (batch_id,),
@@ -175,8 +164,6 @@ class TestAuditTrail:
 # ---------------------------------------------------------------------------
 # RQ task integration tests
 # ---------------------------------------------------------------------------
-
-
 class TestManualCandidateTask:
     @patch("src.queueing.manual_candidates._verify_submitted_email")
     def test_valid_email_keeps_person(self, mock_verify, seed_company, mca_table):
@@ -186,7 +173,6 @@ class TestManualCandidateTask:
         con = mca_table
         batch_id = str(uuid.uuid4())
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         person_row = con.execute(
             "INSERT INTO people (tenant_id, company_id, full_name, source_url)"
             " VALUES ('dev', ?, 'Valid Person', 'manual:user_added')"
@@ -194,7 +180,6 @@ class TestManualCandidateTask:
             (seed_company,),
         ).fetchone()
         person_id = int(person_row[0])
-
         con.execute(
             "INSERT INTO manual_candidate_attempts"
             " (tenant_id, company_id, batch_id, full_name, submitted_email,"
@@ -204,7 +189,6 @@ class TestManualCandidateTask:
             (seed_company, batch_id, person_id, now),
         )
         con.commit()
-
         mock_verify.return_value = {
             "status": "valid",
             "reason": "rcpt_2xx_non_catchall",
@@ -212,21 +196,17 @@ class TestManualCandidateTask:
             "email_id": 999,
             "mx_host": "mx.acme.com",
         }
-
         result = task_verify_manual_candidates(
             tenant_id="dev",
             company_id=seed_company,
             batch_id=batch_id,
         )
-
         assert result["ok"] is True
         assert result["valid"] == 1
         assert result["invalid"] == 0
-
         # Person should still exist
         person = con.execute("SELECT id FROM people WHERE id = ?", (person_id,)).fetchone()
         assert person is not None
-
         # Audit should say valid
         audit = con.execute(
             "SELECT outcome, verified_email FROM manual_candidate_attempts WHERE batch_id = ?",
@@ -243,7 +223,6 @@ class TestManualCandidateTask:
         con = mca_table
         batch_id = str(uuid.uuid4())
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         person_row = con.execute(
             "INSERT INTO people (tenant_id, company_id, full_name, source_url)"
             " VALUES ('dev', ?, 'Invalid Person', 'manual:user_added')"
@@ -251,7 +230,6 @@ class TestManualCandidateTask:
             (seed_company,),
         ).fetchone()
         person_id = int(person_row[0])
-
         con.execute(
             "INSERT INTO manual_candidate_attempts"
             " (tenant_id, company_id, batch_id, full_name, submitted_email,"
@@ -261,7 +239,6 @@ class TestManualCandidateTask:
             (seed_company, batch_id, person_id, now),
         )
         con.commit()
-
         mock_verify.return_value = {
             "status": "invalid",
             "reason": "rcpt_5xx",
@@ -269,21 +246,17 @@ class TestManualCandidateTask:
             "email_id": None,
             "mx_host": "mx.acme.com",
         }
-
         result = task_verify_manual_candidates(
             tenant_id="dev",
             company_id=seed_company,
             batch_id=batch_id,
         )
-
         assert result["ok"] is True
         assert result["valid"] == 0
         assert result["invalid"] == 1
-
         # Person should be deleted
         person = con.execute("SELECT id FROM people WHERE id = ?", (person_id,)).fetchone()
         assert person is None
-
         # Audit should persist
         audit = con.execute(
             "SELECT outcome, submitted_email FROM manual_candidate_attempts WHERE batch_id = ?",
@@ -300,7 +273,6 @@ class TestManualCandidateTask:
         con = mca_table
         batch_id = str(uuid.uuid4())
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         person_row = con.execute(
             "INSERT INTO people"
             " (tenant_id, company_id, first_name, last_name, full_name, source_url)"
@@ -309,7 +281,6 @@ class TestManualCandidateTask:
             (seed_company,),
         ).fetchone()
         person_id = int(person_row[0])
-
         con.execute(
             "INSERT INTO manual_candidate_attempts"
             " (tenant_id, company_id, batch_id, first_name, last_name,"
@@ -319,7 +290,6 @@ class TestManualCandidateTask:
             (seed_company, batch_id, person_id, now),
         )
         con.commit()
-
         mock_gen.return_value = {
             "status": "valid",
             "reason": "valid_found",
@@ -327,16 +297,13 @@ class TestManualCandidateTask:
             "attempts": [],
             "total_probes": 2,
         }
-
         result = task_verify_manual_candidates(
             tenant_id="dev",
             company_id=seed_company,
             batch_id=batch_id,
         )
-
         assert result["ok"] is True
         assert result["valid"] == 1
-
         mock_gen.assert_called_once_with(
             person_id=person_id,
             first_name="John",
@@ -348,8 +315,6 @@ class TestManualCandidateTask:
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
-
-
 class TestEdgeCases:
     def test_no_domain_returns_error(self, mca_table):
         """Company without a domain → batch fails gracefully."""
@@ -361,14 +326,12 @@ class TestEdgeCases:
         ).fetchone()
         company_id = int(row[0])
         con.commit()
-
         batch_id = str(uuid.uuid4())
         result = task_verify_manual_candidates(
             tenant_id="dev",
             company_id=company_id,
             batch_id=batch_id,
         )
-
         assert result["ok"] is False
         assert result["error"] == "no_domain"
 
@@ -377,7 +340,6 @@ class TestEdgeCases:
         from src.queueing.manual_candidates import _insert_email_for_manual
 
         con = mca_table
-
         # Create two people
         p1 = con.execute(
             "INSERT INTO people (tenant_id, company_id, full_name, source_url)"
@@ -392,7 +354,6 @@ class TestEdgeCases:
             (seed_company,),
         ).fetchone()
         con.commit()
-
         eid1 = _insert_email_for_manual(
             con,
             tenant_id="dev",
@@ -407,7 +368,6 @@ class TestEdgeCases:
             person_id=int(p2[0]),
             email="dupe@acme.com",
         )
-
         # Both should succeed and return the same email_id
         assert eid1 is not None
         assert eid1 == eid2
@@ -420,7 +380,6 @@ class TestEdgeCases:
         con = mca_table
         batch_id = str(uuid.uuid4())
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         person_ids = []
         for name, email in [("Good Person", "good@acme.com"), ("Bad Person", "bad@acme.com")]:
             row = con.execute(
@@ -439,7 +398,6 @@ class TestEdgeCases:
                 (seed_company, batch_id, name, email, pid, now),
             )
         con.commit()
-
         # First call valid, second call invalid
         mock_verify.side_effect = [
             {
@@ -457,17 +415,14 @@ class TestEdgeCases:
                 "mx_host": "mx",
             },
         ]
-
         result = task_verify_manual_candidates(
             tenant_id="dev",
             company_id=seed_company,
             batch_id=batch_id,
         )
-
         assert result["ok"] is True
         assert result["valid"] == 1
         assert result["invalid"] == 1
-
         # Good person should exist, bad person should be deleted
         good = con.execute("SELECT id FROM people WHERE id = ?", (person_ids[0],)).fetchone()
         bad = con.execute("SELECT id FROM people WHERE id = ?", (person_ids[1],)).fetchone()

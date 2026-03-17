@@ -917,18 +917,21 @@ def task_generate_company_emails(  # noqa: C901
         # "valid" and others get "risky" on the same catch-all domain.
         domain_catch_all_status: str | None = None
         try:
+            import os as _os
+
             from src.queueing.tasks import (
-                _load_catchall_status_for_domain,
                 _ensure_domain_resolution_row_for_domain,
+                _load_catchall_status_for_domain,
                 _mx_info,
                 _smtp_tcp25_preflight_mx,
             )
             from src.verify.catchall import check_catchall_for_domain
-            import os as _os
 
             _db_path = _os.getenv("DATABASE_PATH") or "data/dev.db"
             domain_catch_all_status = _load_catchall_status_for_domain(
-                _db_path, dom, tenant_id=tenant_id,
+                _db_path,
+                dom,
+                tenant_id=tenant_id,
             )
 
             if domain_catch_all_status not in {"catch_all", "not_catch_all"}:
@@ -1211,8 +1214,12 @@ def _apply_domain_limits(
 
 
 def _cleanup_stale_company_data(
-    con, *, company_id: int, tenant_id: str,
-    purge_verification: bool = False, purge_generated: bool = False,
+    con,
+    *,
+    company_id: int,
+    tenant_id: str,
+    purge_verification: bool = False,
+    purge_generated: bool = False,
     purge_sources: bool = False,
 ) -> dict[str, int]:
     """Purge stale data for a company when force re-discovery is on."""
@@ -1254,7 +1261,8 @@ def _cleanup_stale_company_data(
                     except Exception:
                         pass
                 cur = con.execute(
-                    f"DELETE FROM emails e WHERE {' AND '.join(where)}", tuple(params),
+                    f"DELETE FROM emails e WHERE {' AND '.join(where)}",
+                    tuple(params),
                 )
                 deleted["generated_emails"] = getattr(cur, "rowcount", 0) or 0
         except Exception:
@@ -1370,8 +1378,11 @@ def _enqueue_domain_jobs(
                 },
             )
             job_info["jobs"].append(
-                {"stage": "autodiscovery", "job_id": autod_job.id,
-                 "queue": options["discovery_queue"]}
+                {
+                    "stage": "autodiscovery",
+                    "job_id": autod_job.id,
+                    "queue": options["discovery_queue"],
+                }
             )
         except Exception as exc:
             log.warning("Failed to enqueue autodiscovery for %s: %s", domain, exc)
@@ -1402,9 +1413,12 @@ def _enqueue_domain_jobs(
                 },
             )
             job_info["jobs"].append(
-                {"stage": "generate", "job_id": gen_job.id,
-                 "queue": options["generate_queue"],
-                 "depends_on": getattr(autod_job, "id", None)}
+                {
+                    "stage": "generate",
+                    "job_id": gen_job.id,
+                    "queue": options["generate_queue"],
+                    "depends_on": getattr(autod_job, "id", None),
+                }
             )
         except Exception as exc:
             log.warning("Failed to enqueue generate fanout for %s: %s", domain, exc)
@@ -1440,10 +1454,13 @@ def _enqueue_domain_jobs(
                 },
             )
             job_info["jobs"].append(
-                {"stage": "verify", "job_id": vjob.id,
-                 "queue": options["verify_queue"],
-                 "depends_on": getattr(depends, "id", None),
-                 "only_with_source_url": False}
+                {
+                    "stage": "verify",
+                    "job_id": vjob.id,
+                    "queue": options["verify_queue"],
+                    "depends_on": getattr(depends, "id", None),
+                    "only_with_source_url": False,
+                }
             )
         except Exception as exc:
             log.warning("Failed to enqueue verify sweep for %s: %s", domain, exc)

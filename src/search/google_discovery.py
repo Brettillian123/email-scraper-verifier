@@ -230,23 +230,97 @@ def parse_name_from_title(title: str) -> tuple[str, str] | None:
 # Result validation
 # ---------------------------------------------------------------------------
 
+# TLDs that are meaningful English words and likely part of the company name.
+# e.g. camber.health → "Camber Health", stainless.ai → "Stainless"
+_MEANINGFUL_TLDS = frozenset(
+    {
+        "health",
+        "energy",
+        "finance",
+        "capital",
+        "studio",
+        "media",
+        "group",
+        "global",
+        "digital",
+        "design",
+        "space",
+        "systems",
+        "solutions",
+        "partners",
+        "consulting",
+        "construction",
+        "agency",
+        "legal",
+        "life",
+        "care",
+        "bio",
+        "tech",
+        "labs",
+        "works",
+        "build",
+        "money",
+        "insurance",
+        "properties",
+        "ventures",
+        "supply",
+        "security",
+        "education",
+        "academy",
+    }
+)
+
+
+def _derive_search_name(company_name: str, domain: str) -> str:
+    """
+    Derive the best company name to use in the Serper search query.
+
+    If the company name looks like just a domain or a single word, try to
+    build a better name from the domain parts including meaningful TLDs.
+
+    Examples:
+      ("camber.health", "camber.health") → "Camber Health"
+      ("Stainless", "stainlessapi.com") → "Stainless"
+      ("Goldman Sachs", "goldmansachs.com") → "Goldman Sachs"
+    """
+    # If company_name looks like a real multi-word name, use it as-is
+    name_clean = company_name.strip().lower()
+    # Strip domain-like suffixes if the name IS the domain
+    for tld in (".com", ".org", ".net", ".io", ".ai", ".co", ".dev"):
+        name_clean = name_clean.removesuffix(tld)
+
+    parts = domain.lower().split(".")
+    tld = parts[-1] if len(parts) >= 2 else ""
+
+    # If the TLD is a meaningful word, append it to the base name
+    if tld in _MEANINGFUL_TLDS:
+        base = parts[0] if parts else name_clean
+        # Remove common suffixes like "api", "app", "hq" from the base
+        for suffix in ("api", "app", "hq", "io", "inc", "co"):
+            if base.endswith(suffix) and len(base) > len(suffix) + 1:
+                base = base[: -len(suffix)]
+        return f"{base.capitalize()} {tld.capitalize()}"
+
+    return company_name
+
 
 def _company_keywords(company_name: str, domain: str) -> list[str]:
     """
     Build a list of keywords to check search results against.
 
-    For company_name="Traba" and domain="traba.work" this returns
-    ["traba"] (deduplicated, lowercased, no TLD junk).
+    For company_name="Camber Health" and domain="camber.health" this returns
+    ["camber", "health"] — both must be checked.
     """
     keywords: list[str] = []
 
-    # From company name: split on whitespace, keep words 2+ chars
-    for word in company_name.lower().split():
+    # From the search name (which may include TLD words)
+    search_name = _derive_search_name(company_name, domain)
+    for word in search_name.lower().split():
         word = word.strip(".,;:!?\"'()-")
-        if len(word) >= 2 and word not in _SLUG_STRIP_WORDS:
+        if len(word) >= 2 and word not in _SLUG_STRIP_WORDS and word not in keywords:
             keywords.append(word)
 
-    # From domain: strip TLD, split on dots/hyphens
+    # From domain base as fallback
     domain_base = domain.lower().split(".")[0] if "." in domain else domain.lower()
     for part in re.split(r"[-.]", domain_base):
         if len(part) >= 2 and part not in keywords:
@@ -255,20 +329,61 @@ def _company_keywords(company_name: str, domain: str) -> list[str]:
     return keywords
 
 
-def _result_mentions_company(
+def _extract_company_from_title(title: str) -> str:
+    """
+    Extract the company name portion from a LinkedIn search result title.
+
+    LinkedIn titles typically follow:
+      "John Doe - CEO - Acme Corp | LinkedIn"
+      "Jane Smith - Chief Financial Officer at BigCo | LinkedIn"
+
+    Returns the company portion lowercased, or empty string if unparseable.
+    """
+    # Remove " | LinkedIn" or " - LinkedIn" suffix
+    clean = re.split(r"\s*[|\u2013\u2014-]\s*LinkedIn", title, flags=re.IGNORECASE)[0]
+
+    # Split on separators (dash, en-dash, em-dash)
+    segments = re.split(r"\s*[\u2013\u2014-]\s*", clean)
+
+    # Company is usually the last segment (after name and title)
+    # Format: "Name - Role - Company" → segments[-1] is company
+    if len(segments) >= 3:
+        return segments[-1].strip().lower()
+
+    # Sometimes: "Name - Role at Company"
+    if len(segments) >= 2:
+        role_part = segments[-1].strip()
+        at_match = re.search(r"\bat\s+(.+)$", role_part, re.IGNORECASE)
+        if at_match:
+            return at_match.group(1).strip().lower()
+
+    return ""
+
+
+def _result_matches_company(
     item: dict,
     keywords: list[str],
 ) -> bool:
     """
-    Check if a search result's title or snippet actually mentions the company.
+    Strictly validate that a LinkedIn result belongs to the target company.
 
-    This filters out results where the person is at a different company but
-    happened to appear in the search (e.g. someone who previously worked there).
+    Extracts the company name from the LinkedIn title and checks if our
+    company keywords appear in it. Falls back to checking the full
+    title + snippet if the title can't be parsed.
     """
     if not keywords:
         return True  # Can't validate, let it through
 
-    text = (item.get("title", "") + " " + item.get("snippet", "")).lower()
+    title = item.get("title", "")
+
+    # Primary: check the company field extracted from the LinkedIn title
+    company_from_title = _extract_company_from_title(title)
+    if company_from_title:
+        return any(kw in company_from_title for kw in keywords)
+
+    # Fallback: if we couldn't parse a company from the title,
+    # check the full title + snippet (less strict but better than nothing)
+    text = (title + " " + item.get("snippet", "")).lower()
     return any(kw in text for kw in keywords)
 
 
@@ -289,8 +404,17 @@ def discover_people_for_company(
     """
     api_key = _get_api_key()
     target_roles = roles or CSUITE_ROLES
+    search_name = _derive_search_name(company_name, domain)
     result = CompanyDiscoveryResult(company_name=company_name, domain=domain)
     keywords = _company_keywords(company_name, domain)
+
+    log.info(
+        "Discovery for %s (domain=%s) search_name=%r keywords=%s",
+        company_name,
+        domain,
+        search_name,
+        keywords,
+    )
 
     seen_urls: set[str] = set()
     seen_names: set[str] = set()
@@ -298,7 +422,7 @@ def discover_people_for_company(
     for role in target_roles:
         try:
             items = search_linkedin_for_role(
-                company_name,
+                search_name,
                 role,
                 api_key=api_key,
                 num_results=3,
@@ -322,12 +446,13 @@ def discover_people_for_company(
                     continue
                 seen_urls.add(link)
 
-                # Validate: result must actually mention the company
-                if not _result_mentions_company(item, keywords):
+                # Strictly validate: the company in the LinkedIn title
+                # must match our target company
+                if not _result_matches_company(item, keywords):
                     log.debug(
-                        "Skipping result (no company match): %s for %s %s",
-                        link,
-                        company_name,
+                        "Skipping result (company mismatch): title=%r for %s %s",
+                        item.get("title", ""),
+                        search_name,
                         role,
                     )
                     continue
@@ -367,7 +492,7 @@ def discover_people_for_company(
             result.errors.append(f"{role}: {exc}")
             log.warning(
                 "Serper search failed for %s %s: %s",
-                company_name,
+                search_name,
                 role,
                 exc,
             )

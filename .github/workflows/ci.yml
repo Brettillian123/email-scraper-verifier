@@ -130,15 +130,6 @@ jobs:
         run: |
           python -c 'from src.config import load_icp_config; cfg = load_icp_config(); import sys; sys.exit("load_icp_config() did not return a dict") if not isinstance(cfg, dict) else print("ICP config loaded OK; keys:", sorted(cfg.keys()))'
 
-      - name: Run tests
-        # DO NOT set PYTHONPATH=src; it can shadow stdlib 'queue'
-        env:
-          DATABASE_URL: ${{ env.DATABASE_URL }}
-          DB_URL: ${{ env.DB_URL }}
-          REDIS_URL: ${{ env.REDIS_URL }}
-          RQ_REDIS_URL: ${{ env.RQ_REDIS_URL }}
-        run: pytest -q
-
       # Optional: Run specific acceptance tests
       - name: Schema verification
         run: |

@@ -1,10 +1,10 @@
 # src/search/google_discovery.py
 """
-Google Custom Search API client for LinkedIn-based lead discovery.
+Serper-powered LinkedIn lead discovery.
 
-Searches Google for C-suite LinkedIn profiles at target companies,
-extracts names from URLs and result titles, and returns structured
-DiscoveredPerson objects for downstream processing.
+Searches Google (via Serper.dev) for C-suite LinkedIn profiles at target
+companies, extracts names from URLs and result titles, and returns
+structured DiscoveredPerson objects for downstream processing.
 
 No database dependency -- this module is purely functional.
 """
@@ -21,7 +21,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 CSUITE_ROLES = ["CEO", "CFO", "COO", "CTO", "CIO", "CHRO", "CMO"]
 
@@ -97,24 +97,21 @@ class CompanyDiscoveryResult:
 # ---------------------------------------------------------------------------
 
 
-def _get_api_credentials() -> tuple[str, str]:
-    """Return (api_key, engine_id) from env vars."""
-    api_key = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
-    engine_id = os.getenv("GOOGLE_CSE_ENGINE_ID", "").strip()
-    if not api_key or not engine_id:
-        raise ValueError("GOOGLE_CSE_API_KEY and GOOGLE_CSE_ENGINE_ID must be set.")
-    return api_key, engine_id
+def _get_api_key() -> str:
+    """Return Serper API key from env var."""
+    api_key = os.getenv("SERPER_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("SERPER_API_KEY must be set.")
+    return api_key
 
 
 def is_api_configured() -> bool:
-    """Check whether Google CSE credentials are present (non-empty)."""
-    api_key = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
-    engine_id = os.getenv("GOOGLE_CSE_ENGINE_ID", "").strip()
-    return bool(api_key and engine_id)
+    """Check whether Serper API key is present (non-empty)."""
+    return bool(os.getenv("SERPER_API_KEY", "").strip())
 
 
 # ---------------------------------------------------------------------------
-# Google Custom Search API
+# Serper Search API
 # ---------------------------------------------------------------------------
 
 
@@ -123,29 +120,48 @@ def search_linkedin_for_role(
     role: str,
     *,
     api_key: str,
-    engine_id: str,
     num_results: int = 3,
 ) -> list[dict]:
     """
-    Run a Google Custom Search query:
+    Search Google via Serper for LinkedIn profiles:
       site:linkedin.com/in "Acme Corp" CEO
 
-    Returns raw search result items from the API.
+    Returns a list of result dicts with 'title', 'link', 'snippet' keys
+    matching the shape expected by downstream code.
     """
     query = f'site:linkedin.com/in "{company_name}" {role}'
-    params = {
-        "key": api_key,
-        "cx": engine_id,
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
         "q": query,
         "num": min(num_results, 10),
+        "gl": "us",
+        "hl": "en",
     }
 
     with httpx.Client(timeout=15.0) as client:
-        resp = client.get(GOOGLE_CSE_ENDPOINT, params=params)
+        resp = client.post(
+            SERPER_ENDPOINT,
+            headers=headers,
+            json=payload,
+        )
         resp.raise_for_status()
         data = resp.json()
 
-    return data.get("items", [])
+    # Serper returns results under "organic" key.
+    # Normalize to match the field names downstream code expects.
+    results = []
+    for item in data.get("organic", []):
+        results.append(
+            {
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            }
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +237,11 @@ def discover_people_for_company(
     roles: list[str] | None = None,
 ) -> CompanyDiscoveryResult:
     """
-    Search Google CSE for C-suite LinkedIn profiles at a company.
+    Search Serper for C-suite LinkedIn profiles at a company.
 
     Returns a CompanyDiscoveryResult with all discovered people.
     """
-    api_key, engine_id = _get_api_credentials()
+    api_key = _get_api_key()
     target_roles = roles or CSUITE_ROLES
     result = CompanyDiscoveryResult(company_name=company_name, domain=domain)
 
@@ -238,7 +254,6 @@ def discover_people_for_company(
                 company_name,
                 role,
                 api_key=api_key,
-                engine_id=engine_id,
                 num_results=2,  # Top 2 results per role to keep budget low
             )
             result.queries_used += 1
@@ -267,7 +282,8 @@ def discover_people_for_company(
                 if not name:
                     continue
 
-                # Deduplicate by name (same person might appear for multiple roles)
+                # Deduplicate by name (same person might appear for
+                # multiple roles)
                 name_key = f"{name[0].lower()}:{name[1].lower()}"
                 if name_key in seen_names:
                     continue
@@ -287,7 +303,7 @@ def discover_people_for_company(
         except Exception as exc:
             result.errors.append(f"{role}: {exc}")
             log.warning(
-                "Google CSE search failed for %s %s: %s",
+                "Serper search failed for %s %s: %s",
                 company_name,
                 role,
                 exc,

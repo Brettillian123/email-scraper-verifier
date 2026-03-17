@@ -1736,8 +1736,7 @@ def trigger_discovery_run(
     if not is_api_configured():
         raise HTTPException(
             status_code=400,
-            detail="Google CSE API credentials not configured on VPS. "
-            "Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_ENGINE_ID environment variables.",
+            detail="Serper API key not configured on VPS. Set SERPER_API_KEY environment variable.",
         )
 
     from redis import Redis

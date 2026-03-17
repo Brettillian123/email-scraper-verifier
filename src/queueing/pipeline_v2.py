@@ -835,6 +835,42 @@ def _enqueue(
     return q.enqueue(func, **kwargs)
 
 
+def _maybe_mark_run_complete_from_job() -> None:
+    """
+    Check if the current job is the terminal stage for a pipeline run and,
+    if so, trigger run completion.
+    """
+    from rq import get_current_job
+
+    try:
+        job = get_current_job()
+        if job is None:
+            return
+        meta = job.meta or {}
+
+        if not meta.get("is_terminal_stage"):
+            return
+
+        run_id = meta.get("run_id")
+        tenant_id = str(meta.get("tenant_id") or "dev")
+        company_id = meta.get("company_id")
+        total = meta.get("total_companies")
+
+        if not run_id or company_id is None or not total:
+            return
+
+        from src.queueing.tasks import _check_run_completion
+
+        _check_run_completion(
+            run_id=str(run_id),
+            tenant_id=tenant_id,
+            company_id=int(company_id),
+            total=int(total),
+        )
+    except Exception:
+        log.debug("_maybe_mark_run_complete_from_job failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Generation fanout task
 # ---------------------------------------------------------------------------
@@ -876,6 +912,42 @@ def task_generate_company_emails(  # noqa: C901
         job = get_current_job()
         meta = job.meta if job is not None else {}
 
+        # Resolve catch-all status ONCE for the domain before fanning out
+        # per-person jobs.  This prevents a race where some people get
+        # "valid" and others get "risky" on the same catch-all domain.
+        domain_catch_all_status: str | None = None
+        try:
+            from src.queueing.tasks import (
+                _load_catchall_status_for_domain,
+                _ensure_domain_resolution_row_for_domain,
+                _mx_info,
+                _smtp_tcp25_preflight_mx,
+            )
+            from src.verify.catchall import check_catchall_for_domain
+            import os as _os
+
+            _db_path = _os.getenv("DATABASE_PATH") or "data/dev.db"
+            domain_catch_all_status = _load_catchall_status_for_domain(
+                _db_path, dom, tenant_id=tenant_id,
+            )
+
+            if domain_catch_all_status not in {"catch_all", "not_catch_all"}:
+                mx_host, _ = _mx_info(dom, force=False, db_path=_db_path)
+                if mx_host:
+                    pre = _smtp_tcp25_preflight_mx(mx_host, timeout_s=3.0, redis=None)
+                    if bool(pre.get("ok")):
+                        _ensure_domain_resolution_row_for_domain(dom, tenant_id=tenant_id)
+                        ca_result = check_catchall_for_domain(dom)
+                        ca_status = (ca_result.status or "").strip().lower()
+                        if ca_status in {"catch_all", "not_catch_all"}:
+                            domain_catch_all_status = ca_status
+        except Exception:
+            log.debug(
+                "task_generate_company_emails: catch-all pre-check failed",
+                exc_info=True,
+                extra={"domain": dom, "company_id": company_id},
+            )
+
         people = _load_people_for_company(con, tenant_id=tenant_id, company_id=company_id)
         redis = _get_redis()
         q = Queue(name=generate_queue, connection=redis)
@@ -900,10 +972,12 @@ def task_generate_company_emails(  # noqa: C901
                         "company_id": company_id,
                         "person_id": person_id,
                         "stage": "generate_person_emails",
-                        # Propagate options from parent job meta
                         "ai_enabled": meta.get("ai_enabled", True),
                         "skip_verified": meta.get("skip_verified", True),
                         "skip_catch_all": meta.get("skip_catch_all", False),
+                        # Pass pre-resolved catch-all status so all people
+                        # on this domain use the same value.
+                        "domain_catch_all_status": domain_catch_all_status,
                     },
                 )
                 enqueued += 1
@@ -930,6 +1004,7 @@ def task_generate_company_emails(  # noqa: C901
         }
 
     finally:
+        _maybe_mark_run_complete_from_job()
         try:
             con.close()
         except Exception:
@@ -948,6 +1023,7 @@ def verify_company_emails(  # noqa: C901
     run_id: str | None = None,
     verify_queue: str = DEFAULT_VERIFY_QUEUE,
     only_with_source_url: bool = False,
+    force: bool = False,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """
@@ -1044,6 +1120,7 @@ def verify_company_emails(  # noqa: C901
         }
 
     finally:
+        _maybe_mark_run_complete_from_job()
         try:
             con.close()
         except Exception:
@@ -1133,6 +1210,78 @@ def _apply_domain_limits(
     return domains, info
 
 
+def _cleanup_stale_company_data(
+    con, *, company_id: int, tenant_id: str,
+    purge_verification: bool = False, purge_generated: bool = False,
+    purge_sources: bool = False,
+) -> dict[str, int]:
+    """Purge stale data for a company when force re-discovery is on."""
+    deleted: dict[str, int] = {}
+    email_cols = _table_cols(con, "emails") if _has_table(con, "emails") else set()
+    has_tenant_email = "tenant_id" in email_cols
+
+    if purge_verification and _has_table(con, "verification_results"):
+        try:
+            vr_cols = _table_cols(con, "verification_results")
+            if "email_id" in vr_cols:
+                tf = " AND e.tenant_id = ?" if has_tenant_email else ""
+                params: list = [company_id] + ([tenant_id] if has_tenant_email else [])
+                cur = con.execute(
+                    f"DELETE FROM verification_results WHERE email_id IN "
+                    f"(SELECT e.id FROM emails e WHERE e.company_id = ?{tf})",
+                    tuple(params),
+                )
+                deleted["verification_results"] = getattr(cur, "rowcount", 0) or 0
+        except Exception:
+            log.debug("force cleanup: failed to purge verification_results", exc_info=True)
+
+    if purge_generated and email_cols:
+        try:
+            perm_pred = _build_permutation_predicate(email_cols)
+            if perm_pred:
+                where = ["e.company_id = ?", perm_pred]
+                params = [company_id]
+                if has_tenant_email:
+                    where.insert(0, "e.tenant_id = ?")
+                    params.insert(0, tenant_id)
+                if _has_table(con, "verification_results"):
+                    try:
+                        con.execute(
+                            f"DELETE FROM verification_results WHERE email_id IN "
+                            f"(SELECT e.id FROM emails e WHERE {' AND '.join(where)})",
+                            tuple(params),
+                        )
+                    except Exception:
+                        pass
+                cur = con.execute(
+                    f"DELETE FROM emails e WHERE {' AND '.join(where)}", tuple(params),
+                )
+                deleted["generated_emails"] = getattr(cur, "rowcount", 0) or 0
+        except Exception:
+            log.debug("force cleanup: failed to purge generated emails", exc_info=True)
+
+    if purge_sources and _has_table(con, "sources"):
+        try:
+            src_cols = _table_cols(con, "sources")
+            where = ["company_id = ?"]
+            params = [company_id]
+            if "tenant_id" in src_cols:
+                where.insert(0, "tenant_id = ?")
+                params.insert(0, tenant_id)
+            cur = con.execute(f"DELETE FROM sources WHERE {' AND '.join(where)}", tuple(params))
+            deleted["sources"] = getattr(cur, "rowcount", 0) or 0
+        except Exception:
+            log.debug("force cleanup: failed to purge sources", exc_info=True)
+
+    try:
+        con.commit()
+    except Exception:
+        pass
+
+    log.info("force cleanup: company_id=%s deleted=%s", company_id, deleted)
+    return deleted
+
+
 def _enqueue_domain_jobs(
     con,
     *,
@@ -1151,10 +1300,50 @@ def _enqueue_domain_jobs(
     verify_q: Queue,
     job_timeout: int,
 ) -> dict[str, Any]:
-    """Enqueue autodiscovery/generate/verify jobs for a single domain."""
+    """Enqueue autodiscovery/generate/verify jobs for a single domain.
+
+    KEY DESIGN DECISION: when generate runs in sequential mode (the default),
+    each per-person task_generate_emails job already does inline SMTP probing.
+    A separate verify_company_emails sweep would race with those jobs and
+    create duplicate/unknown results.  So we SKIP the verify sweep when
+    generate is selected — the generate stage IS the verification.
+
+    A standalone verify sweep is only enqueued when verify is requested
+    WITHOUT generate (i.e. verify-only mode).
+    """
     job_info: dict[str, Any] = {"domain": domain, "company_id": company_id, "jobs": []}
     autod_job = None
     gen_job = None
+
+    force_discovery = options.get("force_discovery", False)
+
+    if force_discovery:
+        _cleanup_stale_company_data(
+            con,
+            company_id=company_id,
+            tenant_id=tenant_id,
+            purge_verification=True,
+            purge_generated=(run_generate or run_autodiscovery),
+            purge_sources=run_autodiscovery,
+        )
+
+    # The terminal stage is the last one to actually run.
+    # When generate+verify is selected, generate IS the terminal stage
+    # because we skip the separate verify sweep.
+    skip_verify_sweep = run_generate and run_verify
+
+    terminal_stage: str | None = None
+    if run_verify and not skip_verify_sweep:
+        terminal_stage = "verify"
+    elif run_generate:
+        terminal_stage = "generate"
+    elif run_autodiscovery:
+        terminal_stage = "autodiscovery"
+
+    def _completion_meta(stage: str) -> dict[str, Any]:
+        if stage == terminal_stage:
+            return {"is_terminal_stage": True, "total_companies": total_companies}
+        return {"is_terminal_stage": False}
 
     # 1) Autodiscovery
     if run_autodiscovery:
@@ -1177,19 +1366,17 @@ def _enqueue_domain_jobs(
                     "timeout_per_company_s": options.get("timeout_per_company_s", 300),
                     "skip_verified": options.get("skip_verified", True),
                     "skip_catch_all": options.get("skip_catch_all", False),
+                    **_completion_meta("autodiscovery"),
                 },
             )
             job_info["jobs"].append(
-                {
-                    "stage": "autodiscovery",
-                    "job_id": autod_job.id,
-                    "queue": options["discovery_queue"],
-                }
+                {"stage": "autodiscovery", "job_id": autod_job.id,
+                 "queue": options["discovery_queue"]}
             )
         except Exception as exc:
             log.warning("Failed to enqueue autodiscovery for %s: %s", domain, exc)
 
-    # 2) Generation (company fanout) - depends on autodiscovery when present
+    # 2) Generation (company fanout)
     if run_generate:
         try:
             gen_job = _enqueue(
@@ -1211,21 +1398,23 @@ def _enqueue_domain_jobs(
                     "ai_enabled": options.get("ai_enabled", True),
                     "skip_verified": options.get("skip_verified", True),
                     "skip_catch_all": options.get("skip_catch_all", False),
+                    **_completion_meta("generate"),
                 },
             )
             job_info["jobs"].append(
-                {
-                    "stage": "generate",
-                    "job_id": gen_job.id,
-                    "queue": options["generate_queue"],
-                    "depends_on": getattr(autod_job, "id", None),
-                }
+                {"stage": "generate", "job_id": gen_job.id,
+                 "queue": options["generate_queue"],
+                 "depends_on": getattr(autod_job, "id", None)}
             )
         except Exception as exc:
             log.warning("Failed to enqueue generate fanout for %s: %s", domain, exc)
 
-    # 3) Verification
-    if run_verify:
+    # 3) Verification — ONLY when verify is selected WITHOUT generate.
+    #    When generate+verify is selected, the sequential generator inside
+    #    task_generate_emails already does inline SMTP probing per person.
+    #    Enqueueing a separate verify sweep would race with the per-person
+    #    jobs and produce duplicate/unknown results.
+    if run_verify and not skip_verify_sweep:
         depends = gen_job if (run_generate and gen_job is not None) else autod_job
         try:
             vjob = _enqueue(
@@ -1237,29 +1426,24 @@ def _enqueue_domain_jobs(
                 run_id=run_id,
                 verify_queue=options["verify_queue"],
                 only_with_source_url=False,
+                force=force_discovery,
                 job_timeout=job_timeout,
                 meta={
                     "run_id": run_id,
                     "tenant_id": tenant_id,
                     "domain": domain,
                     "company_id": company_id,
-                    "stage": (
-                        "verify_company_sweep_post_generate"
-                        if run_generate
-                        else "verify_company_sweep"
-                    ),
+                    "stage": "verify_company_sweep",
                     "only_with_source_url": False,
                     "max_probes_per_person_env": max_probes,
+                    **_completion_meta("verify"),
                 },
             )
             job_info["jobs"].append(
-                {
-                    "stage": "verify",
-                    "job_id": vjob.id,
-                    "queue": options["verify_queue"],
-                    "depends_on": getattr(depends, "id", None),
-                    "only_with_source_url": False,
-                }
+                {"stage": "verify", "job_id": vjob.id,
+                 "queue": options["verify_queue"],
+                 "depends_on": getattr(depends, "id", None),
+                 "only_with_source_url": False}
             )
         except Exception as exc:
             log.warning("Failed to enqueue verify sweep for %s: %s", domain, exc)

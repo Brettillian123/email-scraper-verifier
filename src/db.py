@@ -1317,6 +1317,22 @@ def upsert_verification_result(
             elif isinstance(verified_at, str) and verified_at.strip():
                 v_at = verified_at.strip()
 
+            # Delete any existing verification_results for this email_id
+            # so re-runs overwrite rather than creating duplicate rows.
+            try:
+                if "tenant_id" in ver_cols:
+                    conn.execute(
+                        "DELETE FROM verification_results WHERE tenant_id = ? AND email_id = ?",
+                        (t, int(email_id)),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM verification_results WHERE email_id = ?",
+                        (int(email_id),),
+                    )
+            except Exception:
+                pass  # Best-effort; the INSERT below still works on fresh schemas
+
             insert_cols: list[str] = []
             insert_vals: list[Any] = []
 

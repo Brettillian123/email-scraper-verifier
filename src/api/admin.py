@@ -7,9 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from src.admin.audit import log_admin_action
-from src.admin.metrics import get_admin_summary, get_analytics_summary, get_zero_candidate_companies
+from src.admin.metrics import get_admin_summary, get_analytics_summary
 from src.api.deps import require_admin
 
 if TYPE_CHECKING:
@@ -89,7 +90,7 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
                 SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
-                WHERE is_approved = FALSE AND is_verified = TRUE
+                WHERE is_approved = FALSE
                 ORDER BY created_at DESC
                 """
             )
@@ -99,7 +100,6 @@ def admin_users_list(request: Request, pending_only: bool = False) -> dict:
                 SELECT id, email, tenant_id, display_name, is_active, is_superuser,
                        is_approved, is_verified, created_at, last_login_at
                 FROM users
-                WHERE is_verified = TRUE
                 ORDER BY created_at DESC
                 """
             )
@@ -318,32 +318,145 @@ def admin_analytics(
     return analytics
 
 
-@router.get("/zero-candidate-companies")
-def admin_zero_candidate_companies(request: Request) -> dict[str, object]:
-    """
-    Companies that have crawled pages but produced 0 candidate people.
+# ---------------------------------------------------------------------------
+# Zero-Candidate Diagnostic Route (Superuser Only)
+# ---------------------------------------------------------------------------
 
-    Useful for diagnosing extraction gaps — the admin can inspect which
-    URLs were crawled and decide whether the pages are worth re-processing
-    or if the site simply doesn't expose employee info.
+
+@router.get("/zero-candidate-companies")
+def zero_candidate_companies(request: Request) -> dict:
     """
+    Return companies that have crawled pages in ``sources`` but zero rows
+    in ``people``.  Used by the admin dashboard's "Pages Crawled, Zero
+    Candidates" diagnostic card.
+
+    Response shape::
+
+        {
+          "companies": [
+            {
+              "company_id": 42,
+              "company_name": "Acme Inc",
+              "domain": "acme.com",
+              "page_count": 3,
+              "pages": [
+                {"source_url": "https://acme.com/team", "fetched_at": "2025-..."},
+                ...
+              ]
+            }
+          ]
+        }
+
+    Superuser only.
+    """
+    _require_superuser(request)
+
     from src.db import get_conn
 
     conn = get_conn()
     try:
-        companies = get_zero_candidate_companies(conn)
+        # Companies with pages but no people
+        rows = conn.execute(
+            """
+            SELECT
+                c.id            AS company_id,
+                c.name          AS company_name,
+                COALESCE(NULLIF(c.official_domain, ''), c.domain) AS domain,
+                COUNT(s.id)     AS page_count
+            FROM companies c
+            JOIN sources s ON s.company_id = c.id
+            LEFT JOIN people p ON p.company_id = c.id
+            WHERE p.id IS NULL
+            GROUP BY c.id, c.name, c.official_domain, c.domain
+            ORDER BY page_count DESC, c.name
+            """
+        ).fetchall()
+
+        companies = []
+        for r in rows:
+            cid = r[0]
+            # Fetch individual page URLs for the expandable detail rows
+            page_rows = conn.execute(
+                """
+                SELECT source_url, fetched_at
+                FROM sources
+                WHERE company_id = %s
+                ORDER BY fetched_at DESC NULLS LAST
+                """,
+                (cid,),
+            ).fetchall()
+
+            companies.append(
+                {
+                    "company_id": cid,
+                    "company_name": r[1] or "",
+                    "domain": r[2] or "",
+                    "page_count": r[3] or 0,
+                    "pages": [
+                        {
+                            "source_url": pr[0] or "",
+                            "fetched_at": pr[1] or "",
+                        }
+                        for pr in page_rows
+                    ],
+                }
+            )
+
+        return {"companies": companies}
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Export Routes (Superuser Only)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/export-domains.txt")
+def export_all_domains(request: Request) -> StreamingResponse:
+    """
+    Export a plain-text list of all unique company domains in the database.
+
+    Returns one domain per line (deduplicated, sorted alphabetically).
+    Prefers ``official_domain`` when present, falling back to ``domain``.
+    Superuser only.  Audit-logged.
+    """
+    from src.db import get_conn
+
+    user = _require_superuser(request)
+
     remote_ip = request.client.host if request.client else None
     log_admin_action(
-        action="view_zero_candidate_companies",
-        user_id=None,
+        action="export_domains_txt",
+        user_id=user.id,
         remote_ip=remote_ip,
-        metadata={"path": "/admin/zero-candidate-companies", "count": len(companies)},
+        metadata={"path": "/admin/export-domains.txt"},
     )
 
-    return {"companies": companies, "count": len(companies)}
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT COALESCE(NULLIF(official_domain, ''), domain) AS d
+            FROM companies
+            WHERE COALESCE(NULLIF(official_domain, ''), domain) IS NOT NULL
+            ORDER BY d
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Build plain-text body: one domain per line
+    lines = [row[0] for row in rows if row[0]]
+    body = "\n".join(lines) + ("\n" if lines else "")
+
+    return StreamingResponse(
+        iter([body]),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="company_domains.txt"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

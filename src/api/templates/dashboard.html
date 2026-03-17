@@ -646,6 +646,107 @@
             background: var(--border);
             margin: 4px 0;
         }
+
+        /* Manual candidate modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            width: 90%;
+            max-width: 700px;
+            max-height: 85vh;
+            overflow-y: auto;
+            padding: 24px;
+        }
+        .modal h2 { margin-top: 0; }
+        .candidate-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr 1fr auto;
+            gap: 8px;
+            margin-bottom: 8px;
+            align-items: end;
+        }
+        .candidate-row label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            display: block;
+            margin-bottom: 2px;
+        }
+        .candidate-row input {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            padding: 6px 10px;
+            font-size: 0.85rem;
+            width: 100%;
+        }
+        .candidate-row input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+        .btn-remove-row {
+            background: transparent;
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .btn-remove-row:hover { background: rgba(239,68,68,0.15); }
+        .btn-add-row {
+            background: transparent;
+            border: 1px dashed var(--border);
+            color: var(--text-muted);
+            border-radius: 6px;
+            padding: 8px;
+            cursor: pointer;
+            width: 100%;
+            margin: 8px 0 16px;
+            font-size: 0.85rem;
+        }
+        .btn-add-row:hover { border-color: var(--primary); color: var(--primary); }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+        .batch-status {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 8px;
+            background: var(--bg-input);
+        }
+        .batch-status .outcome-valid   { color: var(--success); }
+        .batch-status .outcome-invalid { color: var(--danger); }
+        .batch-status .outcome-pending { color: var(--warning); }
+        .batch-status .outcome-error   { color: var(--danger); font-style: italic; }
+        .batch-progress {
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            margin: 8px 0;
+            overflow: hidden;
+        }
+        .batch-progress-bar {
+            height: 100%;
+            background: var(--primary);
+            transition: width 0.3s ease;
+        }
     </style>
 </head>
 <body>
@@ -653,7 +754,7 @@
         <header>
             <div>
                 <h1>CrestwellIQ Main Dashboard</h1>
-                <div class="subtitle">Lead intelligence platform — runs, companies, people, emails</div>
+                <div class="subtitle">Lead intelligence platform Ã¢â‚¬â€ runs, companies, people, emails</div>
             </div>
             <div class="header-right">
                 <div class="text-muted">
@@ -911,6 +1012,24 @@ another.com"></textarea>
             <button class="close-btn" onclick="closeDetail()">&times;</button>
         </div>
         <div id="detail-content"></div>
+    </div>
+
+    <!-- Manual Candidate Modal -->
+    <div class="modal-overlay" id="manual-candidate-modal">
+        <div class="modal">
+            <h2>Add Candidates</h2>
+            <p class="text-muted" style="margin-top: -8px; margin-bottom: 16px;">
+                Add people to verify. Provide names to generate email permutations,
+                or include an email to verify it directly.
+            </p>
+            <div id="candidate-rows"></div>
+            <button class="btn-add-row" onclick="addCandidateRow()">+ Add another candidate</button>
+            <div id="batch-status-area"></div>
+            <div class="modal-actions">
+                <button class="btn" style="background: var(--bg-input);" onclick="closeManualCandidateModal()">Cancel</button>
+                <button class="btn" id="submit-candidates-btn" onclick="submitManualCandidates()">Submit &amp; Verify</button>
+            </div>
+        </div>
     </div>
 
 
@@ -1482,8 +1601,9 @@ another.com"></textarea>
                     <table>
                         <thead>
                             <tr>
-                                <th>ID</th>
                                 <th>Email</th>
+                                <th>Candidate</th>
+                                <th>Role</th>
                                 <th>Company</th>
                                 <th>Status</th>
                             </tr>
@@ -1491,9 +1611,10 @@ another.com"></textarea>
                         <tbody>
                             ${data.items.map(e => `
                                 <tr>
-                                    <td>${parseInt(e.id) || ''}</td>
                                     <td class="mono">${esc(e.email)}</td>
-                                    <td class="mono">${esc(displayDomain(e.company_domain || '-'))}</td>
+                                    <td>${esc([e.first_name, e.last_name].filter(Boolean).join(' ') || '-')}</td>
+                                    <td class="truncate">${esc(e.person_title || '-')}</td>
+                                    <td>${esc(e.company_name || displayDomain(e.company_domain) || '-')}</td>
                                     <td>${getVerifyStatusBadge(e.verify_status)}</td>
                                 </tr>
                             `).join('')}
@@ -1651,6 +1772,7 @@ another.com"></textarea>
                     ` : '<div class="text-muted">No pages crawled.</div>'}
                 `;
 
+                _injectManualCandidateUI(data.id, data.domain || data.official_domain);
                 openDetail();
             } catch (e) {
                 console.error('Failed to load company detail:', e);
@@ -1756,6 +1878,242 @@ another.com"></textarea>
         }
 
 
+
+
+        // -----------------------------------------------------------------
+        // Manual Candidate Submission
+        // -----------------------------------------------------------------
+
+        let _manualCompanyId = null;
+        let _manualCompanyDomain = null;
+        let _candidateRowCount = 0;
+        let _batchPollTimer = null;
+
+        function _injectManualCandidateUI(companyId, domain) {
+            _manualCompanyId = companyId;
+            _manualCompanyDomain = domain;
+            const existing = document.getElementById('add-candidates-btn');
+            if (existing) existing.remove();
+            const detailContent = document.getElementById('detail-content');
+            if (!detailContent) return;
+            const btnHtml = `
+                <div id="add-candidates-btn" style="margin: 12px 0 20px;">
+                    <button class="btn" onclick="openManualCandidateModal(${companyId}, '${esc(domain || '')}')">
+                        + Add Candidates Manually
+                    </button>
+                    <button class="btn" style="background: var(--bg-input); margin-left: 8px;"
+                            onclick="viewCandidateHistory(${companyId})">
+                        Submission History
+                    </button>
+                </div>
+            `;
+            const firstDiv = detailContent.querySelector('div');
+            if (firstDiv) firstDiv.insertAdjacentHTML('afterend', btnHtml);
+        }
+
+        function openManualCandidateModal(companyId, domain) {
+            _manualCompanyId = companyId;
+            _manualCompanyDomain = domain;
+            _candidateRowCount = 0;
+            document.getElementById('candidate-rows').innerHTML = '';
+            document.getElementById('batch-status-area').innerHTML = '';
+            document.getElementById('submit-candidates-btn').disabled = false;
+            document.getElementById('submit-candidates-btn').textContent = 'Submit & Verify';
+            addCandidateRow();
+            addCandidateRow();
+            addCandidateRow();
+            document.getElementById('manual-candidate-modal').classList.add('active');
+        }
+
+        function closeManualCandidateModal() {
+            document.getElementById('manual-candidate-modal').classList.remove('active');
+            if (_batchPollTimer) { clearInterval(_batchPollTimer); _batchPollTimer = null; }
+        }
+
+        function addCandidateRow() {
+            _candidateRowCount++;
+            const id = _candidateRowCount;
+            const container = document.getElementById('candidate-rows');
+            const showLabels = (id === 1 && container.children.length === 0);
+            const html = `
+                <div class="candidate-row" id="cand-row-${id}">
+                    <div>
+                        ${showLabels ? '<label>First Name</label>' : ''}
+                        <input type="text" id="cand-fn-${id}" placeholder="First name">
+                    </div>
+                    <div>
+                        ${showLabels ? '<label>Last Name</label>' : ''}
+                        <input type="text" id="cand-ln-${id}" placeholder="Last name">
+                    </div>
+                    <div>
+                        ${showLabels ? '<label>Title (optional)</label>' : ''}
+                        <input type="text" id="cand-title-${id}" placeholder="Title">
+                    </div>
+                    <div>
+                        ${showLabels ? '<label>Email (optional)</label>' : ''}
+                        <input type="email" id="cand-email-${id}" placeholder="email@domain.com">
+                    </div>
+                    <div>
+                        ${showLabels ? '<label>&nbsp;</label>' : ''}
+                        <button class="btn-remove-row" onclick="removeCandidateRow(${id})">&#10005;</button>
+                    </div>
+                </div>
+            `;
+            container.insertAdjacentHTML('beforeend', html);
+        }
+
+        function removeCandidateRow(id) {
+            const row = document.getElementById(`cand-row-${id}`);
+            if (row) row.remove();
+            if (document.querySelectorAll('[id^="cand-row-"]').length === 0) addCandidateRow();
+        }
+
+        function _collectCandidates() {
+            const candidates = [];
+            document.querySelectorAll('[id^="cand-row-"]').forEach(row => {
+                const id = row.id.replace('cand-row-', '');
+                const fn = (document.getElementById(`cand-fn-${id}`)?.value || '').trim();
+                const ln = (document.getElementById(`cand-ln-${id}`)?.value || '').trim();
+                const title = (document.getElementById(`cand-title-${id}`)?.value || '').trim();
+                const email = (document.getElementById(`cand-email-${id}`)?.value || '').trim();
+                if (!fn && !ln && !email) return;
+                const cand = {};
+                if (fn) cand.first_name = fn;
+                if (ln) cand.last_name = ln;
+                if (title) cand.title = title;
+                if (email) cand.email = email;
+                candidates.push(cand);
+            });
+            return candidates;
+        }
+
+        async function submitManualCandidates() {
+            const candidates = _collectCandidates();
+            if (candidates.length === 0) { alert('Please add at least one candidate with a name or email.'); return; }
+            for (let i = 0; i < candidates.length; i++) {
+                const c = candidates[i];
+                if (!c.first_name && !c.last_name && !c.email) {
+                    alert(`Candidate #${i + 1}: please provide at least a name or email.`);
+                    return;
+                }
+            }
+            const btn = document.getElementById('submit-candidates-btn');
+            btn.disabled = true;
+            btn.textContent = 'Submitting...';
+            try {
+                const resp = await fetch(`/api/browser/companies/${_manualCompanyId}/candidates`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ candidates }),
+                });
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || `HTTP ${resp.status}`);
+                }
+                const data = await resp.json();
+                btn.textContent = 'Verifying...';
+                _startBatchPoll(data.batch_id);
+            } catch (e) {
+                alert(`Submission failed: ${e.message}`);
+                btn.disabled = false;
+                btn.textContent = 'Submit & Verify';
+            }
+        }
+
+        function _startBatchPoll(batchId) {
+            const statusArea = document.getElementById('batch-status-area');
+            statusArea.innerHTML = `
+                <div class="batch-status">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong>Verification in progress...</strong>
+                        <span class="text-muted" id="batch-progress-text">0 / ?</span>
+                    </div>
+                    <div class="batch-progress"><div class="batch-progress-bar" id="batch-progress-bar" style="width: 0%"></div></div>
+                    <div id="batch-results-list"></div>
+                </div>
+            `;
+            const poll = async () => {
+                try {
+                    const resp = await fetch(`/api/browser/companies/${_manualCompanyId}/candidates/batches/${batchId}`);
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const processed = data.total - data.pending;
+                    const pct = data.total > 0 ? Math.round((processed / data.total) * 100) : 0;
+                    document.getElementById('batch-progress-text').textContent = `${processed} / ${data.total}`;
+                    document.getElementById('batch-progress-bar').style.width = `${pct}%`;
+                    const listHtml = data.candidates.map(c => {
+                        const name = c.full_name || [c.first_name, c.last_name].filter(Boolean).join(' ') || '?';
+                        let detail = '';
+                        if (c.outcome === 'valid') {
+                            detail = `<span class="outcome-valid">\u2713 ${esc(c.verified_email)}</span>`;
+                        } else if (c.outcome === 'invalid' || c.outcome === 'no_mx') {
+                            detail = `<span class="outcome-invalid">\u2717 Invalid${c.verify_reason ? ': ' + esc(c.verify_reason) : ''}</span>`;
+                        } else if (c.outcome === 'error') {
+                            detail = `<span class="outcome-error">\u26A0 Error</span>`;
+                        } else {
+                            detail = `<span class="outcome-pending">\u23F3 Verifying...</span>`;
+                        }
+                        return `<div style="padding: 4px 0; display: flex; justify-content: space-between;">
+                            <span>${esc(name)}${c.submitted_email ? ' (' + esc(c.submitted_email) + ')' : ''}</span>
+                            ${detail}
+                        </div>`;
+                    }).join('');
+                    document.getElementById('batch-results-list').innerHTML = listHtml;
+                    if (data.status === 'complete') {
+                        clearInterval(_batchPollTimer);
+                        _batchPollTimer = null;
+                        const btn = document.getElementById('submit-candidates-btn');
+                        btn.textContent = 'Done';
+                        btn.disabled = true;
+                        document.querySelector('.batch-status strong').textContent =
+                            `Complete: ${data.valid} valid, ${data.invalid} invalid` +
+                            (data.errors > 0 ? `, ${data.errors} errors` : '');
+                        if (_manualCompanyId) viewCompanyDetail(_manualCompanyId);
+                    }
+                } catch (e) { console.error('Batch poll error:', e); }
+            };
+            poll();
+            _batchPollTimer = setInterval(poll, 2000);
+        }
+
+        async function viewCandidateHistory(companyId) {
+            try {
+                const resp = await fetch(`/api/browser/companies/${companyId}/candidates/history`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                if (!data.batches || data.batches.length === 0) {
+                    alert('No manual candidate submissions found for this company.');
+                    return;
+                }
+                let html = '<h3>Manual Submission History</h3>';
+                html += '<table><thead><tr><th>Date</th><th>Total</th><th>Valid</th><th>Invalid</th><th>Status</th></tr></thead><tbody>';
+                for (const b of data.batches) {
+                    const date = b.submitted_at ? new Date(b.submitted_at).toLocaleDateString() : '-';
+                    const statusBadge = b.status === 'complete'
+                        ? '<span class="badge badge-success">complete</span>'
+                        : '<span class="badge badge-warning">processing</span>';
+                    html += `<tr>
+                        <td>${esc(date)}</td>
+                        <td>${b.total}</td>
+                        <td style="color: var(--success);">${b.valid}</td>
+                        <td style="color: var(--danger);">${b.invalid}</td>
+                        <td>${statusBadge}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('detail-content').innerHTML = html;
+            } catch (e) {
+                console.error('Failed to load candidate history:', e);
+                alert('Failed to load submission history.');
+            }
+        }
+
+        document.getElementById('manual-candidate-modal')?.addEventListener('click', function(e) {
+            if (e.target === this) closeManualCandidateModal();
+        });
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeManualCandidateModal();
+        });
 
 
         // Enter key handlers

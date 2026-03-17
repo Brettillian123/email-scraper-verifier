@@ -428,6 +428,7 @@ _NON_PERSON_PHRASES = frozenset(
         "sitemap",
         "main menu",
         "footer menu",
+        "footer menu",
         # Business service categories (not people)
         "tax preparation",
         "tax services",
@@ -514,7 +515,7 @@ _CREDENTIALS_RE = (
     r"CPA|MBA|CFP|CFA|EA|JD|PhD|MD|RN|PE|PMP"
     r"|SPHR|PHR|SHRM|CFE|CIA|CISA|CMA|CGMA"
     r"|CVA|ABV|ASA|CEPA|ChFC|CLU|RICP|WMCP"
-    r"|AIF|AAMS|CRPC|CDFA|CFP®|CPA/PFS"
+    r"|AIF|AAMS|CRPC|CDFA|CFPÂ®|CPA/PFS"
     r")\b\)?"
 )
 
@@ -671,6 +672,31 @@ def _split_name(full_name: str) -> tuple[str | None, str | None]:
     if len(parts) < 2:
         return clean_name.strip(), None
     return parts[0], parts[-1]
+
+
+def _clean_title_edge(text: str) -> str:
+    """
+    Trim leading/trailing junk from a potential title.
+
+    Avoids str.strip(<multi-char string>) which is easy to misread and triggers B005.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # Normalize a few common mojibake sequences for dashes.
+    for bad in ("Ã¢â‚¬â€œ", "Ã¢â‚¬â€", "â€“", "â€”"):
+        if bad in s:
+            s = s.replace(bad, "–")
+
+    edge_chars = {"-", "–", "—", "|", ","}
+
+    while s and s[0] in edge_chars:
+        s = s[1:].lstrip()
+    while s and s[-1] in edge_chars:
+        s = s[:-1].rstrip()
+
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1099,7 @@ def _extract_from_repeated_siblings(
 # ---------------------------------------------------------------------------
 
 
-_ALT_SPLITS = [",", " - ", " â€” ", " | "]
+_ALT_SPLITS = [",", " - ", " Ã¢â‚¬â€ ", " | "]
 _ALT_EXCLUDE_WORDS = ("logo", "icon", "banner", "photo", "image", "headshot", "background")
 
 # Title keywords that might appear in image alt text like "Jack Angers VP Engineering"
@@ -1138,29 +1164,13 @@ def _extract_name_title_from_alt(alt_text: str) -> tuple[str | None, str | None]
 
             # Validate the split makes sense
             if _looks_like_person_name(potential_name) and len(potential_name) >= 3:
-                # Clean up potential title (remove leading/trailing junk)
-                potential_title = potential_title.strip(" -â€“|,")
+                potential_title = _clean_title_edge(potential_title)
                 if potential_title and _looks_like_title(potential_title):
                     return potential_name, potential_title
-                else:
-                    return potential_name, None
+                return potential_name, None
 
     # Fallback: if whole string looks like a person name, return it
     if _looks_like_person_name(alt):
-        return alt, None
-
-    return None, None
-
-    for sep in _ALT_SPLITS:
-        if sep not in alt:
-            continue
-        left, right = alt.split(sep, 1)
-        potential_name = left.strip()
-        potential_title = right.strip()
-        if _looks_like_person_name(potential_name):
-            return potential_name, potential_title if _looks_like_title(potential_title) else None
-
-    if _looks_like_person_name(alt) and not any(x in alt.lower() for x in _ALT_EXCLUDE_WORDS):
         return alt, None
 
     return None, None
@@ -1184,7 +1194,7 @@ def _extract_name_from_next_sibling(img: Any) -> str | None:
     """Find a person name in the next sibling of img or its parent.
 
     Webflow pattern: <div class="photo"><img></div><div class="info">Name</div>
-    The img has no direct sibling — the *parent* div has a next sibling.
+    The img has no direct sibling â€” the *parent* div has a next sibling.
     """
     if not img:
         return None
@@ -1470,17 +1480,59 @@ _LEADERSHIP_SECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Looser variant: match leadership phrases ANYWHERE in heading text.
+# Catches headings like "Our Team | Acme Corp" or "Meet the leadership team at SafetyWing".
+_LEADERSHIP_SECTION_LOOSE_RE = re.compile(
+    r"(?:" + "|".join(_LEADERSHIP_SECTION_PATTERNS) + r")",
+    re.IGNORECASE,
+)
+
+# Section/div IDs and classes that indicate a team section.
+_TEAM_SECTION_ATTR_TERMS = frozenset(
+    {
+        "team",
+        "leadership",
+        "executives",
+        "founders",
+        "board",
+        "people",
+        "staff",
+        "our-team",
+        "our_team",
+        "leadership-team",
+        "leadership_team",
+        "team-members",
+        "team_members",
+        "team-section",
+        "team_section",
+        "leadership-section",
+        "people-section",
+        "board-members",
+        "advisory-board",
+        "meet-the-team",
+        "meet_the_team",
+        "our-leadership",
+        "our_leadership",
+        "executive-team",
+        "executive_team",
+    }
+)
+
 
 def _find_leadership_sections(soup: Any) -> list[Any]:
     sections = []
     seen_elements = set()
 
+    # --- Strategy A: heading-text detection (original + loose) ---
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
         text = heading.get_text(strip=True)
         if not text:
             continue
 
-        if _LEADERSHIP_SECTION_RE.search(text):
+        # Exact match (high confidence) or loose substring match
+        if _LEADERSHIP_SECTION_RE.search(text) or (
+            len(text) <= 80 and _LEADERSHIP_SECTION_LOOSE_RE.search(text)
+        ):
             log.debug("Found leadership heading: %s", text)
 
             parent = heading.find_parent(["section", "div", "article"])
@@ -1504,6 +1556,39 @@ def _find_leadership_sections(soup: Any) -> list[Any]:
                         seen_elements.add(id(next_sib))
 
                 current = next_sib
+
+    # --- Strategy B: data-attribute detection (section/div with team-related ID or class) ---
+    # This catches pages where team content is in e.g. <section id="team"> or
+    # <div class="leadership-section"> even if the heading text is generic.
+    for el in soup.find_all(["section", "div", "article"]):
+        if id(el) in seen_elements:
+            continue
+
+        el_id = (el.get("id") or "").lower().strip()
+        el_classes = " ".join(el.get("class") or []).lower()
+
+        matched = False
+        for term in _TEAM_SECTION_ATTR_TERMS:
+            if term == el_id or term in el_classes.split():
+                matched = True
+                break
+            # Also check hyphenated/underscore variants in class string
+            if term in el_classes:
+                matched = True
+                break
+
+        if matched:
+            # Verify the section has enough children to plausibly contain people cards
+            children = list(el.children)
+            element_children = [c for c in children if hasattr(c, "name") and c.name]
+            if len(element_children) >= 2:
+                log.debug(
+                    "Found team section via attributes: id=%s class=%s",
+                    el_id,
+                    el_classes[:60],
+                )
+                sections.append(el)
+                seen_elements.add(id(el))
 
     return sections
 
@@ -1561,6 +1646,31 @@ def _classifier_allows_people_cards(html: str, source_url: str) -> bool:
                 min_score=_PEOPLE_CARDS_CLASSIFY_MIN_SCORE,
             )
             if not getattr(verdict, "ok", False):
+                # FALLBACK: Allow extraction if the HTML body contains strong
+                # people-section signals even though the classifier scored low.
+                # This covers root-page-only startups whose URL and headings
+                # are product-focused but the page body has a team section.
+                head = (html or "")[:60_000].lower()
+                _body_people_signals = (
+                    "leadership team",
+                    "executive team",
+                    "management team",
+                    "board of directors",
+                    "our team",
+                    "meet the team",
+                    "our leadership",
+                    '"@type":"person"',
+                    '"@type": "person"',
+                )
+                if any(s in head for s in _body_people_signals):
+                    log.info(
+                        "people_cards: classifier rejected but body has people signals: "
+                        "url=%s score=%s reasons=%s",
+                        source_url,
+                        getattr(verdict, "score", None),
+                        getattr(verdict, "reasons", None),
+                    )
+                    return True
                 log.debug(
                     "Skipping people_cards (classifier not ok): url=%s score=%s reasons=%s",
                     source_url,

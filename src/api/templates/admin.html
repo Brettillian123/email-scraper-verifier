@@ -385,6 +385,7 @@
             <div class="user-section">
                 <a href="/" class="user-btn">← Dashboard</a>
                 <a href="/admin/users" class="user-btn">👥 Users</a>
+		<a href="/admin/export-domains.txt" class="user-btn" download="company_domains.txt">📋 Export Domains</a>
                 {% if user %}
                 <div class="user-btn">
                     <div class="user-avatar">{{ user.email[0]|upper if user.email else '?' }}</div>

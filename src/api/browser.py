@@ -12,7 +12,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 RQ_REDIS_URL = (
     os.getenv("RQ_REDIS_URL") or os.getenv("REDIS_URL") or "redis://127.0.0.1:6379/0"
@@ -125,6 +125,47 @@ class PaginatedResponse(BaseModel):
     total_pages: int
 
 
+class ManualCandidateInput(BaseModel):
+    """Single candidate in a manual submission batch."""
+
+    first_name: str | None = None
+    last_name: str | None = None
+    full_name: str | None = None
+    title: str | None = None
+    email: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if "@" not in v:
+            raise ValueError("Invalid email format: missing '@'")
+        return v
+
+    @field_validator("first_name", "last_name", "full_name", "title", mode="before")
+    @classmethod
+    def strip_strings(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = str(v).strip()
+        return v if v else None
+
+
+class ManualCandidateRequest(BaseModel):
+    """Batch submission of manual candidates to a company."""
+
+    candidates: list[ManualCandidateInput] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="List of candidates to add (max 50 per batch)",
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
@@ -187,7 +228,6 @@ def _normalize_modes(modes: Iterable[str] | None) -> list[str]:
 def _domain_risk_levels_for_company_ids(
     con: Any,
     *,
-    tenant_id: str,
     company_ids: list[int],
 ) -> dict[int, str]:
     """
@@ -202,13 +242,8 @@ def _domain_risk_levels_for_company_ids(
     if not company_ids:
         return {}
 
-    emails_has_tenant = _has_column(con, "emails", "tenant_id")
     where_parts: list[str] = [f"e.company_id IN ({','.join(['%s'] * len(company_ids))})"]
     params: list[Any] = list(company_ids)
-
-    if emails_has_tenant:
-        where_parts.append("e.tenant_id = %s")
-        params.append(tenant_id)
 
     # NOTE: use %% inside SQL literals to avoid psycopg2 percent interpolation.
     sql = f"""
@@ -373,40 +408,17 @@ def _export_status_filter_clause(
     return status_where, status_params
 
 
-def _export_join_tenant_clauses(
-    *,
-    tenant_id: str,
-    emails_has_tenant: bool,
-    vr_has_tenant: bool,
-) -> tuple[str, list[Any], str, list[Any]]:
-    e_tenant_clause = ""
-    e_tenant_params: list[Any] = []
-    if emails_has_tenant:
-        e_tenant_clause = "AND e.tenant_id = %s"
-        e_tenant_params = [tenant_id]
-
-    vr_tenant_clause = ""
-    vr_tenant_params: list[Any] = []
-    if vr_has_tenant and emails_has_tenant:
-        vr_tenant_clause = "AND vr.tenant_id = e.tenant_id"
-    elif vr_has_tenant:
-        vr_tenant_clause = "AND vr.tenant_id = %s"
-        vr_tenant_params = [tenant_id]
-
-    return e_tenant_clause, e_tenant_params, vr_tenant_clause, vr_tenant_params
+def _export_join_tenant_clauses() -> tuple[str, list[Any], str, list[Any]]:
+    """Return empty tenant clauses — all authenticated users see all data."""
+    return "", [], "", []
 
 
 def _export_selected_companies_sql(
     con: Any,
     *,
-    tenant_id: str,
     company_ids: list[int],
     status_filter: str,
 ) -> tuple[str, tuple[Any, ...]]:
-    companies_has_tenant = _has_column(con, "companies", "tenant_id")
-    people_has_tenant = _has_column(con, "people", "tenant_id")
-    emails_has_tenant = _has_column(con, "emails", "tenant_id")
-    vr_has_tenant = _has_column(con, "verification_results", "tenant_id")
     vr_has_fallback = _has_column(con, "verification_results", "fallback_status")
 
     name_expr = _export_name_expr()
@@ -415,13 +427,6 @@ def _export_selected_companies_sql(
     placeholders = ",".join(["%s"] * len(company_ids))
     where_parts: list[str] = [f"c.id IN ({placeholders})"]
     where_params: list[Any] = list(company_ids)
-
-    if companies_has_tenant:
-        where_parts.append("c.tenant_id = %s")
-        where_params.append(tenant_id)
-    if people_has_tenant:
-        where_parts.append("p.tenant_id = %s")
-        where_params.append(tenant_id)
 
     where_parts.append(f"{name_expr} IS NOT NULL AND {name_expr} <> ''")
 
@@ -438,11 +443,7 @@ def _export_selected_companies_sql(
         e_tenant_params,
         vr_tenant_clause,
         vr_tenant_params,
-    ) = _export_join_tenant_clauses(
-        tenant_id=tenant_id,
-        emails_has_tenant=emails_has_tenant,
-        vr_has_tenant=vr_has_tenant,
-    )
+    ) = _export_join_tenant_clauses()
 
     sql = f"""
         SELECT DISTINCT ON (c.id, p.id)
@@ -526,7 +527,6 @@ def _export_selected_companies_filename(status_filter: str) -> str:
 def get_stats(auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[str, Any]:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         stats: dict[str, Any] = {}
 
         for table, key in [
@@ -538,42 +538,25 @@ def get_stats(auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[s
             ("verification_results", "verifications"),
         ]:
             try:
-                if _has_column(con, table, "tenant_id"):
-                    stats[key] = con.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE tenant_id = %s",
-                        (tenant_id,),
-                    ).fetchone()[0]
-                else:
-                    stats[key] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                stats[key] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             except Exception:
                 stats[key] = 0
 
         try:
-            where = "WHERE verify_status IS NOT NULL"
-            params: list[Any] = []
-            if _has_column(con, "verification_results", "tenant_id"):
-                where += " AND tenant_id = %s"
-                params.append(tenant_id)
-
             sql = (
                 "SELECT verify_status, COUNT(*) "
-                f"FROM verification_results {where} "
+                "FROM verification_results "
+                "WHERE verify_status IS NOT NULL "
                 "GROUP BY verify_status"
             )
-            rows = con.execute(sql, tuple(params)).fetchall()
+            rows = con.execute(sql).fetchall()
             stats["verification_breakdown"] = {r[0]: r[1] for r in rows}
         except Exception:
             stats["verification_breakdown"] = {}
 
         try:
-            where = ""
-            params2: list[Any] = []
-            if _has_column(con, "runs", "tenant_id"):
-                where = "WHERE tenant_id = %s"
-                params2.append(tenant_id)
             rows = con.execute(
-                f"SELECT status, COUNT(*) FROM runs {where} GROUP BY status",
-                tuple(params2),
+                "SELECT status, COUNT(*) FROM runs GROUP BY status",
             ).fetchall()
             stats["runs_by_status"] = {r[0]: r[1] for r in rows}
         except Exception:
@@ -596,17 +579,10 @@ def list_companies(
 ) -> PaginatedResponse:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         offset = (page - 1) * page_size
-
-        companies_has_tenant = _has_column(con, "companies", "tenant_id")
 
         where_parts: list[str] = []
         params: list[Any] = []
-
-        if companies_has_tenant:
-            where_parts.append("c.tenant_id = %s")
-            params.append(tenant_id)
 
         if search:
             st = f"%{search.lower()}%"
@@ -624,35 +600,23 @@ def list_companies(
             tuple(params),
         ).fetchone()[0]
 
-        p_tenant = "AND p.tenant_id = %s" if _has_column(con, "people", "tenant_id") else ""
-        e_tenant = "AND e.tenant_id = %s" if _has_column(con, "emails", "tenant_id") else ""
-        s_tenant = "AND s.tenant_id = %s" if _has_column(con, "sources", "tenant_id") else ""
-
         sql = f"""
             SELECT
                 c.id, c.name, c.domain, c.official_domain,
                 c.attrs, c.created_at,
                 (SELECT COUNT(*) FROM people p
-                 WHERE p.company_id = c.id {p_tenant}),
+                 WHERE p.company_id = c.id),
                 (SELECT COUNT(*) FROM emails e
-                 WHERE e.company_id = c.id {e_tenant}),
+                 WHERE e.company_id = c.id),
                 (SELECT COUNT(*) FROM sources s
-                 WHERE s.company_id = c.id {s_tenant})
+                 WHERE s.company_id = c.id)
             FROM companies c
             {where_clause}
             ORDER BY c.id DESC
             LIMIT %s OFFSET %s
         """
 
-        sub_params: list[Any] = []
-        if _has_column(con, "people", "tenant_id"):
-            sub_params.append(tenant_id)
-        if _has_column(con, "emails", "tenant_id"):
-            sub_params.append(tenant_id)
-        if _has_column(con, "sources", "tenant_id"):
-            sub_params.append(tenant_id)
-
-        rows = con.execute(sql, tuple(sub_params + params + [page_size, offset])).fetchall()
+        rows = con.execute(sql, tuple(params + [page_size, offset])).fetchall()
 
         items: list[dict[str, Any]] = []
         company_ids: list[int] = []
@@ -680,7 +644,6 @@ def list_companies(
 
         risk_map = _domain_risk_levels_for_company_ids(
             con,
-            tenant_id=tenant_id,
             company_ids=company_ids,
         )
         for it in items:
@@ -726,14 +689,12 @@ def export_selected_companies_csv(
             detail="ids must contain at least one valid integer company id",
         )
 
-    tenant_id = auth.tenant_id
     status_filter = (status or "").strip().lower()
 
     con = _get_conn()
     try:
         sql, params = _export_selected_companies_sql(
             con,
-            tenant_id=tenant_id,
             company_ids=company_ids,
             status_filter=status_filter,
         )
@@ -777,20 +738,11 @@ def get_company(
 ) -> dict[str, Any]:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
-        companies_has_tenant = _has_column(con, "companies", "tenant_id")
-
-        where = "WHERE id = %s"
-        params: list[Any] = [company_id]
-        if companies_has_tenant:
-            where += " AND tenant_id = %s"
-            params.append(tenant_id)
-
         row = con.execute(
             "SELECT id, name, domain, official_domain,"
             " website_url, attrs, created_at, updated_at"
-            f" FROM companies {where}",
-            tuple(params),
+            " FROM companies WHERE id = %s",
+            (company_id,),
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Company not found")
@@ -802,31 +754,15 @@ def get_company(
             except Exception:
                 attrs = {}
 
-        people_has_tenant = _has_column(con, "people", "tenant_id")
-        emails_has_tenant = _has_column(con, "emails", "tenant_id")
-        sources_has_tenant = _has_column(con, "sources", "tenant_id")
-
-        people_where = "WHERE company_id = %s"
-        people_params: list[Any] = [company_id]
-        if people_has_tenant:
-            people_where += " AND tenant_id = %s"
-            people_params.append(tenant_id)
-
         people = con.execute(
             "SELECT id, first_name, last_name, full_name,"
             " title, source_url"
-            f" FROM people {people_where} ORDER BY id",
-            tuple(people_params),
+            " FROM people WHERE company_id = %s ORDER BY id",
+            (company_id,),
         ).fetchall()
 
-        emails_where = "WHERE e.company_id = %s"
-        emails_params: list[Any] = [company_id]
-        if emails_has_tenant:
-            emails_where += " AND e.tenant_id = %s"
-            emails_params.append(tenant_id)
-
         emails = con.execute(
-            f"""
+            """
             SELECT
                 e.id,
                 e.email,
@@ -842,28 +778,21 @@ def get_company(
                 ORDER BY vr.verified_at DESC NULLS LAST, vr.id DESC
                 LIMIT 1
             ) vr ON true
-            {emails_where}
+            WHERE e.company_id = %s
             ORDER BY e.id
             """,
-            tuple(emails_params),
+            (company_id,),
         ).fetchall()
 
-        pages_where = "WHERE company_id = %s"
-        pages_params: list[Any] = [company_id]
-        if sources_has_tenant:
-            pages_where += " AND tenant_id = %s"
-            pages_params.append(tenant_id)
-
-        pages_sql = (
+        pages = con.execute(
             "SELECT id, source_url, LENGTH(html), fetched_at "
-            f"FROM sources {pages_where} "
-            "ORDER BY fetched_at DESC"
-        )
-        pages = con.execute(pages_sql, tuple(pages_params)).fetchall()
+            "FROM sources WHERE company_id = %s "
+            "ORDER BY fetched_at DESC",
+            (company_id,),
+        ).fetchall()
 
         risk_map = _domain_risk_levels_for_company_ids(
             con,
-            tenant_id=tenant_id,
             company_ids=[int(company_id)],
         )
         risk_level = risk_map.get(int(company_id))
@@ -919,6 +848,325 @@ def get_company(
             pass
 
 
+# --------------------------------------------------------------------------------------
+# Manual candidate submission
+# --------------------------------------------------------------------------------------
+
+MANUAL_SOURCE_URL = "manual:user_added"
+
+
+@router.post("/companies/{company_id}/candidates")
+def submit_manual_candidates(
+    company_id: int,
+    request: ManualCandidateRequest,
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    """
+    Submit manual candidates for a company.
+
+    Each candidate is inserted as a person (and optionally email), then an
+    RQ job is enqueued to verify all candidates in the batch.  Invalid
+    candidates are cleaned up after verification; valid ones are kept.
+
+    Returns a batch_id + job_id for status polling.
+    """
+    from redis import Redis
+    from rq import Queue
+
+    con = _get_conn()
+    try:
+        tenant_id = auth.tenant_id
+        user_id = auth.user_id
+        now = _utc_now_iso()
+        batch_id = str(uuid.uuid4())
+
+        # Validate company exists
+        company_row = con.execute(
+            "SELECT id, domain, official_domain FROM companies WHERE id = %s",
+            (company_id,),
+        ).fetchone()
+        if not company_row:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+        # Validate each candidate has at least a name or email
+        validated: list[dict[str, Any]] = []
+        for i, cand in enumerate(request.candidates):
+            has_name = bool(
+                cand.full_name
+                or (cand.first_name and cand.last_name)
+                or cand.first_name
+                or cand.last_name
+            )
+            if not has_name and not cand.email:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Candidate #{i + 1}: must provide at least a name or email",
+                )
+
+            # Derive full_name if not provided
+            full_name = cand.full_name
+            first_name = cand.first_name
+            last_name = cand.last_name
+
+            if not full_name and (first_name or last_name):
+                full_name = f"{first_name or ''} {last_name or ''}".strip()
+            elif full_name and not first_name and not last_name:
+                parts = full_name.strip().split(None, 1)
+                first_name = parts[0] if parts else None
+                last_name = parts[1] if len(parts) > 1 else None
+
+            validated.append(
+                {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "full_name": full_name,
+                    "title": cand.title,
+                    "email": cand.email,
+                }
+            )
+
+        # Insert people + audit rows
+        person_ids: list[int] = []
+
+        for v in validated:
+            person_row = con.execute(
+                "INSERT INTO people"
+                " (tenant_id, company_id, first_name, last_name, full_name,"
+                "  title, source_url, created_at, updated_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                " RETURNING id",
+                (
+                    tenant_id,
+                    company_id,
+                    v["first_name"],
+                    v["last_name"],
+                    v["full_name"],
+                    v["title"],
+                    MANUAL_SOURCE_URL,
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            person_id = int(person_row[0])
+            person_ids.append(person_id)
+
+            con.execute(
+                "INSERT INTO manual_candidate_attempts"
+                " (tenant_id, company_id, batch_id, first_name, last_name,"
+                "  full_name, title, submitted_email, outcome, person_id,"
+                "  submitted_by, submitted_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s)",
+                (
+                    tenant_id,
+                    company_id,
+                    batch_id,
+                    v["first_name"],
+                    v["last_name"],
+                    v["full_name"],
+                    v["title"],
+                    v["email"],
+                    person_id,
+                    user_id,
+                    now,
+                ),
+            )
+
+        con.commit()
+
+        # Enqueue the verification job
+        try:
+            redis = Redis.from_url(RQ_REDIS_URL)
+            q = Queue(name="generate", connection=redis)
+
+            from src.queueing.manual_candidates import task_verify_manual_candidates
+
+            job = q.enqueue(
+                task_verify_manual_candidates,
+                tenant_id=tenant_id,
+                company_id=company_id,
+                batch_id=batch_id,
+                job_timeout=600,
+                meta={
+                    "stage": "manual_candidate_verification",
+                    "tenant_id": tenant_id,
+                    "company_id": company_id,
+                    "batch_id": batch_id,
+                    "candidate_count": len(validated),
+                },
+            )
+
+            return {
+                "ok": True,
+                "batch_id": batch_id,
+                "job_id": job.id,
+                "candidates_submitted": len(validated),
+                "person_ids": person_ids,
+                "status": "processing",
+            }
+
+        except Exception as exc:
+            # Enqueue failed â€” roll back the inserts
+            try:
+                for pid in person_ids:
+                    con.execute("DELETE FROM people WHERE id = %s", (pid,))
+                con.execute(
+                    "DELETE FROM manual_candidate_attempts WHERE batch_id = %s",
+                    (batch_id,),
+                )
+                con.commit()
+            except Exception:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to start verification: {exc}",
+            ) from exc
+
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+@router.get("/companies/{company_id}/candidates/batches/{batch_id}")
+def get_manual_candidate_batch(
+    company_id: int,
+    batch_id: str,
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    """Poll the status of a manual candidate submission batch."""
+    con = _get_conn()
+    try:
+        rows = con.execute(
+            "SELECT id, first_name, last_name, full_name, title,"
+            "  submitted_email, outcome, verified_email,"
+            "  verify_status, verify_reason, error_detail,"
+            "  person_id, email_id, submitted_at, processed_at"
+            " FROM manual_candidate_attempts"
+            " WHERE batch_id = %s AND company_id = %s"
+            " ORDER BY id",
+            (batch_id, company_id),
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="Batch not found")
+
+        candidates = []
+        pending = valid = invalid = errors = 0
+
+        for r in rows:
+            outcome = r[6]
+            if outcome == "pending":
+                pending += 1
+            elif outcome == "valid":
+                valid += 1
+            elif outcome in ("invalid", "no_mx"):
+                invalid += 1
+            elif outcome == "error":
+                errors += 1
+
+            candidates.append(
+                {
+                    "id": r[0],
+                    "first_name": r[1],
+                    "last_name": r[2],
+                    "full_name": r[3],
+                    "title": r[4],
+                    "submitted_email": r[5],
+                    "outcome": outcome,
+                    "verified_email": r[7],
+                    "verify_status": r[8],
+                    "verify_reason": r[9],
+                    "error_detail": r[10],
+                    "person_id": r[11],
+                    "email_id": r[12],
+                    "submitted_at": r[13],
+                    "processed_at": r[14],
+                }
+            )
+
+        total = len(rows)
+        batch_status = "processing" if pending > 0 else "complete"
+
+        return {
+            "batch_id": batch_id,
+            "company_id": company_id,
+            "status": batch_status,
+            "total": total,
+            "pending": pending,
+            "valid": valid,
+            "invalid": invalid,
+            "errors": errors,
+            "candidates": candidates,
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+@router.get("/companies/{company_id}/candidates/history")
+def get_manual_candidate_history(
+    company_id: int,
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """Get the history of all manual candidate submissions for a company."""
+    con = _get_conn()
+    try:
+        # Check if the table exists before querying
+        if not _has_table(con, "manual_candidate_attempts"):
+            return {"company_id": company_id, "batches": []}
+
+        rows = con.execute(
+            "SELECT batch_id,"
+            "  COUNT(*) AS total,"
+            "  COUNT(*) FILTER (WHERE outcome = 'valid') AS valid,"
+            "  COUNT(*) FILTER (WHERE outcome IN ('invalid', 'no_mx')) AS invalid,"
+            "  COUNT(*) FILTER (WHERE outcome = 'pending') AS pending,"
+            "  COUNT(*) FILTER (WHERE outcome = 'error') AS errors,"
+            "  MIN(submitted_at) AS submitted_at,"
+            "  MAX(processed_at) AS last_processed_at,"
+            "  MAX(submitted_by) AS submitted_by"
+            " FROM manual_candidate_attempts"
+            " WHERE company_id = %s"
+            " GROUP BY batch_id"
+            " ORDER BY MIN(submitted_at) DESC"
+            " LIMIT %s",
+            (company_id, limit),
+        ).fetchall()
+
+        batches = []
+        for r in rows:
+            batch_status = "processing" if r[4] > 0 else "complete"
+            batches.append(
+                {
+                    "batch_id": r[0],
+                    "total": r[1],
+                    "valid": r[2],
+                    "invalid": r[3],
+                    "pending": r[4],
+                    "errors": r[5],
+                    "status": batch_status,
+                    "submitted_at": r[6],
+                    "last_processed_at": r[7],
+                    "submitted_by": r[8],
+                }
+            )
+
+        return {"company_id": company_id, "batches": batches}
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 @router.get("/people")
 def list_people(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
@@ -929,17 +1177,10 @@ def list_people(
 ) -> PaginatedResponse:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         offset = (page - 1) * page_size
-
-        people_has_tenant = _has_column(con, "people", "tenant_id")
 
         where_parts: list[str] = []
         params: list[Any] = []
-
-        if people_has_tenant:
-            where_parts.append("p.tenant_id = %s")
-            params.append(tenant_id)
 
         if company_id:
             where_parts.append("p.company_id = %s")
@@ -1013,17 +1254,10 @@ def list_emails(
 ) -> PaginatedResponse:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         offset = (page - 1) * page_size
-
-        emails_has_tenant = _has_column(con, "emails", "tenant_id")
 
         where_parts: list[str] = []
         params: list[Any] = []
-
-        if emails_has_tenant:
-            where_parts.append("e.tenant_id = %s")
-            params.append(tenant_id)
 
         if company_id:
             where_parts.append("e.company_id = %s")
@@ -1117,24 +1351,16 @@ def list_runs(
 ) -> PaginatedResponse:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         offset = (page - 1) * page_size
 
-        runs_has_tenant = _has_column(con, "runs", "tenant_id")
-        where = ""
-        params: list[Any] = []
-        if runs_has_tenant:
-            where = "WHERE tenant_id = %s"
-            params.append(tenant_id)
-
-        total = con.execute(f"SELECT COUNT(*) FROM runs {where}", tuple(params)).fetchone()[0]
+        total = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
         rows = con.execute(
             "SELECT id, status, label, domains_json,"
             " options_json, progress_json, error,"
             " created_at, started_at, finished_at "
-            f"FROM runs {where} ORDER BY created_at DESC "
+            "FROM runs ORDER BY created_at DESC "
             "LIMIT %s OFFSET %s",
-            tuple(params + [page_size, offset]),
+            (page_size, offset),
         ).fetchall()
 
         items: list[dict[str, Any]] = []
@@ -1189,21 +1415,12 @@ def list_runs(
 def get_run(run_id: str, auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[str, Any]:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
-        runs_has_tenant = _has_column(con, "runs", "tenant_id")
-
-        where = "WHERE id = %s"
-        params: list[Any] = [run_id]
-        if runs_has_tenant:
-            where += " AND tenant_id = %s"
-            params.append(tenant_id)
-
         row = con.execute(
             "SELECT id, status, label, domains_json,"
             " options_json, progress_json, error,"
             " created_at, started_at, finished_at"
-            f" FROM runs {where}",
-            tuple(params),
+            " FROM runs WHERE id = %s",
+            (run_id,),
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
@@ -1333,45 +1550,26 @@ def search_all(
 ) -> dict[str, Any]:
     con = _get_conn()
     try:
-        tenant_id = auth.tenant_id
         st = f"%{q.lower()}%"
 
-        companies_has_tenant = _has_column(con, "companies", "tenant_id")
-        people_has_tenant = _has_column(con, "people", "tenant_id")
-        emails_has_tenant = _has_column(con, "emails", "tenant_id")
-
-        companies_where = (
-            "WHERE (LOWER(domain) LIKE %s OR LOWER(name) LIKE %s OR LOWER(official_domain) LIKE %s)"
-        )
-        companies_params: list[Any] = [st, st, st]
-        if companies_has_tenant:
-            companies_where += " AND tenant_id = %s"
-            companies_params.append(tenant_id)
         companies = con.execute(
-            f"SELECT id, name, domain, official_domain FROM companies {companies_where} LIMIT %s",
-            tuple(companies_params + [limit]),
+            "SELECT id, name, domain, official_domain FROM companies"
+            " WHERE (LOWER(domain) LIKE %s OR LOWER(name) LIKE %s"
+            " OR LOWER(official_domain) LIKE %s)"
+            " LIMIT %s",
+            (st, st, st, limit),
         ).fetchall()
 
-        people_where = (
+        people = con.execute(
+            "SELECT p.id, p.first_name, p.last_name, p.full_name, p.title, c.domain "
+            "FROM people p LEFT JOIN companies c ON c.id = p.company_id "
             "WHERE (LOWER(p.first_name) LIKE %s"
             " OR LOWER(p.last_name) LIKE %s"
             " OR LOWER(p.full_name) LIKE %s)"
-        )
-        people_params: list[Any] = [st, st, st]
-        if people_has_tenant:
-            people_where += " AND p.tenant_id = %s"
-            people_params.append(tenant_id)
-        people = con.execute(
-            "SELECT p.id, p.first_name, p.last_name, p.full_name, p.title, c.domain "
-            f"FROM people p LEFT JOIN companies c ON c.id = p.company_id {people_where} LIMIT %s",
-            tuple(people_params + [limit]),
+            " LIMIT %s",
+            (st, st, st, limit),
         ).fetchall()
 
-        emails_where = "WHERE LOWER(e.email) LIKE %s"
-        emails_params: list[Any] = [st]
-        if emails_has_tenant:
-            emails_where += " AND e.tenant_id = %s"
-            emails_params.append(tenant_id)
         emails = con.execute(
             "SELECT e.id, e.email, c.domain, vr.verify_status "
             "FROM emails e "
@@ -1382,8 +1580,8 @@ def search_all(
             "  ORDER BY vr.verified_at DESC NULLS LAST, vr.id DESC "
             "  LIMIT 1"
             ") vr ON true "
-            f"{emails_where} LIMIT %s",
-            tuple(emails_params + [limit]),
+            "WHERE LOWER(e.email) LIKE %s LIMIT %s",
+            (st, limit),
         ).fetchall()
 
         return {

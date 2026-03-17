@@ -2011,30 +2011,25 @@ def _task_probe_email_impl(  # noqa: C901
     )
     tcp25_ok = bool(pre.get("ok"))
     if not tcp25_ok and not bool(force):
+        fallback_status, fallback_raw = _maybe_run_fallback(email_str, "unknown")
+
         payload: dict[str, Any] = {
-            "ok": False,
-            "category": "unknown",
-            "code": None,
-            "mx_host": mx_host,
-            "domain": dom,
-            "email_id": int(email_id),
+            "ok": False, "category": "unknown", "code": None,
+            "mx_host": mx_host, "domain": dom, "email_id": int(email_id),
             "email": email_str,
             "elapsed_ms": int((time.perf_counter() - start) * 1000),
-            "error": "tcp25_blocked",
-            "preflight": pre,
+            "error": "tcp25_blocked", "preflight": pre,
         }
 
+        if fallback_status is not None:
+            payload["fallback_status"] = fallback_status
+            payload["fallback_raw"] = fallback_raw
+
         v_status, v_reason, v_mx, v_at, _vr_id = _persist_probe_result_r18(
-            db_path=db_path,
-            email_id=int(email_id),
-            email=email_str,
-            domain=dom,
-            mx_host=mx_host,
-            category=payload["category"],
-            code=None,
-            error=payload["error"],
-            fallback_status=None,
-            fallback_raw=None,
+            db_path=db_path, email_id=int(email_id), email=email_str,
+            domain=dom, mx_host=mx_host, category=payload["category"],
+            code=None, error=payload["error"],
+            fallback_status=fallback_status, fallback_raw=fallback_raw,
             tcp25_ok=False,
         )
         if v_status is not None:
@@ -2061,24 +2056,11 @@ def _task_probe_email_impl(  # noqa: C901
             start=start,
         )
         if throttle_error is not None:
-            v_status, v_reason, v_mx, v_at, _vr_id = _persist_probe_result_r18(
-                db_path=db_path,
-                email_id=int(email_id),
-                email=email_str,
-                domain=dom,
-                mx_host=mx_host,
-                category=throttle_error.get("category"),
-                code=throttle_error.get("code"),
-                error=throttle_error.get("error"),
-                fallback_status=None,
-                fallback_raw=None,
-                tcp25_ok=tcp25_ok,
+            log.info(
+                "R16: throttled, skipping probe (no result persisted)",
+                extra={"email_id": email_id, "email": email_str, "domain": dom,
+                        "mx_host": mx_host, "reason": throttle_error.get("error")},
             )
-            if v_status is not None:
-                throttle_error["verify_status"] = v_status
-                throttle_error["verify_reason"] = v_reason
-                throttle_error["verified_mx"] = v_mx
-                throttle_error["verified_at"] = v_at
             return throttle_error
 
         # --- NEW: clamp probe timeouts so the 20s job timeout remains realistic
@@ -2281,7 +2263,7 @@ def _examples_for_domain(con: Any, domain: str) -> list[tuple[str, str, str]]:
 
 
     We:
-      - Prefer a join from emails â†’ people when both tables/columns exist.
+      - Prefer a join from emails Ã¢â€ â€™ people when both tables/columns exist.
       - Fall back to names stored directly on emails when available.
       - Filter out obvious role/placeholder locals (info@, support@, etc.).
     """
@@ -2290,7 +2272,7 @@ def _examples_for_domain(con: Any, domain: str) -> list[tuple[str, str, str]]:
     if not dom:
         return examples
 
-    # 1) Preferred: join emails â†’ people, using the email's domain.
+    # 1) Preferred: join emails Ã¢â€ â€™ people, using the email's domain.
     try:
         rows = con.execute(
             """
@@ -2472,7 +2454,7 @@ def _load_company_email_pattern(con: Any, company_id: int | None) -> str | None:
 
 
 # ---------------------------------------------
-# R12 wiring: email generation + verify enqueue (â†’ R16)
+# R12 wiring: email generation + verify enqueue (Ã¢â€ â€™ R16)
 # ---------------------------------------------
 
 
@@ -3061,11 +3043,25 @@ def _generate_emails_sequential(  # noqa: C901
             "person_id": person_id,
         }
 
-    # Get catch-all status once for the domain
+    # Get catch-all status for the domain.
+    # Prefer the pre-resolved status passed via job meta from
+    # task_generate_company_emails — this ensures all people on the
+    # same domain see the same catch-all status (no race condition).
     tenant_id = _infer_tenant_id(con=con, company_id=company_id)
-    catch_all_status = _load_catchall_status_for_domain(db_path, domain, tenant_id=tenant_id)
+    catch_all_status: str | None = None
 
-    # If unknown/stale, best-effort probe once so 2xx accepts cannot be misclassified as 'valid'.
+    try:
+        _job = get_current_job()
+        _meta_ca = (_job.meta or {}).get("domain_catch_all_status") if _job else None
+        if isinstance(_meta_ca, str) and _meta_ca in {"catch_all", "not_catch_all"}:
+            catch_all_status = _meta_ca
+    except Exception:
+        pass
+
+    if catch_all_status is None:
+        catch_all_status = _load_catchall_status_for_domain(db_path, domain, tenant_id=tenant_id)
+
+    # If still unknown/stale, best-effort probe once.
     if catch_all_status not in {"catch_all", "not_catch_all"}:
         try:
             pre = _smtp_tcp25_preflight_mx(mx_host, timeout_s=3.0, redis=None)
@@ -3119,25 +3115,9 @@ def _generate_emails_sequential(  # noqa: C901
             )
             continue
 
-        # Step 1: Insert email first to get an email_id for verification_results FK
-        email_id: int | None = None
-        try:
-            email_id = upsert_generated_email(
-                conn=con,
-                person_id=person_id,
-                email=email_addr,
-                domain=domain,
-                source_note=f"sequential_candidate:rank={rank}:pattern={pattern_key}",
-            )
-            con.commit()
-        except Exception:
-            log.debug(
-                "R12 sequential: failed to insert candidate email",
-                exc_info=True,
-                extra={"person_id": person_id, "email": email_addr},
-            )
-
-        # Step 2: Verify this permutation with retries
+        # Step 1: Probe FIRST, before inserting into DB.
+        # This avoids creating email rows for permutations that are never
+        # verified (which show up as "Unknown" in the dashboard).
         attempt_result = _verify_permutation_with_retry(
             email_addr=email_addr,
             mx_host=mx_host,
@@ -3147,7 +3127,6 @@ def _generate_emails_sequential(  # noqa: C901
 
         attempt_result["pattern"] = pattern_key
         attempt_result["rank"] = rank
-        attempt_result["email_id"] = email_id
         attempts.append(attempt_result)
         total_probes += attempt_result.get("retries", 1)
 
@@ -3155,7 +3134,28 @@ def _generate_emails_sequential(  # noqa: C901
         reason = attempt_result.get("reason")
         code = attempt_result.get("code")
 
-        # Step 3: Persist verification result
+        # Step 2: Only insert the email into DB if we got a definitive result.
+        email_id: int | None = None
+        if status in ("valid", "risky_catch_all", "invalid"):
+            try:
+                email_id = upsert_generated_email(
+                    conn=con,
+                    person_id=person_id,
+                    email=email_addr,
+                    domain=domain,
+                    source_note=f"sequential_candidate:rank={rank}:pattern={pattern_key}",
+                )
+                con.commit()
+            except Exception:
+                log.debug(
+                    "R12 sequential: failed to insert candidate email",
+                    exc_info=True,
+                    extra={"person_id": person_id, "email": email_addr},
+                )
+
+        attempt_result["email_id"] = email_id
+
+        # Step 3: Persist verification result (only if we have an email_id)
         if email_id is not None:
             try:
                 _persist_sequential_verification_result(
@@ -3569,8 +3569,8 @@ def _classify_probe_for_sequential(
     """Classify an SMTP RCPT probe for the sequential verifier (R12).
 
     Critical invariant:
-      - Do not label RCPT 2xx as 'valid' unless catch-all has been checked and is 'not_catch_all'.
-        Otherwise, catch-all domains will be incorrectly treated as valid.
+      - Confirmed catch-all domains + RCPT 2xx → risky_catch_all (not valid).
+      - Unknown catch-all status + RCPT 2xx → valid (provisionally).
     """
     ca = (catch_all_status or "").strip().lower() or None
 
@@ -3579,7 +3579,7 @@ def _classify_probe_for_sequential(
             return "risky_catch_all", "rcpt_2xx_catchall"
         if ca == "not_catch_all":
             return "valid", "rcpt_2xx_accepted"
-        return "unknown", "catchall_unchecked"
+        return "valid", "rcpt_2xx_catchall_unconfirmed"
 
     # Handle both "reject" and "hard_fail" - smtp.py returns "hard_fail" for 5xx codes
     if category in ("reject", "hard_fail"):
@@ -3597,7 +3597,7 @@ def _classify_probe_for_sequential(
             return "risky_catch_all", "rcpt_2xx_catchall"
         if ca == "not_catch_all":
             return "valid", "rcpt_2xx_accepted"
-        return "unknown", "catchall_unchecked"
+        return "valid", "rcpt_2xx_catchall_unconfirmed"
 
     # Fallback for implementations that only provide codes (not category)
     if isinstance(code, int) and 500 <= code < 600:
@@ -3634,7 +3634,7 @@ def crawl_company_site(company_id: int) -> dict:
 
 
 
-    This is the core "company â†’ crawl" building block used by auto-discovery.
+    This is the core "company Ã¢â€ â€™ crawl" building block used by auto-discovery.
     It is side-effectful (DB writes) but does not itself depend on RQ; callers
     may invoke it directly or via handle_task().
 
@@ -3755,6 +3755,9 @@ def autodiscover_company(company_id: int) -> dict:  # noqa: C901
                 return
             run_id = meta.get("run_id")
             if not run_id:
+                return
+
+            if meta.get("is_terminal_stage") is False:
                 return
 
             tenant_id = str(meta.get("tenant_id") or "dev")

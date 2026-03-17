@@ -61,6 +61,11 @@ class AutodiscoveryResult:
     # Error tracking
     errors: list[str] = field(default_factory=list)
 
+    # SPA rendering metrics
+    spa_shells_detected: int = 0  # Pages detected as JS SPA shells
+    spa_shells_rendered: int = 0  # Pages successfully re-rendered via headless browser
+    ai_html_extractions: int = 0  # Candidates found via AI HTML extraction fallback
+
     # Context
     company_id: int | None = None
     domain: str | None = None
@@ -154,6 +159,10 @@ class AutodiscoveryResult:
             "emails_generated": self.emails_generated,
             # Errors and context
             "errors": self.errors,
+            # SPA rendering metrics
+            "spa_shells_detected": self.spa_shells_detected,
+            "spa_shells_rendered": self.spa_shells_rendered,
+            "ai_html_extractions": self.ai_html_extractions,
             "company_id": self.company_id,
             "domain": self.domain,
         }
@@ -184,6 +193,9 @@ class AutodiscoveryResult:
             permutations_generated=data.get("permutations_generated", 0),
             emails_generated=data.get("emails_generated", 0),
             errors=data.get("errors", []),
+            spa_shells_detected=data.get("spa_shells_detected", 0),
+            spa_shells_rendered=data.get("spa_shells_rendered", 0),
+            ai_html_extractions=data.get("ai_html_extractions", 0),
             company_id=data.get("company_id"),
             domain=data.get("domain"),
         )
@@ -224,6 +236,10 @@ class AutodiscoveryResult:
         self.emails_generated += other.emails_generated
 
         self.errors.extend(other.errors)
+
+        self.spa_shells_detected += other.spa_shells_detected
+        self.spa_shells_rendered += other.spa_shells_rendered
+        self.ai_html_extractions += other.ai_html_extractions
 
         # Context: prefer non-None values
         if other.company_id is not None:
@@ -271,6 +287,12 @@ class AutodiscoveryResult:
 
         if self.errors:
             lines.append(f"Errors: {len(self.errors)}")
+
+        if self.spa_shells_detected > 0:
+            lines.append(f"SPA shells detected: {self.spa_shells_detected}")
+            lines.append(f"SPA shells rendered: {self.spa_shells_rendered}")
+        if self.ai_html_extractions > 0:
+            lines.append(f"AI HTML extractions: {self.ai_html_extractions}")
 
         return lines
 

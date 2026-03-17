@@ -145,7 +145,7 @@ _BLOG_ALLOW_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Strong allow overrides (even if otherwise “blocked-ish” like under /blog/)
+# Strong allow overrides (even if otherwise â€œblocked-ishâ€ like under /blog/)
 _STRONG_EMPLOYEE_PATH_RE = re.compile(
     r"/("
     r"team|teams|leadership|executive(?:s)?|management|people|staff|"
@@ -180,7 +180,7 @@ _ALLOWED_URL_PATTERNS: list[tuple[str, str]] = [
     ("our_team", r"/our[-_]?team(?:/|$)"),
     ("our_people", r"/our[-_]?people(?:/|$)"),
     ("our_story", r"/our[-_]?story(?:/|$)"),
-    # Press/news (often includes leadership announcements) — keep conservative
+    # Press/news (often includes leadership announcements) â€” keep conservative
     ("press_room", r"/press[-_]?room(?:/|$)"),
     ("newsroom", r"/newsroom(?:/|$)"),
     ("press_index", r"/press(?:/|$)"),
@@ -193,7 +193,7 @@ _ALLOWED_URL_PATTERNS: list[tuple[str, str]] = [
     # Investor relations (lists leadership)
     ("investor", r"/investor(?:s)?(?:/|$)"),
     ("ir", r"/ir(?:/|$)"),
-    # Blog “meta” pages that sometimes list leadership
+    # Blog â€œmetaâ€ pages that sometimes list leadership
     ("blog_author", r"/blog/author/[^/]+(?:/|$)"),
     ("blog_category_about", r"/blog/category/(?:about|company)(?:/|$)"),
     ("blog_tag_about", r"/blog/tag/(?:about|team|leadership|company)(?:/|$)"),
@@ -211,6 +211,8 @@ _ALLOWED_RULES: list[tuple[str, re.Pattern[str]]] = [
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 _H2_RE = re.compile(r"<h2[^>]*>(.*?)</h2>", re.IGNORECASE | re.DOTALL)
+_H3_RE = re.compile(r"<h3[^>]*>(.*?)</h3>", re.IGNORECASE | re.DOTALL)
+_H4_RE = re.compile(r"<h4[^>]*>(.*?)</h4>", re.IGNORECASE | re.DOTALL)
 
 _STRONG_PEOPLE_PHRASES_RE = re.compile(
     r"\b("
@@ -242,6 +244,34 @@ _TEAM_MARKER_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+# Section/div ID and class attributes that indicate a team/people section.
+# Catches patterns like: <section id="team">, <div class="leadership-section">,
+# <div id="our-team">, <section class="team-members">, etc.
+_TEAM_CONTAINER_ATTR_TERMS_RE = re.compile(
+    r"\b(?:"
+    r"team|leadership|executives?|founders?|board|people|staff|"
+    r"our-team|our_team|leadership-team|leadership_team|"
+    r"team-members|team_members|team-section|team_section|"
+    r"people-section|people_section|leadership-section|"
+    r"board-members|board_members|advisory-board"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_ATTR_VALUE_RE = re.compile(
+    r"""(?:id|class)\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+
+def _has_team_container_attrs(text: str, *, limit: int = 200_000) -> bool:
+    """Check if HTML contains section/div attributes indicating a team section."""
+    for m in _ATTR_VALUE_RE.finditer(text[:limit]):
+        attr_value = m.group(1)
+        if _TEAM_CONTAINER_ATTR_TERMS_RE.search(attr_value):
+            return True
+    return False
 
 
 def _html_text_snippet(html: str | bytes | None, *, max_bytes: int = 200_000) -> str:
@@ -305,7 +335,17 @@ def _extract_heading_blob(text: str) -> str:
             break
     h2_joined = " | ".join([h for h in h2_hits if h])
 
-    return " ".join([head_title, h1, h2_joined]).strip()
+    # Also scan h3/h4 — many team sections use sub-headings (e.g. "Our Team"
+    # in an h3 inside a section on a multi-purpose /about page).
+    h3_h4_hits: list[str] = []
+    for regex in (_H3_RE, _H4_RE):
+        for m in regex.finditer(text[:200_000]):
+            h3_h4_hits.append(_strip_tags(m.group(1)))
+            if len(h3_h4_hits) >= 8:
+                break
+    h3_h4_joined = " | ".join([h for h in h3_h4_hits if h])
+
+    return " ".join([head_title, h1, h2_joined, h3_h4_joined]).strip()
 
 
 def _score_html_signals(text: str, reasons: list[str]) -> int:
@@ -327,6 +367,13 @@ def _score_html_signals(text: str, reasons: list[str]) -> int:
     if _TEAM_MARKER_RE.search(text):
         score += 4
         reasons.append("team_dom_markers")
+
+    # Check section/div IDs and classes for team-related attributes.
+    # This catches pages that have <section id="team"> or <div class="leadership">
+    # even when the heading text is generic (e.g. "About Us" in the title).
+    if _has_team_container_attrs(text):
+        score += 4
+        reasons.append("team_container_attrs")
 
     if _NEGATIVE_PAGE_PHRASES_RE.search(text) and "html_negative_phrases" not in reasons:
         score -= 4
@@ -376,7 +423,7 @@ def is_blocked_source_url(url: str) -> tuple[bool, str | None]:
     if not path:
         return False, None
 
-    # Strong employee paths override blog-post blocking (and some “generic blocks”).
+    # Strong employee paths override blog-post blocking (and some â€œgeneric blocksâ€).
     if _STRONG_EMPLOYEE_PATH_RE.search(path):
         return False, None
 
@@ -456,7 +503,7 @@ def classify_page_for_people_extraction(
         +8  allowed employee URL pattern match
         +4  strong employee segment match (team/leadership/etc.)
         -12 blocked source URL (hard)
-        -6  blog post (non-exception) or other “likely non-employee” sources
+        -6  blog post (non-exception) or other â€œlikely non-employeeâ€ sources
       HTML signals (optional):
         +8  strong people phrases in title/h1/h2
         +6  JSON-LD Person/Employee

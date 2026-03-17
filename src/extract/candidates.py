@@ -1,5 +1,5 @@
 """
-R11 / O05 — HTML candidate extractor (broad, AI-refiner friendly).
+R11 / O05 â€” HTML candidate extractor (broad, AI-refiner friendly).
 
 Given an HTML document, try to find:
   - email addresses that plausibly belong to the target org
@@ -493,7 +493,7 @@ def normalize_generated_name(raw: str) -> str | None:
     if not cleaned:
         return None
 
-    # If there is a comma, almost always "Name, CPA/MBA/..." → keep the left part
+    # If there is a comma, almost always "Name, CPA/MBA/..." â†’ keep the left part
     if "," in cleaned:
         cleaned, _ = cleaned.split(",", 1)
         cleaned = cleaned.strip()
@@ -529,7 +529,7 @@ def _normalize_space(text: str) -> str:
 
 def _strip_punctuation(text: str) -> str:
     # Keep apostrophes and hyphens, drop trailing commas, pipes, etc.
-    return text.strip(" \t\r\n,;:|/·•")
+    return text.strip(" \t\r\n,;:|/Â·â€¢")
 
 
 def _is_concepty_token(tok: str) -> bool:
@@ -578,9 +578,9 @@ def _looks_human_name(text: str) -> bool:
     s = EMAIL_RE.sub(" ", s)
 
     # Strip obvious trailing sections like "- VP Sales" or "| Sales"
-    s = re.split(r"[|/·•]", s, maxsplit=1)[0]
+    s = re.split(r"[|/Â·â€¢]", s, maxsplit=1)[0]
     s = re.split(r"\s+-\s+", s, maxsplit=1)[0]
-    s = re.split(r"\s+–\s+", s, maxsplit=1)[0]
+    s = re.split(r"\s+â€“\s+", s, maxsplit=1)[0]
     s = _strip_punctuation(s)
 
     raw_tokens = [t for t in s.split() if t]
@@ -700,9 +700,9 @@ def _choose_name_piece(text: str) -> str:
     """
     From a noisy label like:
 
-        "Brett Anderson – VP Sales"
+        "Brett Anderson â€“ VP Sales"
         "Brett Anderson, VP Sales"
-        "VP Sales – Brett Anderson"
+        "VP Sales â€“ Brett Anderson"
 
     try to pick the part that looks like a human name.
 
@@ -719,7 +719,7 @@ def _choose_name_piece(text: str) -> str:
 
     # Split on hard separators first: pipes, slashes, bullets
     segments: list[str] = []
-    for seg in re.split(r"[|/·•]", t):
+    for seg in re.split(r"[|/Â·â€¢]", t):
         seg = seg.strip()
         if not seg:
             continue
@@ -731,7 +731,7 @@ def _choose_name_piece(text: str) -> str:
         pieces = re.split(r"[,;/]", seg)
         more: list[str] = []
         for p in pieces:
-            more.extend(re.split(r"\s+-\s+|\s+–\s+", p))
+            more.extend(re.split(r"\s+-\s+|\s+â€“\s+", p))
         if not more:
             more = [seg]
 
@@ -1140,9 +1140,10 @@ def _should_run_people_cards_page(
             verdict = classify_page_for_people_extraction(  # type: ignore[misc]
                 url,
                 html,
+                min_score=4,  # Lower threshold: partial signals are OK since crawler pre-filters
             )
             # classify_page_for_people_extraction returns a PageClassification
-            # dataclass with .ok, .score, .reasons — NOT a plain tuple.
+            # dataclass with .ok, .score, .reasons â€” NOT a plain tuple.
             v_ok = getattr(verdict, "ok", False)
             v_reasons = getattr(verdict, "reasons", ("unknown",))
             reason_str = ",".join(str(r) for r in v_reasons) if v_reasons else "unknown"
@@ -1176,6 +1177,24 @@ def _should_run_people_cards_page(
         '"@type": "person"',
         '"@type":"employee"',
         '"@type": "employee"',
+        # Body-level title signals (roster pages without heading markers)
+        "chief executive officer",
+        "chief operating officer",
+        "chief technology officer",
+        "chief financial officer",
+        "co-founder",
+        "cofounder",
+        "vice president",
+        "managing director",
+        "general partner",
+        # DOM markers (CSS classes / data attributes)
+        "team-member",
+        "team_member",
+        "leadership-card",
+        "bio-card",
+        "person-card",
+        "staff-card",
+        "profile-card",
     )
     if any(s in head for s in people_signals):
         return True, "allow:html_people_signal"
@@ -1191,17 +1210,18 @@ def _merge_people_cards_into_map(
 ) -> int:
     added_cards = 0
 
+    # Build a quick lookup of existing names (regardless of email) for dedup.
+    existing_names: set[str] = set()
+    for _k, v in by_key.items():
+        name = (getattr(v, "raw_name", None) or "").lower().strip()
+        if name:
+            existing_names.add(name)
+
     for c in card_candidates:
         try:
             c.source_url = source_url
         except Exception:
             pass
-
-        if getattr(c, "email", None):
-            try:
-                c.email = None
-            except Exception:
-                pass
 
         if not _should_keep_candidate(c):
             continue
@@ -1210,11 +1230,31 @@ def _merge_people_cards_into_map(
         if not name_key:
             continue
 
-        key = (None, name_key, False)
+        # If this name was already extracted with an email by the main loop,
+        # merge title into the existing candidate but don't duplicate the entry.
+        if name_key in existing_names:
+            new_title = getattr(c, "title", None) or ""
+            if new_title:
+                # Find and enrich the existing entry that matches this name.
+                for _k, v in by_key.items():
+                    v_name = (getattr(v, "raw_name", None) or "").lower().strip()
+                    if v_name == name_key:
+                        existing_title = getattr(v, "title", None) or ""
+                        if not existing_title or len(new_title) > len(existing_title):
+                            try:
+                                v.title = new_title
+                            except Exception:
+                                pass
+                        break
+            continue
+
+        # Use the standard candidate key (preserves email if present).
+        key = _candidate_key(c)
         existing = by_key.get(key)
         if existing is None:
             by_key[key] = c
             added_cards += 1
+            existing_names.add(name_key)
             continue
 
         existing_title = getattr(existing, "title", None) or ""
@@ -1252,7 +1292,7 @@ def extract_candidates(
       - Extract same-org emails from any page (safe: customer emails won't pass _same_org()).
       - Run no-email people-cards extraction ONLY on pages that are likely employee pages
         and NOT third-party content (case studies, customer stories, events, podcasts, etc.).
-        This prevents “customer names” being persisted as company employees.
+        This prevents â€œcustomer namesâ€ being persisted as company employees.
     """
     if not html:
         return []

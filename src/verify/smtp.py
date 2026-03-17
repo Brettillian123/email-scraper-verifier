@@ -1,5 +1,5 @@
 """
-R16 — Core SMTP RCPT probe (+ O06 behavior-aware timeouts + fast-fail preflight)
+R16 â€” Core SMTP RCPT probe (+ O06 behavior-aware timeouts + fast-fail preflight)
 
 Public function:
 
@@ -17,7 +17,7 @@ Public function:
 Responsibilities:
 - Light email normalization (trim, split, IDNA for domain; preserve local-part case).
 - Require a non-empty MX host.
-- Optional fast-fail TCP/25 preflight (circuit breaker) to avoid N× timeout blowups.
+- Optional fast-fail TCP/25 preflight (circuit breaker) to avoid NÃ— timeout blowups.
 - Open an SMTP connection with sane (and O06-tuned) timeouts.
 - EHLO; opportunistic STARTTLS if offered; EHLO again afterward.
 - Run MAIL FROM / RCPT TO and capture the RCPT reply code/message.
@@ -447,13 +447,13 @@ def probe_rcpt(  # noqa: C901
             domain=_domain,
             mx_host=mx_host,
             elapsed_ms=elapsed_ms,
-            category="unknown",
+            category="temp_fail",
             code=None,
             error_kind="port25_unreachable",
         )
         return {
             "ok": False,
-            "category": "unknown",
+            "category": "temp_fail",
             "code": None,
             "message": "",
             "mx_host": mx_host,
@@ -468,7 +468,7 @@ def probe_rcpt(  # noqa: C901
     error_str: str | None = None
     category: str = "unknown"
 
-    # Bound how many IPs we attempt for this MX (prevents N× connect timeout)
+    # Bound how many IPs we attempt for this MX (prevents NÃ— connect timeout)
     ips = _resolve_mx_ips(
         mx_host,
         prefer_ipv4=bool(SMTP_PREFER_IPV4),
@@ -540,7 +540,7 @@ def probe_rcpt(  # noqa: C901
 
     except TimeoutError as exc:
         error_str = f"timeout:{exc}"
-        category = "unknown"
+        category = "temp_fail"
         rcpt_code = None
         rcpt_msg = ""
     except smtplib.SMTPResponseException as exc:
@@ -554,17 +554,17 @@ def probe_rcpt(  # noqa: C901
             error_str = f"timeout:{exc}"
         else:
             error_str = f"disconnected:{exc}"
-        category = "unknown"
+        category = "temp_fail"
         rcpt_code = None
         rcpt_msg = ""
     except smtplib.SMTPException as exc:
         error_str = f"smtp_error:{exc}"
-        category = "unknown"
+        category = "temp_fail"
         rcpt_code = None
         rcpt_msg = ""
     except Exception as exc:
         error_str = f"error:{type(exc).__name__}:{exc}"
-        category = "unknown"
+        category = "temp_fail"
         rcpt_code = None
         rcpt_msg = ""
     finally:
@@ -577,7 +577,7 @@ def probe_rcpt(  # noqa: C901
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    # SINGLE behavior-hook invocation per probe — resolve from live module
+    # SINGLE behavior-hook invocation per probe â€” resolve from live module
     err_kind = None if error_str is None else (error_str.split(":", 1)[0] or "error")
     hook = sys.modules[__name__].record_behavior
     hook(

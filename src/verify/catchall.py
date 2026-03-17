@@ -1,5 +1,5 @@
 """
-R17 â€” Domain-level catch-all detection (with caching on domain_resolutions).
+R17 Ã¢â‚¬â€ Domain-level catch-all detection (with caching on domain_resolutions).
 
 Public API:
 
@@ -23,7 +23,7 @@ Behavior:
 
 Tests monkeypatch:
 
-- get_connection() â†’ in-memory SQLite DB with a minimal domain_resolutions table.
+- get_connection() Ã¢â€ â€™ in-memory SQLite DB with a minimal domain_resolutions table.
 - get_or_resolve_mx() and _smtp_probe_random_address() for controlled behavior.
 """
 
@@ -79,8 +79,13 @@ class CatchallResult:
     error: str | None = None
 
 
-# 24h caching window; tests may override this constant or _now_utc().
+# 24h caching window for definitive results; tests may override this constant or _now_utc().
 CATCHALL_TTL_SECONDS = 24 * 60 * 60
+
+# Transient failures (tempfail/error) should expire quickly so they don't
+# poison every email on the domain for 24h.  5 minutes lets the MX recover
+# from greylisting / rate-limiting without hammering it on every probe.
+CATCHALL_TRANSIENT_TTL_SECONDS = 5 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +118,18 @@ def _parse_ts(s: str | None) -> datetime | None:
         return None
 
 
-def _is_fresh(checked_at: str | None) -> bool:
+def _is_fresh(checked_at: str | None, status: str | None = None) -> bool:
     dt = _parse_ts(checked_at)
     if not dt:
         return False
+    # Transient failures use a much shorter TTL so they don't poison
+    # the entire domain for 24h when the MX is temporarily flaky.
+    if status in ("tempfail", "error"):
+        ttl = CATCHALL_TRANSIENT_TTL_SECONDS
+    else:
+        ttl = CATCHALL_TTL_SECONDS
     delta = _now_utc() - dt
-    return delta.total_seconds() < CATCHALL_TTL_SECONDS
+    return delta.total_seconds() < ttl
 
 
 def get_connection():
@@ -256,7 +267,7 @@ def _classify_from_probe(code: int | None, error: str | None) -> CatchallStatus:
             return "not_catch_all"
         if 400 <= code < 500:
             return "tempfail"
-        # unexpected SMTP code â†’ generic error
+        # unexpected SMTP code Ã¢â€ â€™ generic error
         return "error"
 
     if error:
@@ -270,7 +281,7 @@ def _classify_from_probe(code: int | None, error: str | None) -> CatchallStatus:
 
 
 # ---------------------------------------------------------------------------
-# SMTP helper â€“ tests monkeypatch _smtp_probe_random_address
+# SMTP helper Ã¢â‚¬â€œ tests monkeypatch _smtp_probe_random_address
 # ---------------------------------------------------------------------------
 
 
@@ -363,7 +374,10 @@ def check_catchall_for_domain(
         cached_row
         and not force
         and cached_row.get("catch_all_status") is not None
-        and _is_fresh(cached_row.get("catch_all_checked_at"))
+        and _is_fresh(
+            cached_row.get("catch_all_checked_at"),
+            status=cached_row.get("catch_all_status"),
+        )
     ):
         # Use cached verdict, no new SMTP call
         elapsed_ms = 0.0
@@ -416,7 +430,7 @@ def check_catchall_for_domain(
         mx_host = getattr(mx_res, "lowest_mx", None) or None
 
     if not mx_host:
-        # No MX / A-only fallback â†’ no_mx, no SMTP call
+        # No MX / A-only fallback Ã¢â€ â€™ no_mx, no SMTP call
         status = "no_mx"
         _update_cached_state(
             con,

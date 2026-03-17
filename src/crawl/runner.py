@@ -14,7 +14,7 @@ Key features:
 
 Tiered seeding (R10 refinement):
   - Seeds are attempted by tiers (T1 -> T2 -> T3)
-  - Lower tiers are only attempted if higher tiers fail to yield “people pages”
+  - Lower tiers are only attempted if higher tiers fail to yield â€œpeople pagesâ€
   - Once enough people pages are found, additional seed attempts stop
   - Seed URLs are processed with higher priority than discovered crawl URLs
 
@@ -33,7 +33,7 @@ High-ROI tighteners (robustness):
 
 Efficiency controls (batch-polish additions):
   - WAF/403 early-abort when the first N meaningful fetches are all 403 and no pages
-    have been persisted (prevents 30–50s burn on blocked sites)
+    have been persisted (prevents 30â€“50s burn on blocked sites)
   - Per-domain 403 ceiling (abort once 403 count crosses a cap)
   - Per-domain time budgets:
       * budget_no_pages_s: abort if exceeded before persisting any page
@@ -87,6 +87,21 @@ except ImportError:  # pragma: no cover
     _HAS_EXPLAIN_BLOCK = False
     explain_block = None  # type: ignore[assignment]
 
+# Optional: headless browser for SPA shell re-rendering (non-fatal if not available)
+try:
+    from src.crawl.headless import (  # noqa: E402
+        HeadlessBrowser,
+        is_headless_available,
+        is_spa_shell,
+    )
+
+    _HAS_HEADLESS = True
+except ImportError:  # pragma: no cover
+    _HAS_HEADLESS = False
+    HeadlessBrowser = None  # type: ignore[assignment,misc]
+    is_headless_available = None  # type: ignore[assignment]
+    is_spa_shell = None  # type: ignore[assignment]
+
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +140,11 @@ class _CrawlState:
 
     nav_expanded: bool = False
     nav_enqueued: int = 0
+
+    # SPA shell detection and headless rendering metrics
+    spa_shells_detected: int = 0
+    spa_shells_rendered: int = 0
+    headless_browser: Any = None  # HeadlessBrowser instance (set by crawl_domain)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1233,31 @@ def _fetch_html_page(
         log.debug("Skipping soft-404 page: %s", final_url)
         return None
 
+    # --- SPA shell detection and headless browser fallback ---
+    # If the fetched HTML looks like a JS framework shell (e.g. Next.js, React),
+    # attempt to re-render with a headless browser to get the full DOM.
+    if _HAS_HEADLESS and is_spa_shell is not None and is_spa_shell(body):
+        state.spa_shells_detected += 1
+        log.info("SPA shell detected: url=%s size=%d", final_url, len(body))
+
+        if state.headless_browser is not None:
+            rendered = state.headless_browser.render(final_url)
+            if rendered and len(rendered) > len(body):
+                log.info(
+                    "Headless re-render succeeded: url=%s original=%d rendered=%d",
+                    final_url,
+                    len(body),
+                    len(rendered),
+                )
+                body = rendered
+                state.spa_shells_rendered += 1
+
+                # Re-check size limit after render (rendered DOM can be larger)
+                if len(body) > CRAWL_HTML_MAX_BYTES:
+                    body = body[:CRAWL_HTML_MAX_BYTES]
+            else:
+                log.debug("Headless re-render returned no improvement for %s", final_url)
+
     state.seen_final_keys.add(final_key)
     state.seen_final_keys.add(key)
 
@@ -1906,10 +1951,19 @@ def _attach_result_metrics_from_run(run: _CrawlRun, state: _CrawlState, *, resul
         "nav_expansion_enabled": bool(_CRAWL_NAV_EXPANSION_ENABLED),
         "nav_expanded": bool(state.nav_expanded),
         "nav_enqueued": int(state.nav_enqueued),
+        "spa_shells_detected": int(state.spa_shells_detected),
+        "spa_shells_rendered": int(state.spa_shells_rendered),
         "elapsed_seconds": round(_elapsed_s(run.start_monotonic), 3),
     }
     if CRAWL_SEEDS_LINKED_ONLY:
         payload["discovered_paths_count"] = len(run.discovered_paths)
+
+    # Propagate SPA metrics directly to AutodiscoveryResult (if available)
+    if result is not None:
+        if hasattr(result, "spa_shells_detected"):
+            result.spa_shells_detected = state.spa_shells_detected
+        if hasattr(result, "spa_shells_rendered"):
+            result.spa_shells_rendered = state.spa_shells_rendered
 
     if hasattr(result, "add_crawl_stats"):
         try:
@@ -1944,27 +1998,50 @@ def crawl_domain(domain: str, *, result: Any = None) -> list[Page]:
 
     state = _CrawlState()
 
+    # Set up headless browser for SPA shell re-rendering (if available).
+    # The browser is lazily initialized and shared across the entire crawl session.
+    _headless_ctx = None
+    if _HAS_HEADLESS and is_headless_available is not None and is_headless_available():
+        try:
+            _headless_ctx = HeadlessBrowser(user_agent=FETCH_USER_AGENT)
+            state.headless_browser = _headless_ctx.__enter__()
+            log.debug("Headless browser available for SPA rendering")
+        except Exception as exc:
+            log.debug("Headless browser setup failed (non-fatal): %s", exc)
+            _headless_ctx = None
+            state.headless_browser = None
+
     headers = {"User-Agent": FETCH_USER_AGENT}
     timeout = httpx.Timeout(CRAWL_READ_TIMEOUT_S, connect=CRAWL_CONNECT_TIMEOUT_S)
     start_monotonic = time.monotonic()
 
-    with httpx.Client(follow_redirects=True, headers=headers, timeout=timeout) as client:
-        run = _init_run(
-            client,
-            state,
-            dom=dom,
-            timeout=timeout,
-            stop_min_people=stop_min_people,
-            max_pages=max_pages,
-            max_depth=max_depth,
-            hints=hints,
-            start_monotonic=start_monotonic,
-            result=result,
-        )
-        if run is None:
-            return []
+    try:
+        with httpx.Client(follow_redirects=True, headers=headers, timeout=timeout) as client:
+            run = _init_run(
+                client,
+                state,
+                dom=dom,
+                timeout=timeout,
+                stop_min_people=stop_min_people,
+                max_pages=max_pages,
+                max_depth=max_depth,
+                hints=hints,
+                start_monotonic=start_monotonic,
+                result=result,
+            )
+            if run is None:
+                return []
 
-        _crawl_loop(client, run, state, result=result)
+            _crawl_loop(client, run, state, result=result)
+
+    finally:
+        # Clean up headless browser
+        if _headless_ctx is not None:
+            try:
+                _headless_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            state.headless_browser = None
 
     _final_log(
         dom=run.dom,

@@ -435,6 +435,54 @@ def _result_matches_role(item: dict, role: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Person extraction helper
+# ---------------------------------------------------------------------------
+
+
+def _extract_person(
+    item: dict,
+    title: str,
+    base_confidence: str,
+    seen_names: set[str],
+) -> DiscoveredPerson | None:
+    """
+    Try to extract a DiscoveredPerson from a search result item.
+
+    Parses the name from the LinkedIn URL slug or the result title.
+    Returns None if no name can be extracted or the person was already seen.
+    Mutates *seen_names* on success.
+    """
+    link = item.get("link", "")
+
+    # Try URL slug first (highest confidence)
+    name = parse_linkedin_name(link)
+    confidence = base_confidence if name else "low"
+
+    # Fallback: try the result title
+    if not name:
+        name = parse_name_from_title(item.get("title", ""))
+        confidence = "medium" if name else "low"
+
+    if not name:
+        return None
+
+    # Deduplicate by name
+    name_key = f"{name[0].lower()}:{name[1].lower()}"
+    if name_key in seen_names:
+        return None
+    seen_names.add(name_key)
+
+    return DiscoveredPerson(
+        first_name=name[0],
+        last_name=name[1],
+        title=title,
+        source_url=link,
+        confidence=confidence,
+        raw_snippet=item.get("snippet", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Company-level discovery
 # ---------------------------------------------------------------------------
 
@@ -477,6 +525,10 @@ def discover_people_for_company(
             result.queries_used += 1
 
             accepted_for_role = 0
+            # Track the first company-matched result as a fallback
+            # in case nobody passes the role check
+            fallback_candidate: dict | None = None
+
             for item in items:
                 # Only take the top matching result per role
                 if accepted_for_role >= 1:
@@ -491,10 +543,8 @@ def discover_people_for_company(
                 # Skip duplicate URLs
                 if link in seen_urls:
                     continue
-                seen_urls.add(link)
 
-                # Strictly validate: the company in the LinkedIn title
-                # must match our target company
+                # Company in the LinkedIn title must match our target
                 if not _result_matches_company(item, keywords):
                     log.debug(
                         "Skipping result (company mismatch): title=%r for %s %s",
@@ -504,9 +554,11 @@ def discover_people_for_company(
                     )
                     continue
 
-                # Validate: the role in the LinkedIn title must match
-                # what we searched for (e.g. reject a Marketing Manager
-                # when we searched for CEO)
+                # Remember first company-matched result as fallback
+                if fallback_candidate is None:
+                    fallback_candidate = item
+
+                # Check if the role also matches
                 if not _result_matches_role(item, role):
                     log.debug(
                         "Skipping result (role mismatch): title=%r expected %s",
@@ -515,36 +567,30 @@ def discover_people_for_company(
                     )
                     continue
 
-                # Try to extract name from URL slug first (highest confidence)
-                name = parse_linkedin_name(link)
-                confidence = "high" if name else "low"
+                # Both company and role match — accept with the role
+                seen_urls.add(link)
+                person = _extract_person(item, role, "high", seen_names)
+                if person:
+                    result.people.append(person)
+                    accepted_for_role += 1
 
-                # Fallback: try the result title
-                if not name:
-                    name = parse_name_from_title(item.get("title", ""))
-                    confidence = "medium" if name else "low"
-
-                if not name:
-                    continue
-
-                # Deduplicate by name (same person might appear for
-                # multiple roles)
-                name_key = f"{name[0].lower()}:{name[1].lower()}"
-                if name_key in seen_names:
-                    continue
-                seen_names.add(name_key)
-
-                result.people.append(
-                    DiscoveredPerson(
-                        first_name=name[0],
-                        last_name=name[1],
-                        title=role,
-                        source_url=link,
-                        confidence=confidence,
-                        raw_snippet=item.get("snippet", ""),
-                    )
-                )
-                accepted_for_role += 1
+            # Fallback: if no one passed the role check but we had a
+            # company match, insert that person with an empty title
+            # so we at least capture them for manual review
+            if accepted_for_role == 0 and fallback_candidate is not None:
+                link = fallback_candidate.get("link", "")
+                if link not in seen_urls:
+                    seen_urls.add(link)
+                    person = _extract_person(fallback_candidate, "", "low", seen_names)
+                    if person:
+                        log.info(
+                            "Fallback insert (no role match): %s %s for %s %s",
+                            person.first_name,
+                            person.last_name,
+                            search_name,
+                            role,
+                        )
+                        result.people.append(person)
 
         except Exception as exc:
             result.errors.append(f"{role}: {exc}")

@@ -1850,3 +1850,59 @@ def get_discovery_history(
             con.close()
         except Exception:
             pass
+
+
+@router.get("/discovery/run/{run_id}/details")
+def get_discovery_run_details(
+    run_id: int,
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    """Get per-company details for a discovery run (used for live progress polling)."""
+    tenant_id = auth.tenant_id
+    con = _get_conn()
+    try:
+        row = con.execute(
+            "SELECT id, status, trigger_type, companies_queried, queries_used, "
+            "people_found, people_inserted, emails_generated, "
+            "errors, started_at, finished_at, details_json "
+            "FROM google_discovery_runs "
+            "WHERE id = ? AND tenant_id = ?",
+            (run_id, tenant_id),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        errors_list: list[str] = []
+        if row[8]:
+            try:
+                errors_list = json.loads(row[8])
+            except Exception:
+                errors_list = [str(row[8])]
+
+        details_list: list[dict] = []
+        if row[11]:
+            try:
+                details_list = json.loads(row[11])
+            except Exception:
+                details_list = []
+
+        return {
+            "id": row[0],
+            "status": row[1],
+            "trigger_type": row[2],
+            "companies_queried": row[3],
+            "queries_used": row[4],
+            "people_found": row[5],
+            "people_inserted": row[6],
+            "emails_generated": row[7],
+            "errors": errors_list,
+            "started_at": row[9],
+            "finished_at": row[10],
+            "details": details_list,
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass

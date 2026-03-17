@@ -83,7 +83,8 @@ def _find_companies_needing_contacts(
     limit: int,
 ) -> list[dict[str, Any]]:
     """
-    Find companies with fewer than `threshold` people.
+    Find companies with fewer than `threshold` people that have NOT
+    been searched before (last_discovery_at IS NULL).
     Ordered by least people first (most starved companies get priority).
     """
     rows = con.execute(
@@ -95,6 +96,7 @@ def _find_companies_needing_contacts(
         WHERE c.tenant_id = ?
           AND COALESCE(NULLIF(c.official_domain, ''), c.domain) IS NOT NULL
           AND COALESCE(NULLIF(c.official_domain, ''), c.domain) != ''
+          AND c.last_discovery_at IS NULL
         GROUP BY c.id, c.name, COALESCE(NULLIF(c.official_domain, ''), c.domain)
         HAVING COUNT(p.id) < ?
         ORDER BY COUNT(p.id) ASC, c.id ASC
@@ -104,6 +106,22 @@ def _find_companies_needing_contacts(
     ).fetchall()
 
     return [{"id": r[0], "name": r[1] or "", "domain": r[2], "people_count": r[3]} for r in rows]
+
+
+def _mark_company_searched(con: Any, company_id: int) -> None:
+    """Stamp last_discovery_at so this company won't be searched again."""
+    try:
+        con.execute(
+            "UPDATE companies SET last_discovery_at = NOW() WHERE id = ?",
+            (company_id,),
+        )
+        con.commit()
+    except Exception:
+        log.debug("Failed to mark company %s as searched", company_id, exc_info=True)
+        try:
+            con.rollback()
+        except Exception:
+            pass
 
 
 def _person_already_exists(
@@ -201,29 +219,50 @@ def _update_run_record(
     emails_generated: int,
     errors: list[str],
     details: list[dict],
+    finished: bool = True,
 ) -> None:
-    """Update the discovery run record with final results."""
+    """Update the discovery run record. Set finished=False for mid-run progress updates."""
     now = _utc_now_iso()
     try:
-        con.execute(
-            "UPDATE google_discovery_runs SET "
-            "status = ?, companies_queried = ?, queries_used = ?, "
-            "people_found = ?, people_inserted = ?, emails_generated = ?, "
-            "errors = ?, finished_at = ?, details_json = ? "
-            "WHERE id = ?",
-            (
-                status,
-                companies_queried,
-                queries_used,
-                people_found,
-                people_inserted,
-                emails_generated,
-                json.dumps(errors) if errors else None,
-                now,
-                json.dumps(details) if details else None,
-                run_id,
-            ),
-        )
+        if finished:
+            con.execute(
+                "UPDATE google_discovery_runs SET "
+                "status = ?, companies_queried = ?, queries_used = ?, "
+                "people_found = ?, people_inserted = ?, emails_generated = ?, "
+                "errors = ?, finished_at = ?, details_json = ? "
+                "WHERE id = ?",
+                (
+                    status,
+                    companies_queried,
+                    queries_used,
+                    people_found,
+                    people_inserted,
+                    emails_generated,
+                    json.dumps(errors) if errors else None,
+                    now,
+                    json.dumps(details) if details else None,
+                    run_id,
+                ),
+            )
+        else:
+            con.execute(
+                "UPDATE google_discovery_runs SET "
+                "status = ?, companies_queried = ?, queries_used = ?, "
+                "people_found = ?, people_inserted = ?, emails_generated = ?, "
+                "errors = ?, details_json = ? "
+                "WHERE id = ?",
+                (
+                    status,
+                    companies_queried,
+                    queries_used,
+                    people_found,
+                    people_inserted,
+                    emails_generated,
+                    json.dumps(errors) if errors else None,
+                    json.dumps(details) if details else None,
+                    run_id,
+                ),
+            )
         con.commit()
     except Exception:
         log.debug("Failed to update discovery run %s", run_id, exc_info=True)
@@ -436,6 +475,25 @@ def task_google_discovery(
             )
             total_queries += detail["queries_used"]
             details.append(detail)
+
+            # Mark this company as searched so it won't be picked again
+            _mark_company_searched(con, company["id"])
+
+            # Progressive update so the frontend can poll for live progress
+            if run_id:
+                _update_run_record(
+                    con,
+                    run_id,
+                    status="running",
+                    companies_queried=len(details),
+                    queries_used=total_queries,
+                    people_found=sum(d["people_found"] for d in details),
+                    people_inserted=sum(d["people_inserted"] for d in details),
+                    emails_generated=sum(d["emails_generated"] for d in details),
+                    errors=errors,
+                    details=details,
+                    finished=False,
+                )
 
         totals = {
             "companies_queried": len(details),

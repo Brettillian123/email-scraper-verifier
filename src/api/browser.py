@@ -1621,3 +1621,206 @@ def search_all(
             con.close()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------------------
+# Google Discovery endpoints
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/discovery/config")
+def get_discovery_config(
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    """Get current Google Discovery configuration."""
+    from src.search.google_discovery import is_api_configured
+
+    tenant_id = auth.tenant_id
+    con = _get_conn()
+    try:
+        row = con.execute(
+            "SELECT enabled, companies_per_day, min_people_threshold, "
+            "target_roles, daily_query_budget, updated_at "
+            "FROM google_discovery_config WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+
+        if not row:
+            return {
+                "enabled": False,
+                "companies_per_day": 20,
+                "min_people_threshold": 2,
+                "target_roles": ["CEO", "CFO", "COO", "CTO", "CIO", "CHRO", "CMO"],
+                "daily_query_budget": 140,
+                "updated_at": None,
+                "api_configured": is_api_configured(),
+            }
+
+        return {
+            "enabled": bool(row[0]),
+            "companies_per_day": row[1],
+            "min_people_threshold": row[2],
+            "target_roles": [r.strip() for r in (row[3] or "").split(",") if r.strip()],
+            "daily_query_budget": row[4],
+            "updated_at": row[5],
+            "api_configured": is_api_configured(),
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+class DiscoveryConfigUpdate(BaseModel):
+    enabled: bool = False
+    companies_per_day: int = 20
+    min_people_threshold: int = 2
+    target_roles: list[str] = ["CEO", "CFO", "COO", "CTO", "CIO", "CHRO", "CMO"]
+    daily_query_budget: int = 140
+
+
+@router.put("/discovery/config")
+def update_discovery_config(
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    body: DiscoveryConfigUpdate,
+) -> dict[str, Any]:
+    """Update Google Discovery configuration (upsert)."""
+    tenant_id = auth.tenant_id
+    now = _utc_now_iso()
+    con = _get_conn()
+    try:
+        con.execute(
+            """
+            INSERT INTO google_discovery_config
+              (tenant_id, enabled, companies_per_day, min_people_threshold,
+               target_roles, daily_query_budget, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (tenant_id) DO UPDATE SET
+              enabled = EXCLUDED.enabled,
+              companies_per_day = EXCLUDED.companies_per_day,
+              min_people_threshold = EXCLUDED.min_people_threshold,
+              target_roles = EXCLUDED.target_roles,
+              daily_query_budget = EXCLUDED.daily_query_budget,
+              updated_at = EXCLUDED.updated_at
+            """,
+            (
+                tenant_id,
+                body.enabled,
+                body.companies_per_day,
+                body.min_people_threshold,
+                ",".join(body.target_roles),
+                body.daily_query_budget,
+                now,
+                now,
+            ),
+        )
+        con.commit()
+        return {"ok": True}
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+@router.post("/discovery/run")
+def trigger_discovery_run(
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    """Trigger a manual Google Discovery run via RQ."""
+    from src.search.google_discovery import is_api_configured
+
+    tenant_id = auth.tenant_id
+
+    if not is_api_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Google CSE API credentials not configured on VPS. "
+            "Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_ENGINE_ID environment variables.",
+        )
+
+    from redis import Redis
+    from rq import Queue
+
+    from src.queueing.google_discovery_task import task_google_discovery
+
+    redis = Redis.from_url(RQ_REDIS_URL)
+    q = Queue(name="generate", connection=redis)
+
+    job = q.enqueue(
+        task_google_discovery,
+        tenant_id=tenant_id,
+        trigger_type="manual",
+        job_timeout=3600,
+    )
+
+    return {"ok": True, "job_id": job.id}
+
+
+@router.get("/discovery/history")
+def get_discovery_history(
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Get past Google Discovery run history."""
+    tenant_id = auth.tenant_id
+    con = _get_conn()
+    try:
+        offset = (page - 1) * page_size
+
+        total_row = con.execute(
+            "SELECT COUNT(*) FROM google_discovery_runs WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        total = int(total_row[0]) if total_row else 0
+
+        rows = con.execute(
+            """
+            SELECT id, status, trigger_type, companies_queried, queries_used,
+                   people_found, people_inserted, emails_generated,
+                   errors, started_at, finished_at
+            FROM google_discovery_runs
+            WHERE tenant_id = ?
+            ORDER BY started_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (tenant_id, page_size, offset),
+        ).fetchall()
+
+        items = []
+        for r in rows:
+            errors_list: list[str] = []
+            if r[8]:
+                try:
+                    errors_list = json.loads(r[8])
+                except Exception:
+                    errors_list = [str(r[8])]
+            items.append(
+                {
+                    "id": r[0],
+                    "status": r[1],
+                    "trigger_type": r[2],
+                    "companies_queried": r[3],
+                    "queries_used": r[4],
+                    "people_found": r[5],
+                    "people_inserted": r[6],
+                    "emails_generated": r[7],
+                    "errors": errors_list,
+                    "started_at": r[9],
+                    "finished_at": r[10],
+                }
+            )
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass

@@ -25,6 +25,18 @@ SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 CSUITE_ROLES = ["CEO", "CFO", "COO", "CTO", "CIO", "CHRO", "CMO"]
 
+# Map abbreviations to their expanded forms for role validation.
+# When we search for "CEO", a LinkedIn title might say "Chief Executive Officer".
+_ROLE_EXPANSIONS: dict[str, list[str]] = {
+    "CEO": ["ceo", "chief executive officer", "chief executive"],
+    "CFO": ["cfo", "chief financial officer", "chief finance officer"],
+    "COO": ["coo", "chief operating officer", "chief operations officer"],
+    "CTO": ["cto", "chief technology officer", "chief technical officer"],
+    "CIO": ["cio", "chief information officer"],
+    "CHRO": ["chro", "chief human resources officer", "chief people officer", "chief hr officer"],
+    "CMO": ["cmo", "chief marketing officer"],
+}
+
 # Words to strip from LinkedIn URL slugs (titles, credentials, etc.)
 _SLUG_STRIP_WORDS = frozenset(
     {
@@ -124,12 +136,21 @@ def search_linkedin_for_role(
 ) -> list[dict]:
     """
     Search Google via Serper for LinkedIn profiles:
-      site:linkedin.com/in "Acme Corp" CEO
+      site:linkedin.com/in "Acme Corp" "CEO"
 
     Returns a list of result dicts with 'title', 'link', 'snippet' keys
     matching the shape expected by downstream code.
     """
-    query = f'site:linkedin.com/in "{company_name}" {role}'
+    # Get the expanded title form (e.g. CEO → "Chief Executive Officer")
+    expansion = _ROLE_EXPANSIONS.get(role.upper(), [])
+    expanded = expansion[1] if len(expansion) >= 2 else ""
+
+    # Search with both the abbreviation and the expanded form for better recall
+    # Quote the role to force exact match
+    if expanded:
+        query = f'site:linkedin.com/in "{company_name}" ("{role}" OR "{expanded}")'
+    else:
+        query = f'site:linkedin.com/in "{company_name}" "{role}"'
     headers = {
         "X-API-KEY": api_key,
         "Content-Type": "application/json",
@@ -387,6 +408,60 @@ def _result_matches_company(
     return any(kw in text for kw in keywords)
 
 
+def _extract_role_from_title(title: str) -> str:
+    """
+    Extract the role/title portion from a LinkedIn search result title.
+
+    LinkedIn titles typically follow:
+      "John Doe - CEO - Acme Corp | LinkedIn"
+      "Jane Smith - Chief Financial Officer at BigCo | LinkedIn"
+
+    The role is the SECOND segment (index 1) in a 3-segment title,
+    or the last segment (which may contain "at Company") in a 2-segment title.
+
+    Returns the role portion lowercased, or empty string if unparseable.
+    """
+    # Remove " | LinkedIn" or " - LinkedIn" suffix
+    clean = re.split(r"\s*[|\u2013\u2014-]\s*LinkedIn", title, flags=re.IGNORECASE)[0]
+
+    # Split on separators (dash, en-dash, em-dash)
+    segments = re.split(r"\s*[\u2013\u2014-]\s*", clean)
+
+    # "Name - Role - Company" → segments[1] is the role
+    if len(segments) >= 3:
+        return segments[1].strip().lower()
+
+    # "Name - Role at Company" → strip the "at Company" part
+    if len(segments) >= 2:
+        role_part = segments[-1].strip()
+        at_match = re.search(r"^(.+?)\s+at\s+", role_part, re.IGNORECASE)
+        if at_match:
+            return at_match.group(1).strip().lower()
+        return role_part.lower()
+
+    return ""
+
+
+def _result_matches_role(item: dict, role: str) -> bool:
+    """
+    Validate that a LinkedIn result actually has the target C-suite role.
+
+    Extracts the role segment from the title and checks if the target role
+    abbreviation or its expanded form appears in it.
+    """
+    expansions = _ROLE_EXPANSIONS.get(role.upper(), [role.lower()])
+
+    title = item.get("title", "")
+    role_from_title = _extract_role_from_title(title)
+
+    if role_from_title:
+        return any(exp in role_from_title for exp in expansions)
+
+    # Fallback: check full title + snippet
+    text = (title + " " + item.get("snippet", "")).lower()
+    return any(exp in text for exp in expansions)
+
+
 # ---------------------------------------------------------------------------
 # Company-level discovery
 # ---------------------------------------------------------------------------
@@ -453,6 +528,17 @@ def discover_people_for_company(
                         "Skipping result (company mismatch): title=%r for %s %s",
                         item.get("title", ""),
                         search_name,
+                        role,
+                    )
+                    continue
+
+                # Validate: the role in the LinkedIn title must match
+                # what we searched for (e.g. reject a Marketing Manager
+                # when we searched for CEO)
+                if not _result_matches_role(item, role):
+                    log.debug(
+                        "Skipping result (role mismatch): title=%r expected %s",
+                        item.get("title", ""),
                         role,
                     )
                     continue

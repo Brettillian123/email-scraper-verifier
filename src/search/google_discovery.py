@@ -524,73 +524,40 @@ def discover_people_for_company(
             )
             result.queries_used += 1
 
-            accepted_for_role = 0
-            # Track the first company-matched result as a fallback
-            # in case nobody passes the role check
-            fallback_candidate: dict | None = None
+            # Filter to valid LinkedIn profile links we haven't seen
+            linkedin_items = [
+                it
+                for it in items
+                if "linkedin.com/in/" in it.get("link", "") and it.get("link", "") not in seen_urls
+            ]
 
-            for item in items:
-                # Only take the top matching result per role
-                if accepted_for_role >= 1:
-                    break
+            # First pass: try to find someone whose role matches
+            accepted = False
+            for item in linkedin_items:
+                if _result_matches_role(item, role):
+                    seen_urls.add(item["link"])
+                    person = _extract_person(item, role, "high", seen_names)
+                    if person:
+                        result.people.append(person)
+                        accepted = True
+                        break
 
-                link = item.get("link", "")
-
-                # Skip non-LinkedIn URLs
-                if "linkedin.com/in/" not in link:
-                    continue
-
-                # Skip duplicate URLs
-                if link in seen_urls:
-                    continue
-
-                # Company in the LinkedIn title must match our target
-                if not _result_matches_company(item, keywords):
-                    log.debug(
-                        "Skipping result (company mismatch): title=%r for %s %s",
-                        item.get("title", ""),
+            # Fallback: none of the results matched the role,
+            # so take the first LinkedIn person with an empty title
+            # for manual review
+            if not accepted and linkedin_items:
+                item = linkedin_items[0]
+                seen_urls.add(item["link"])
+                person = _extract_person(item, "", "low", seen_names)
+                if person:
+                    log.info(
+                        "Fallback (no role match): %s %s for %s %s",
+                        person.first_name,
+                        person.last_name,
                         search_name,
                         role,
                     )
-                    continue
-
-                # Remember first company-matched result as fallback
-                if fallback_candidate is None:
-                    fallback_candidate = item
-
-                # Check if the role also matches
-                if not _result_matches_role(item, role):
-                    log.debug(
-                        "Skipping result (role mismatch): title=%r expected %s",
-                        item.get("title", ""),
-                        role,
-                    )
-                    continue
-
-                # Both company and role match — accept with the role
-                seen_urls.add(link)
-                person = _extract_person(item, role, "high", seen_names)
-                if person:
                     result.people.append(person)
-                    accepted_for_role += 1
-
-            # Fallback: if no one passed the role check but we had a
-            # company match, insert that person with an empty title
-            # so we at least capture them for manual review
-            if accepted_for_role == 0 and fallback_candidate is not None:
-                link = fallback_candidate.get("link", "")
-                if link not in seen_urls:
-                    seen_urls.add(link)
-                    person = _extract_person(fallback_candidate, "", "low", seen_names)
-                    if person:
-                        log.info(
-                            "Fallback insert (no role match): %s %s for %s %s",
-                            person.first_name,
-                            person.last_name,
-                            search_name,
-                            role,
-                        )
-                        result.people.append(person)
 
         except Exception as exc:
             result.errors.append(f"{role}: {exc}")

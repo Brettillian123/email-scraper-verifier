@@ -286,9 +286,6 @@ def _process_person(
     errors: list[str],
 ) -> tuple[int, int, int]:
     """Process a single discovered person. Returns (found, inserted, emails)."""
-    if person.confidence == "low":
-        return (0, 0, 0)
-
     if _person_already_exists(con, tenant_id, company["id"], person.first_name, person.last_name):
         log.debug(
             "Skipping duplicate: %s %s at %s",

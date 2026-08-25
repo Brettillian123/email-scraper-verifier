@@ -196,6 +196,8 @@ curl http://localhost:8000/runs/{run_id}/export \
 #### Search Leads
 
 ```bash
+# NOTE: /leads/search is a stub since 2026-08 and always returns an empty
+# result set. Kept only for two admin components that still call it.
 curl "http://localhost:8000/leads/search?q=john&domain=example.com" \
   -H "X-Tenant-ID: dev" \
   -H "X-User-ID: user_dev"

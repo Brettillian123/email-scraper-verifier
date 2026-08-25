@@ -1,5 +1,17 @@
 # /leads/search API (R22 + R23 + O26)
 
+> **SUPERSEDED — the subsystem this describes was deleted in 2026-08.**
+>
+> The lead-search stack (`src/search/backend.py`, `indexing.py`, `cache.py`, the
+> facets materialized view and their migrations) is gone. `lead_search_docs`
+> survives as an empty orphan table. `GET /leads/search` survives as a stub
+> returning an empty result set, only because two live admin components still
+> call it.
+>
+> This document is kept as the record of what the stack did and why it was built,
+> so that anyone tempted to rebuild it can see what was already tried. It does
+> **not** describe running code.
+
 Lead search HTTP endpoint backed by the SQLite FTS + ICP/verification stack.
 
 - **Checklist item:** R22 – Lead Search API (/leads/search)

@@ -72,7 +72,21 @@ All configuration is managed through environment variables, loaded from a `.env`
 | Variable | Default | Description |
 |---|---|---|
 | `SMTP_PROBES_ENABLED` | `true` | Master switch for SMTP probing |
-| `SMTP_PROBES_ALLOWED_HOSTS` | (empty = all) | Comma-separated hostnames where probing is allowed. Empty means unrestricted |
+| `SMTP_PROBES_ALLOWED_HOSTS` | (empty = all) | Comma-separated hostnames where probing is allowed. Empty means unrestricted. **In Docker, see the warning below.** |
+
+> **`SMTP_PROBES_ALLOWED_HOSTS` is matched against the machine's OWN hostname,**
+> not against the host being probed (`src/verify/preflight.py`). A container's
+> hostname defaults to a random hex id, so if this variable is set to a real
+> name the guard will reject **every** probe with `SmtpProbingDisabledError` —
+> and the run will still report `succeeded`, having verified nothing.
+>
+> This is exactly what happened during the 2026-08 Hetzner-to-Contabo migration:
+> the old bare-metal box was literally named `verifier.crestwellpartners.com`, so
+> the guard had always passed and nobody knew it was load-bearing. The fix is
+> `hostname: verifier.crestwellpartners.com` on every IQ service in the compose
+> file, which also matches the HELO we present. Do not remove it without also
+> changing the preflight check.
+
 | `SMTP_CONNECT_TIMEOUT` | `5` | SMTP connection timeout (seconds) |
 | `SMTP_COMMAND_TIMEOUT` | `10` | SMTP command timeout (seconds) |
 

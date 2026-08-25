@@ -195,9 +195,15 @@ Export run results as CSV or JSON file download.
 
 ## Lead Search API
 
-### `GET /leads/search`
+### `GET /leads/search` — STUB, always empty
 
-Full-text search across all leads with faceted filtering (R22/R23).
+**The lead-search stack was deleted in 2026-08.** This endpoint remains only
+because two live admin components (`CrestwellIQ.tsx`, `PipelineTracker.tsx`)
+still call it. It accepts the parameters below and returns the original
+response shape with `results: []` and empty `facets`. Change the callers rather
+than resurrecting the backend.
+
+The parameter list is retained so the stub's accepted shape stays documented.
 
 **Query parameters**:
 | Param | Type | Required | Description |

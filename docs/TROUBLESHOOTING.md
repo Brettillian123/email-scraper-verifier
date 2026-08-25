@@ -46,7 +46,17 @@ python scripts/probe_smtp.py test@gmail.com
 - **Port 25 blocked**: Most cloud providers block outbound SMTP by default. Check with your provider (AWS requires an EC2 SMTP unblock request, GCP blocks it entirely on standard VMs)
 - **Firewall rules**: Ensure your server's firewall allows outbound TCP port 25
 - **SMTP_PROBES_ENABLED=false**: Check your `.env`
-- **SMTP_PROBES_ALLOWED_HOSTS too restrictive**: If set, only probes from the listed hostnames are executed. Set to empty for unrestricted access
+- **SMTP_PROBES_ALLOWED_HOSTS too restrictive**: If set, only probes from the listed hostnames are executed. Set to empty for unrestricted access.
+  **This is matched against our OWN hostname, not the target's.** Under Docker a
+  container gets a random hex id, so a non-empty value here disables probing
+  entirely while runs continue to report `succeeded`. Confirm with:
+
+  ```bash
+  docker exec cw-iq-worker-1 hostname
+  ```
+
+  If that does not match a value in `SMTP_PROBES_ALLOWED_HOSTS`, no probe will
+  ever run. Set `hostname:` on the service in the compose file.
 - **DNS resolution failing**: Ensure the server can resolve MX records (`dig MX gmail.com`)
 
 ### All Emails Classified as "risky_catch_all"

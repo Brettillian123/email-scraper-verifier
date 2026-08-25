@@ -1,5 +1,13 @@
 # R25 – QA & Acceptance Harness
 
+> **PARTIALLY SUPERSEDED (2026-08).** The search and facets portions of this
+> acceptance story — sections covering `backend.search_leads`, the R21/R22/R23
+> stack, and the tests `test_r21_search_indexing.py`, `test_r22_api.py`,
+> `test_r22_search_backend.py`, `test_r23_facets_backend.py`,
+> `test_r23_facets_diagnostics.py`, `test_o14_facets_mv.py`,
+> `test_o15_search_cache.py` — describe deleted code and deleted tests. The
+> ingest → verify → export → admin portions still hold.
+
 - **Checklist item:** R25 – QA & end-to-end acceptance
 - **Depends on:** R08–R24, O14, O15, O17, O20, O23
 - **Primary artifacts:**

@@ -148,11 +148,11 @@ email-scraper/
 
 | Module | Purpose | Key Files |
 |---|---|---|
-| **Crawl** | Multi-page crawling with depth/page limits | `src/crawl/runner.py`, `src/crawl/targets.py` |
-| **Extract** | Find people on HTML pages (regex + optional OpenAI) | `src/extract/candidates.py`, `src/extract/ai_candidates.py` |
-| **Fetch** | HTTP client with robots.txt enforcement, caching, throttling | `src/fetch/client.py`, `src/fetch/robots.py` |
-| **Generate** | Detect domain email patterns, generate permutations | `src/generate/patterns.py`, `src/generate/permutations.py` |
-| **Verify** | SMTP RCPT TO probing, catch-all detection | `src/verify/smtp.py`, `src/verify/catchall.py` |
+| **Crawl** | Multi-page crawling with depth/page limits | `src/crawl/runner.py` |
+| **Extract** | Find people on HTML pages (regex + optional OpenAI); harvest published addresses to infer the domain pattern | `src/extract/candidates.py`, `src/extract/ai_candidates.py`, `src/extract/address_harvest.py` |
+| **Fetch** | HTTP client with robots.txt enforcement, caching, throttling, SSRF + response-size guard | `src/fetch/client.py`, `src/fetch/robots.py`, `src/fetch/ssrf.py` |
+| **Generate** | Learn and rank domain email patterns from confirmed/refuted evidence, generate permutations | `src/generate/patterns.py`, `src/generate/permutations.py` |
+| **Verify** | SMTP RCPT TO probing (session reuse, time budget, tarpit backoff), catch-all detection, confidence-ordered candidates | `src/verify/smtp.py`, `src/verify/catchall.py`, `src/verify/candidates.py` |
 | **Resolve** | Domain resolution and MX lookup | `src/resolve/mx.py` |
 | **Scoring** | ICP (Ideal Customer Profile) scoring | `src/scoring/icp.py` |
 | **Export** | CSV/JSON export with policy enforcement | `src/export/policy.py`, `src/export/writer.py` |
@@ -209,6 +209,7 @@ See [docs/service-management.md](docs/service-management.md) for the `esctl` ope
 
 | Document | Description |
 |---|---|
+| [2026-08-accuracy-build.md](docs/2026-08-accuracy-build.md) | **Start here.** What the current build does, what it measured, and how to read a run without being misled |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flow, module responsibilities |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Complete environment variable reference |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production deployment (systemd, Caddy, TLS) |
@@ -216,7 +217,7 @@ See [docs/service-management.md](docs/service-management.md) for the `esctl` ope
 | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common issues, debugging, log analysis |
 | [API.md](docs/API.md) | REST API reference |
 | [service-management.md](docs/service-management.md) | VPS ops guide (`esctl`, monitoring) |
-| [r25-qa-acceptance.md](docs/r25-qa-acceptance.md) | QA acceptance harness |
+| [r25-qa-acceptance.md](docs/r25-qa-acceptance.md) | QA acceptance harness (search/facets sections superseded) |
 
 ## License
 

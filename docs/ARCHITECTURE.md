@@ -57,7 +57,8 @@ Core tables:
 - `domain_resolutions` — audit log of domain resolution attempts
 - `suppression` — email/domain suppression lists
 - `ingest_items` — staging table for CSV/JSONL ingestion
-- `lead_search_docs` — materialized search documents for faceted search
+- `company_email_pattern` — learned per-company address pattern, with confirmed/refuted evidence counts
+- `lead_search_docs` — **orphan.** The lead-search stack was deleted (2026-08); the table remains at 0 rows and nothing reads or writes it.
 
 Auth tables (applied separately):
 - `auth_users`, `sessions`, `password_reset_tokens` — session-based authentication
@@ -105,11 +106,40 @@ Orchestrator (pipeline_v2.py)
             │    Optional: third-party fallback (O07)
             │  Update verification_results
             ▼
-    Run finalization (run_finalize.py)
+    Run finalization (queueing/pipeline_v2.py)
         │  Aggregate metrics (emails found, verified, valid rate)
         │  Update run status to "succeeded" or "failed"
         │  Log activity metrics
+        │
+        │  NOTE: this fires BEFORE the verify tail drains. "succeeded"
+        │  does not mean the results are final -- see "Known reporting
+        │  defects" below.
 ```
+
+### Known reporting defects
+
+Measured on run `a661ca92` (256 companies, 2026-08-24). These are reporting and
+observability defects, not correctness ones -- the addresses that get found are
+sound. They are documented because each one will mislead somebody reading run
+output.
+
+1. **`status='succeeded'` fires before the verify tail drains.** That run was
+   marked succeeded at 21:33; verification kept writing rows until roughly 22:30,
+   and nearly half of them landed after the terminal status. Do not treat
+   `succeeded` as "results are final" -- query `verification_results` by time
+   window instead, or you will undercount, as our own first measurement did
+   (20 companies reported against a true 87).
+
+2. **Per-domain progress is never updated.** `runs.progress_json` still shows
+   every domain at `state: "enqueued"` and `metrics.total_companies: 0` on a
+   completed run. Fan-out writes the initial record and nothing revises it, so a
+   stalled domain and a finished one look identical.
+
+3. **A company that yields nothing records no reason.** On that run, 191
+   companies were crawled but only 87 produced an address to verify. There is no
+   per-company note of whether that was no people extracted, no pattern
+   available, or no MX -- so the largest single loss in the funnel cannot be
+   attributed.
 
 ### Verification Classification (R18)
 
@@ -126,8 +156,7 @@ The `verify_status` field uses a four-value taxonomy:
 
 ### Crawling (`src/crawl/`)
 
-- **runner.py**: Orchestrates multi-page crawling with BFS over seed URLs. Enforces `CRAWL_MAX_PAGES_PER_DOMAIN` and `CRAWL_MAX_DEPTH`. Uses tiered seed paths (team, leadership, about pages) and stops early when enough people-pages are found.
-- **targets.py**: Generates seed URLs for a given domain based on configured tiers.
+- **runner.py**: Orchestrates multi-page crawling with BFS over seed URLs. Seed-path tiering was folded in here when `targets.py` was removed. Enforces `CRAWL_MAX_PAGES_PER_DOMAIN` and `CRAWL_MAX_DEPTH`. Uses tiered seed paths (team, leadership, about pages) and stops early when enough people-pages are found.
 
 ### Fetching (`src/fetch/`)
 
@@ -135,24 +164,27 @@ The `verify_status` field uses a four-value taxonomy:
 - **robots.py**: Parses and caches `robots.txt` with explainability (`RobotsBlockInfo`). Enforces crawl-delay directives. Supports the `EmailVerifierBot` user-agent and `Email-Scraper` alias.
 - **cache.py**: HTTP response cache with configurable TTL.
 - **throttle.py**: Per-domain request throttling to respect rate limits.
+- **ssrf.py**: Central egress guard. `validate_url()` refuses non-public hosts; `safe_get()` streams and truncates at `max_bytes` so a gzip bomb cannot be buffered whole. Every outbound fetch, including the resolver's HEAD probe, goes through it.
 
 ### Extraction (`src/extract/`)
 
 - **candidates.py**: Regex and heuristic-based extraction of people from HTML. Detects names, titles, and published email addresses. Uses role aliases for title normalization.
 - **ai_candidates.py**: OpenAI-powered extraction for pages where regex fails. Sends cleaned HTML to GPT and parses structured people data from the response.
 - **ai_candidates_wrapper.py**: Coordination layer that tries regex extraction first, falls back to AI if enabled and results are sparse.
+- **address_harvest.py**: Harvests addresses already published on a company's own pages and infers the company's pattern from them, by matching the local part against a known employee name. Measured 94.4% overall and 100% at confidence >= 0.75 against `tests/fixtures/pattern_ground_truth.tsv`.
 
 ### Generation (`src/generate/`)
 
-- **patterns.py**: Detects the email naming pattern for a domain by analyzing existing known emails (e.g., `first.last`, `flast`, `first_last`).
+- **patterns.py**: Learns and ranks a domain's address pattern. Vocabulary: `flast`, `first.last`, `first`, `firstlast`, `f.last`, `firstl`, `last.first`, `first_last`. Ranking is Laplace-smoothed over confirmed/refuted evidence held in `company_email_pattern`, so a hard-failed probe actively refutes a pattern rather than merely failing to confirm it.
 - **permutations.py**: Generates all plausible email permutations for a person given the detected pattern and domain.
 
 ### Verification (`src/verify/`)
 
-- **smtp.py**: Core SMTP RCPT-TO probing logic with connection pooling, timeout handling, and error classification.
+- **smtp.py**: Core SMTP RCPT-TO probing. Reuses one session across all candidates for a domain, enforces a per-domain time budget, and bounds reads (`SMTP_SESSION_MAX_BYTES`) including the banner. `_classify_exc()` distinguishes a server-issued 4xx from a timeout or a local crash -- only the first is a real deferral, and only the first is eligible for greylist retry.
 - **preflight.py**: Fast TCP port-25 reachability check before attempting full SMTP conversation.
 - **catchall.py**: Probes a random address to detect catch-all domains.
 - **status.py**: Canonical `verify_status` classification engine combining SMTP results, catch-all status, and fallback data.
+- **candidates.py**: Orders the candidate addresses for a person by learned-pattern confidence, so the likely address is probed first and the rest are skipped once one accepts.
 - **labels.py**: Human-readable label generation for verification outcomes.
 - **fallback.py**: Third-party verification API integration (when SMTP is inconclusive).
 - **delivery_catchall.py**: Upgrades `risky_catch_all` to `valid` based on actual delivery confirmation.
@@ -162,16 +194,21 @@ The `verify_status` field uses a four-value taxonomy:
 
 - **cli.py**: Command-line tool for bulk CSV/JSONL ingestion with normalization.
 - **normalize.py**: Field-level normalization (R13) — domain cleanup, name casing, title standardization.
-- **http.py**: HTTP endpoint for programmatic lead ingestion.
 - **persist.py**: Adapter for writing normalized rows to the database.
 - **validators.py**: Input validation rules.
-- **company_enrich.py**: Company metadata enrichment during ingestion.
 
-### Search (`src/search/`)
+### Search (`src/search/`) — REMOVED (2026-08)
 
-- **backend.py**: Full-text search backend using PostgreSQL `tsvector`. Supports query parsing, ranking, and result pagination.
-- **indexing.py**: Builds and maintains the `lead_search_docs` materialized table for fast faceted queries.
-- **cache.py**: Search result caching layer.
+`backend.py`, `indexing.py` and `cache.py` are deleted, along with the facets
+materialized view and its migration. The stack was never wired to a UI,
+`lead_search_docs` held 0 rows, and its tests were the bulk of the failing suite.
+
+`GET /leads/search` survives as a thin stub returning the original response shape
+with an empty result set, because two live admin components still call it
+(`CrestwellIQ.tsx`, `PipelineTracker.tsx`). Do not resurrect the stack to satisfy
+that endpoint -- change the callers instead.
+
+`src/search/google_discovery.py` is unrelated and still live.
 
 ### Export (`src/export/`)
 

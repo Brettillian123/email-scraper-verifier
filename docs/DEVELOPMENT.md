@@ -82,13 +82,13 @@ src/
 ├── queueing/    → RQ tasks, pipeline orchestration, worker, DLQ
 ├── resolve/     → Domain and MX resolution
 ├── scoring/     → ICP scoring
-├── search/      → Full-text search and faceted filtering
+├── search/      → Google-based domain discovery (the lead-search stack was removed 2026-08)
 ├── verify/      → SMTP probing, catch-all, verification status
 ├── export/      → CSV/JSON export with policy enforcement
 ├── admin/       → Admin audit and metrics
 ├── config.py    → Centralized configuration
 ├── db.py        → Core database operations
-└── ...          → Supporting DB modules (db_ingest, db_pages, db_suppression)
+└── ...          → Supporting DB modules (db_pages, db_suppression)
 ```
 
 ### Naming Conventions
@@ -134,9 +134,12 @@ Tests are organized by requirement/feature:
 | `test_r16_smtp.py` | SMTP verification (R16) |
 | `test_r17_catchall.py` | Catch-all detection (R17) |
 | `test_r18_verify_status.py` | Verification status (R18) |
-| `test_r21_search_indexing.py` | Search indexing (R21) |
-| `test_r22_api.py` | API endpoints (R22) |
-| `test_r23_facets_backend.py` | Faceted search (R23) |
+| `test_pattern_shape_accuracy.py` | Pattern inference accuracy gate (>=94% overall, 100% at conf >= 0.75) |
+| `test_address_harvest.py` | Harvesting published addresses off a company's own pages |
+| `test_candidate_ranking.py` | Confidence-ordered candidate selection |
+| `test_greylist_deferral_gate.py` | Only a server-issued 4xx may trigger greylist retry |
+| `test_ssrf_guard.py` | Egress guard: non-public hosts refused, bodies truncated |
+| `test_run_reaper.py` | Stale-run detection and requeue policy |
 | `test_robots_enforcement.py` | robots.txt compliance |
 | `test_rate_limit_concurrency.py` | Rate limiting |
 

@@ -1,3 +1,15 @@
+> **SUPERSEDED — the subsystem this describes was deleted in 2026-08.**
+>
+> The lead-search stack (`src/search/backend.py`, `indexing.py`, `cache.py`, the
+> facets materialized view and their migrations) is gone. `lead_search_docs`
+> survives as an empty orphan table. `GET /leads/search` survives as a stub
+> returning an empty result set, only because two live admin components still
+> call it.
+>
+> This document is kept as the record of what the stack did and why it was built,
+> so that anyone tempted to rebuild it can see what was already tried. It does
+> **not** describe running code.
+
 <!-- docs/r21-search-indexing.md -->
 
 # R21 — Search Indexing Prep (SQLite FTS5)

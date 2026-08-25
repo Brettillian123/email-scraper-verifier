@@ -2770,7 +2770,7 @@ def task_generate_emails(  # noqa: C901
 
     # ----- SEQUENTIAL VERIFICATION MODE -----
     if sequential_mode:
-        return _generate_emails_sequential(
+        result = _generate_emails_sequential(
             con=con,
             person_id=person_id,
             domain=dom,
@@ -2783,6 +2783,8 @@ def task_generate_emails(  # noqa: C901
             nl=nl,
             company_id=company_id,
         )
+        _record_generation_outcome(con, person_id=person_id, result=result)
+        return result
 
     # ----- PARALLEL MODE (LEGACY) -----
     inserted = 0
@@ -3260,6 +3262,47 @@ def _set_email_source_note(con: Any, email_id: int | None, note: str) -> None:
         log.debug("failed to update source_note", exc_info=True, extra={"email_id": email_id})
 
 
+def _record_generation_outcome(con: Any, *, person_id: int, result: dict) -> None:
+    """Persist WHY this person did or did not yield an address.
+
+    The generator already knows: no_mx, no_candidates, all_invalid, exhausted,
+    deferred, valid_found, risky_found. It used to discard that, and because
+    CLEANUP_INVALID_GENERATED deletes the email row for every hard failure, a
+    person who was probed and missed left no trace -- indistinguishable from one
+    who was never probed at all.
+
+    That is not a cosmetic gap. It is why the 2026-08-24 sweep was first read as
+    an extraction failure when it was a pattern-evidence bug: the losing rows had
+    already been deleted, so the funnel could not be attributed after the fact.
+
+    Best-effort by design. A failure here must never lose a verified address, and
+    must never leave an aborted transaction behind for the caller -- Postgres
+    fails every subsequent statement on the same connection until rollback.
+    """
+    try:
+        con.execute(
+            "UPDATE people SET generation_status = ?, generation_at = ?, "
+            "generation_probes = ? WHERE id = ?",
+            (
+                str(result.get("status") or "unknown"),
+                _utc_now_iso_z(),
+                int(result.get("verified") or 0),
+                int(person_id),
+            ),
+        )
+        con.commit()
+    except Exception:
+        log.debug(
+            "could not record generation outcome",
+            exc_info=True,
+            extra={"person_id": person_id, "status": result.get("status")},
+        )
+        try:
+            con.rollback()
+        except Exception:
+            pass
+
+
 def _generate_emails_sequential(  # noqa: C901
     *,
     con: Any,
@@ -3484,10 +3527,39 @@ def _generate_emails_sequential(  # noqa: C901
                 probed[res["email"]] = res
         return probed[addr]
 
+    # Failures are HELD until this person proves they have a mailbox here.
+    #
+    # A 550 "no such user" for kellyleveque@magicspoon.com proves exactly one
+    # thing: Kelly LeVeque has no mailbox at that domain. It says nothing about
+    # whether the company uses `firstlast`. Recording it as pattern evidence
+    # conflates a fact about a PERSON with a claim about a FORMAT.
+    #
+    # That conflation was measured doing real damage. Extraction legitimately
+    # picks up non-employees -- advisors, brand ambassadors, testimonial names,
+    # people who have left. Each one bounces on every format, and at
+    # REFUTED_MIN_FAILURES=2 it took only two of them to refute a company's
+    # ENTIRE vocabulary. Every remaining employee then ranked to an empty plan
+    # and was never probed. Production state when this was found: 73 companies
+    # fully refuted, 460 people at them never probed -- and spot-probing those
+    # companies still returned valid addresses on `flast` and `first.last`,
+    # the two formats their own evidence claimed were dead.
+    #
+    # The discriminating signal is an ACCEPT alongside the rejections. If some
+    # candidate for this person is accepted and others are refused, the person
+    # demonstrably exists, the domain demonstrably distinguishes mailboxes, and
+    # the refusals are then genuine evidence about format. If NOTHING is
+    # accepted, the whole probe set is the signature of an absent person and
+    # teaches nothing.
+    pending_failures: list[tuple[str, str]] = []
+
     def _teach(addr: str, pattern_key: str, ok: bool) -> None:
         if addr in taught:
             return
         taught.add(addr)
+        if not ok:
+            # Held, not discarded -- promoted by _flush_failures() on an accept.
+            pending_failures.append((addr, pattern_key))
+            return
         _record_pattern_outcome_safe(
             con,
             company_id=company_id,
@@ -3495,9 +3567,30 @@ def _generate_emails_sequential(  # noqa: C901
             email=addr,
             first=nf,
             last=nl,
-            ok=ok,
+            ok=True,
             pattern=pattern_key,
         )
+
+    def _flush_failures() -> None:
+        """Commit the held failures. Called ONLY once a candidate has accepted.
+
+        At that point the rejections on the same session are informative: this
+        MX answered 250 for one local-part and 550 for another, so it is both
+        distinguishing mailboxes and telling us which formats this company does
+        not use.
+        """
+        for addr, pat in pending_failures:
+            _record_pattern_outcome_safe(
+                con,
+                company_id=company_id,
+                domain=domain,
+                email=addr,
+                first=nf,
+                last=nl,
+                ok=False,
+                pattern=pat,
+            )
+        pending_failures.clear()
 
     def _teach_unprocessed() -> None:
         """Bank the hard failures this session already paid for.
@@ -3506,6 +3599,9 @@ def _generate_emails_sequential(  # noqa: C901
         it were discarded -- 36,320 hard failures stored exactly one row. They
         were issued on the same connection; recording them costs nothing and is
         what stops the next 5.9 people at this domain re-probing a dead format.
+
+        These are still routed through _teach(), so they are HELD and only
+        committed if this person also produced an accept.
         """
         for addr, pat in ranked_candidates:
             res = probed.get(addr)
@@ -3685,6 +3781,8 @@ def _generate_emails_sequential(  # noqa: C901
         # Step 6: Stop on anything the server accepted; otherwise keep walking.
         if status in ("valid", "risky_catch_all"):
             _teach_unprocessed()
+            # The accept is what makes this person's rejections informative.
+            _flush_failures()
             _accept(email_addr, pattern_key, email_id, status, rank)
             return _result(
                 status="valid_found" if status == "valid" else "risky_found",
@@ -3738,7 +3836,12 @@ def _generate_emails_sequential(  # noqa: C901
             },
         )
 
-    _teach_unprocessed()
+    # Reached only when NOTHING accepted. pending_failures is therefore
+    # deliberately dropped: every candidate for this person bounced, which is
+    # the signature of a person who is not at this company, not proof that the
+    # company uses none of these formats. Teaching here is what refuted 73
+    # companies outright and left 460 of their people unprobed.
+    pending_failures.clear()
 
     all_invalid = bool(attempts) and all(
         a.get("status") in ("invalid", "skipped") for a in attempts

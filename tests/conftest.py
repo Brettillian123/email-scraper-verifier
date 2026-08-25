@@ -212,7 +212,16 @@ def _wire_db_env(
     For SQLite (legacy dev mode, ALLOW_SQLITE_DEV=1):
       - Creates a temporary SQLite database
       - Ensures minimal schema exists
+
+    Tests marked ``@pytest.mark.no_db`` opt out entirely. A pure unit test that
+    mocks its own collaborators should not be skipped for want of a database it
+    never touches -- otherwise the logic gates that matter most silently do not
+    run in an environment without Postgres, which is exactly how a whole class
+    of tests here became dead weight.
     """
+    if request.node.get_closest_marker("no_db") is not None:
+        return
+
     url = _get_db_url()
 
     if _is_postgres_url(url):

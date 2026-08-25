@@ -117,12 +117,19 @@ theoretical.
 
 Company coverage moved 328 to 346 of 965. Valid addresses total 1,807.
 
-### Where the loss actually is
+### Where the loss actually was — and the bug behind it
 
-191 companies were crawled; only 87 produced an address to test. **104 companies
-were fetched successfully and yielded nothing generatable.** Verification is
-doing its job on what reaches it — the bottleneck is extraction and pattern
-availability, upstream. Probing harder will not move the number.
+An earlier version of this section read the funnel wrong, and the correction is
+the most important thing in this document.
+
+191 companies were crawled and only 87 retained an address, which looked like an
+extraction failure. It was not. `CLEANUP_INVALID_GENERATED` **deletes** the email
+row for every address that hard-fails, so a company that was probed and missed is
+indistinguishable in the `emails` table from one that was never probed at all.
+Those companies were probed.
+
+The real cause was in how probe failures were recorded. See
+[pattern evidence is person-scoped](#7-pattern-evidence-is-person-scoped).
 
 ---
 
@@ -140,11 +147,11 @@ correctness of addresses that are found.
    `state: "enqueued"` and `metrics.total_companies: 0` on a completed run. A
    stalled domain looks exactly like a finished one.
 3. **A company that yields nothing records no reason** — no note of whether it
-   was no people extracted, no pattern, or no MX. This is why section 3 can
-   locate the largest loss in the funnel but not attribute it.
-
-Fixing (3) is the highest-value next task: it turns the 104-company gap from a
-number into a diagnosis.
+   was no people extracted, no pattern, no MX, or every candidate bounced.
+   `CLEANUP_INVALID_GENERATED` then deletes the failed rows, so the outcome is
+   unrecoverable after the fact. This is what made the diagnosis in section 7
+   take a full round of wrong conclusions to reach, and it is the highest-value
+   observability work outstanding.
 
 ---
 
@@ -178,3 +185,89 @@ an empty result set, because `CrestwellIQ.tsx` and `PipelineTracker.tsx` still
 call it. **Change those callers rather than resurrecting the backend.**
 
 Net across the build: 11,595 insertions, 9,827 deletions, 80 files.
+
+---
+
+## 7. Pattern evidence is person-scoped
+
+The single most damaging defect found in this cycle, and the reason the sweep in
+section 3 returned 7.4% instead of something much higher.
+
+### The conflation
+
+`_teach_unprocessed()` banked every 550 from a probe session as evidence against
+the **format**. But a 550 for `kellyleveque@magicspoon.com` proves exactly one
+thing: Kelly LeVeque has no mailbox at that domain. It says nothing about whether
+the company uses `firstlast`.
+
+Those are different claims, and the code treated them as the same claim.
+
+### Why that was catastrophic rather than merely imprecise
+
+Extraction legitimately picks up people who are not employees — advisors, brand
+ambassadors, testimonial names, board members, people who have left. Magic Spoon's
+`/pages/people` route lists athletes. Every one of them bounces on **every**
+format we try.
+
+So one absent person banked a failure against the entire vocabulary at once. With
+`REFUTED_MIN_FAILURES = 2`, it took just **two** such people to refute every
+pattern a company had. `rank_patterns()` then filtered out the refuted patterns,
+every remaining employee ranked to an empty candidate plan, and nobody at that
+company was ever probed again.
+
+The damage compounds in the worst possible direction: the more people a company
+has listed, the more likely two of them are non-employees, and the whole company
+is written off — including the real employees further down the list.
+
+### Measured, in production
+
+| | |
+|---|---:|
+| companies with every pattern refuted and none confirmed | **73** |
+| people at those companies | 521 |
+| **people never probed as a result** | **460** |
+| pattern rows holding failure counts that came only from absent people | 622 |
+| companies affected once partial refutations are counted | **120** |
+| **people never probed, full set** | **535** |
+
+`caremessage.org` is the clean illustration: **26 people**, refuted after 3 of
+them bounced, ~23 never probed — and `ccorral@caremessage.org` (`flast`) resolves
+perfectly well. `elemenohealth.com`: 5 people, all patterns refuted, and
+`steve.mundro@elemenohealth.com` (`first.last`) resolves. Both formats were rank
+1 and 2 in the base-rate order. Their own evidence had declared them dead.
+
+This is also why the exec-sorted batch of 25 scored 94%: a real CEO gets probed
+first, **confirms** a pattern, and the company is never poisoned.
+
+### The fix
+
+Failures are held until the person is shown to have a mailbox at all:
+
+- If some candidate for a person **accepts** and others are refused, the person
+  exists, the MX demonstrably distinguishes local-parts, and the refusals are
+  real format evidence — recorded, exactly as before.
+- If **nothing** accepts, the probe set is the signature of an absent person and
+  teaches nothing. The held failures are dropped.
+
+That is the whole change: `pending_failures` in `_generate_emails_sequential()`,
+flushed by `_flush_failures()` only on an accept. Locked by
+`tests/test_pattern_evidence_person_scope.py`, which fails against the old code
+with `[('flast', False), ('first.last', False), ('first', False)]` — one absent
+person refuting three formats.
+
+Note that no negative evidence is lost. The accept-alongside-rejection case is
+strictly *better* evidence than what was being collected before, because it is
+the only case where a rejection is attributable to format at all.
+
+### Repairing what was already written
+
+`scripts/backfill_clear_person_scoped_refutations.py` resets `failed_count` to 0
+**only** at companies with no confirmed pattern anywhere — those never saw an
+accept, so every failure they hold came from the absent-person path. Companies
+that do have a confirmed pattern keep their failures, because those sat beside an
+accept. `inferred_count` is never touched; it comes from the harvester, not from
+probing.
+
+Applied 2026-08-25: 622 rows across 120 companies, 1,261 failure counts dropped.
+A pre-repair dump of the table is at `/root/company_email_pattern.pre-repair.sql`
+on the VPS.

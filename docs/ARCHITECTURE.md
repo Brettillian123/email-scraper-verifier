@@ -121,7 +121,8 @@ Orchestrator (pipeline_v2.py)
 Measured on run `a661ca92` (256 companies, 2026-08-24). These are reporting and
 observability defects, not correctness ones -- the addresses that get found are
 sound. They are documented because each one will mislead somebody reading run
-output.
+output, and defect 3 demonstrably did: it sent the first diagnosis of that run's
+poor yield to the wrong subsystem entirely.
 
 1. **`status='succeeded'` fires before the verify tail drains.** That run was
    marked succeeded at 21:33; verification kept writing rows until roughly 22:30,
@@ -135,11 +136,18 @@ output.
    completed run. Fan-out writes the initial record and nothing revises it, so a
    stalled domain and a finished one look identical.
 
-3. **A company that yields nothing records no reason.** On that run, 191
-   companies were crawled but only 87 produced an address to verify. There is no
-   per-company note of whether that was no people extracted, no pattern
-   available, or no MX -- so the largest single loss in the funnel cannot be
-   attributed.
+3. **A company that yields nothing recorded no reason.** FIXED 2026-08-25 --
+   `people.generation_status` now holds the generator's own verdict (`no_mx`,
+   `no_candidates`, `all_invalid`, `exhausted`, `deferred`, `valid_found`,
+   `risky_found`) with a timestamp and probe count.
+
+   This mattered more than it looks. `CLEANUP_INVALID_GENERATED` deletes the
+   email row for every hard failure, so a person who was probed and missed left
+   no trace at all and was indistinguishable from one never probed. That is why
+   the 2026-08-24 sweep was first read as an extraction failure -- 191 crawled,
+   87 retaining an address -- when the real cause was pattern evidence being
+   refuted by people who were never at the company. See
+   `docs/2026-08-accuracy-build.md` section 7.
 
 ### Verification Classification (R18)
 

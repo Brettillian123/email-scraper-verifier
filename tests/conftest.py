@@ -412,3 +412,40 @@ def schema_applied():
             print(f"Schema apply warning: {result.stderr}")
     except Exception as e:
         print(f"Schema apply error: {e}")
+
+
+# --------------------------------------------------------------------------------------
+# SSRF guard: keep transport-mocked tests working
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _ssrf_allow_reserved_test_tlds(monkeypatch):
+    """
+    The HTTP-mocking tests (respx) address fake hosts under the RFC 6761 reserved
+    TLDs and the RFC 2606 example.* domains. Those never resolve (or must not be
+    depended on for DNS in CI), and src.fetch.ssrf fails closed on hosts it
+    cannot resolve, which would short-circuit those tests before the mocked
+    transport is ever reached.
+
+    Map ONLY those reserved names onto a public address. Every other host --
+    including anything an SSRF test cares about -- still goes through the real
+    resolver, so this does not weaken the guard under test. Tests that need a
+    different DNS answer just re-patch _resolve_host_addresses themselves.
+    """
+    from src.fetch import ssrf
+
+    real_resolver = ssrf._resolve_host_addresses
+    reserved_suffixes = (".test", ".invalid", ".example")
+    reserved_exact = ("example.com", "example.net", "example.org")
+
+    def _resolver(host: str):
+        if (
+            host.endswith(reserved_suffixes)
+            or host in reserved_exact
+            or host.endswith((".example.com", ".example.net", ".example.org"))
+        ):
+            return ["93.184.216.34"]
+        return real_resolver(host)
+
+    monkeypatch.setattr(ssrf, "_resolve_host_addresses", _resolver)

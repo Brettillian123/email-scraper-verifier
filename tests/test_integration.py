@@ -71,7 +71,6 @@ def test_module_imports():
     print("\n=== Module Import Tests ===\n")
 
     modules = [
-        ("src.api.runs_v2", "router"),
         ("src.admin.run_metrics", "RunMetricsSummary"),
         ("src.admin.user_activity", "log_user_activity"),
         ("src.queueing.pipeline_v2", "pipeline_start_v2"),

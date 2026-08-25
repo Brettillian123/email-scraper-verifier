@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -10,6 +11,10 @@ import dns.resolver
 import httpx
 import idna
 import tldextract
+
+from src.fetch.ssrf import SSRFBlocked, validate_url
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "RESOLVER_VERSION",
@@ -249,6 +254,20 @@ def _http_head_ok(host: str) -> tuple[bool, str | None]:
 
     def _probe(scheme: str) -> tuple[bool, str | None]:
         url = f"{scheme}://{host}"
+
+        # This probe reaches an operator-supplied host, so it must clear the same
+        # guard as the crawler. It did not: _labels_ok() only checks length,
+        # charset and "has a dot", which every IP literal satisfies --
+        # 169.254.169.254, 10.0.0.5 and 127.0.0.1 all passed. A run created with
+        # one of those as a domain turned this into a blind internal port scan,
+        # because reachability and redirect behaviour still feed the resolution
+        # decision even though the body never reaches the caller.
+        try:
+            validate_url(url)
+        except SSRFBlocked:
+            log.info("resolver: refusing non-public host", extra={"host": host})
+            return False, None
+
         try:
             limits = httpx.Limits(max_keepalive_connections=0, max_connections=10)
             with httpx.Client(

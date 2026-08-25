@@ -76,7 +76,16 @@ from src.config import (
 CRAWL_HTML_MAX_BYTES = 2_000_000  # 2 MB
 
 # Import robots helpers - is_allowed is required, explain_block is optional
+# The polite-fetch layer. FetcherClient chains per-host pacing (crawl-delay aware),
+# retry-with-backoff on 5xx/429/WAF-403, and conditional HTTP caching -- and it issues
+# every request through ssrf.safe_get(), which follows redirects manually and
+# re-validates each hop. The crawler therefore never touches httpx directly: the SSRF
+# guard is enforced at that single chokepoint rather than at each call site here.
+from src.fetch.client import FetcherClient  # noqa: E402
 from src.fetch.robots import is_allowed  # noqa: E402
+
+# SSRF guard helpers still used directly for up-front domain screening.
+from src.fetch.ssrf import is_public_host, normalize_host  # noqa: E402
 
 # Optional: robots explainability (non-fatal if not available)
 try:
@@ -141,6 +150,11 @@ class _CrawlState:
     nav_expanded: bool = False
     nav_enqueued: int = 0
 
+    # Cumulative seconds slept for per-host politeness pacing / WAF backoff. Tracked
+    # separately from wall-clock so the time budgets below can measure working time
+    # rather than penalizing the crawl for being polite.
+    wait_s: float = 0.0
+
     # SPA shell detection and headless rendering metrics
     spa_shells_detected: int = 0
     spa_shells_rendered: int = 0
@@ -188,9 +202,16 @@ _CRAWL_WAF_ABORT_FIRST_N = max(1, _env_int("CRAWL_WAF_ABORT_FIRST_N", 10))
 # 403 ceiling: if 403 count reaches this, abort (regardless of first-N heuristic).
 _CRAWL_403_CEILING = max(1, _env_int("CRAWL_403_CEILING", 18))
 
-# Time budgets (wall-clock)
+# Time budgets (working time: wall-clock minus time slept for politeness pacing)
 _CRAWL_TIME_BUDGET_NO_PAGES_S = max(1.0, _env_float("CRAWL_TIME_BUDGET_NO_PAGES_S", 25.0))
 _CRAWL_TIME_BUDGET_TOTAL_S = max(1.0, _env_float("CRAWL_TIME_BUDGET_TOTAL_S", 60.0))
+
+# Pacing budget: total seconds a single domain crawl may spend asleep honoring
+# Crawl-delay / WAF backoff. This is the only bound on politeness waiting, so it does
+# double duty: it stops a site with a huge Crawl-delay from monopolizing a worker, and
+# it stops an exponentially-backing-off WAF from doing the same. A single wait longer
+# than the remaining budget aborts the crawl instead of sleeping through it.
+_CRAWL_PACING_BUDGET_S = max(0.0, _env_float("CRAWL_PACING_BUDGET_S", 60.0))
 
 # Dynamic nav expansion (last-resort when seeds fail to yield any persisted pages)
 _CRAWL_NAV_EXPANSION_ENABLED = _env_bool("CRAWL_NAV_EXPANSION_ENABLED", True)
@@ -713,12 +734,25 @@ def _extract_internal_paths(
     return out
 
 
+def _decode_html(body: bytes, content_type: str | None) -> str:
+    """Decode HTML bytes, honoring a charset from Content-Type when one is declared."""
+    ct = (content_type or "").lower()
+    if "charset=" in ct:
+        enc = ct.split("charset=", 1)[1].split(";")[0].strip().strip("\"'")
+        if enc:
+            try:
+                return body.decode(enc, "ignore")
+            except LookupError:
+                pass
+    return body.decode("utf-8", "ignore")
+
+
 def _build_discovered_paths(
     client: Any,
     *,
     origin_base: str,
     base_host: str,
-    timeout: Any,
+    state: _CrawlState,
 ) -> set[str]:
     """
     Build discovered internal paths by fetching and parsing discovery pages.
@@ -740,19 +774,33 @@ def _build_discovered_paths(
 
         url = urljoin(origin_base, dp)
         try:
-            resp = client.get(url, timeout=timeout)
+            res = _fetch(client, url, state)
         except Exception:
             continue
 
-        if resp.status_code != 200:
+        if res.reason == "throttle-budget":
+            _abort_for_pacing(state, stage="discovery", url=url)
+            break
+
+        if res.status != 200:
             continue
 
-        content_type = resp.headers.get("content-type", "")
+        content_type = res.content_type or ""
         if "text/html" not in content_type.lower():
             continue
 
-        body = resp.content
-        final_path = urlparse(str(resp.url)).path or dp
+        body = res.body or b""
+        # This path previously parsed the body with no size check at all, so a
+        # multi-hundred-MB "discovery" page was decoded and regex-scanned in full.
+        if res.oversize:
+            log.info(
+                "Skipping oversized discovery page: url=%s limit=%d",
+                url,
+                CRAWL_HTML_MAX_BYTES,
+            )
+            continue
+
+        final_path = urlparse(res.effective_url).path or dp
         final_path_norm = _normalize_path(final_path)
 
         final_url_canon = urljoin(origin_base, final_path_norm)
@@ -767,17 +815,11 @@ def _build_discovered_paths(
         if final_path_norm != "/":
             discovered.add(final_path_norm + "/")
 
-        try:
-            text = resp.text
-        except Exception:
-            try:
-                text = body.decode("utf-8", "ignore")
-            except Exception:
-                continue
+        text = _decode_html(body, res.content_type)
 
         discovered |= _extract_internal_paths(
             text,
-            base_url=str(resp.url),
+            base_url=res.effective_url,
             base_host=base_host,
             origin_base=origin_base,
         )
@@ -942,13 +984,41 @@ def _elapsed_s(start_monotonic: float) -> float:
     return time.monotonic() - start_monotonic
 
 
+def _fetch(client: Any, url: str, state: _CrawlState) -> Any:
+    """
+    The crawler's single outbound-request chokepoint.
+
+    Everything goes through FetcherClient, which applies robots-aware per-host pacing,
+    retry-with-backoff, conditional caching, and the SSRF-safe redirect walk. Pacing
+    sleep is bounded by whatever is left of the crawl's pacing budget and booked against
+    it, so no caller can sleep the crawl past its limit.
+    """
+    res = client.fetch(url, max_wait_s=max(0.0, _CRAWL_PACING_BUDGET_S - state.wait_s))
+    state.wait_s += res.waited_s
+    return res
+
+
+def _abort_for_pacing(state: _CrawlState, *, stage: str, url: str) -> None:
+    state.aborted = True
+    state.abort_reason = "pacing_budget"
+    state.abort_stage = stage
+    log.info(
+        "Pacing budget exhausted (%.1fs) before %s; stopping crawl.",
+        state.wait_s,
+        url,
+    )
+
+
 def _check_time_budget(
     *,
     state: _CrawlState,
     start_monotonic: float,
     stage: str,
 ) -> bool:
-    elapsed = _elapsed_s(start_monotonic)
+    # Subtract politeness sleep: these budgets exist to stop the crawler burning a
+    # worker on a dead or hostile site, not to punish it for honoring Crawl-delay.
+    # Charging pacing here would silently truncate healthy crawls and drop pages.
+    elapsed = _elapsed_s(start_monotonic) - state.wait_s
 
     if not state.pages and elapsed >= _CRAWL_TIME_BUDGET_NO_PAGES_S:
         state.aborted = True
@@ -989,20 +1059,25 @@ def _maybe_abort_for_waf(
     return False
 
 
-def _resolve_origin(client: Any, *, dom: str, timeout: Any) -> tuple[str, str]:
+def _resolve_origin(client: Any, *, dom: str, state: _CrawlState) -> tuple[str, str]:
     """
     Resolve canonical origin by requesting the site root with redirects.
 
     Returns (origin_base, base_host).
+
+    WHY the SSRF-safe fetch path: this call adopts whatever host it lands on as the
+    crawl origin, so an attacker-controlled domain that 302s to
+    http://crestwell-admin:3000/ would otherwise pin the whole crawl onto an internal
+    service. FetcherClient issues this through ssrf.safe_get(), which walks the
+    redirect chain manually and re-validates every hop.
     """
     fallback = f"https://{dom}/"
     try:
-        resp = client.get(fallback, timeout=timeout)
-        scheme = resp.url.scheme
-        host = resp.url.host
-        if scheme and host:
-            origin = f"{scheme}://{host}".rstrip("/") + "/"
-            return origin, host.lower()
+        res = _fetch(client, fallback, state)
+        parsed = urlparse(res.effective_url)
+        if parsed.scheme and parsed.hostname:
+            origin = f"{parsed.scheme}://{parsed.hostname}".rstrip("/") + "/"
+            return origin, parsed.hostname.lower()
     except Exception:
         pass
 
@@ -1126,7 +1201,6 @@ def _maybe_nav_expand(
     stage: str,
     origin_base: str,
     base_host: str,
-    timeout: Any,
     discovered_paths: set[str],
     next_tier_idx: int,
 ) -> bool:
@@ -1150,7 +1224,7 @@ def _maybe_nav_expand(
             client,
             origin_base=origin_base,
             base_host=base_host,
-            timeout=timeout,
+            state=state,
         )
         cand_paths.add("/")
 
@@ -1188,16 +1262,27 @@ def _fetch_html_page(
     base_host: str,
     state: _CrawlState,
 ) -> tuple[str, bytes] | None:
-    resp = client.get(key)
+    # Every hop is re-validated inside the fetch layer: a public page is allowed to 302
+    # anywhere, including at an internal service, so the check cannot be done
+    # once at the origin and then trusted for the rest of the crawl.
+    res = _fetch(client, key, state)
+
+    if res.reason.startswith("blocked-ssrf"):
+        log.warning("Blocked unsafe crawl target %s: %s", key, res.reason)
+        return None
+
+    if res.reason == "throttle-budget":
+        _abort_for_pacing(state, stage="pre_fetch", url=key)
+        return None
 
     state.meaningful_fetches += 1
-    if resp.status_code == 403:
+    if res.status == 403:
         state.meaningful_403 += 1
 
     if _maybe_abort_for_waf(state=state, stage="post_fetch"):
         return None
 
-    final_path_raw = urlparse(str(resp.url)).path or "/"
+    final_path_raw = urlparse(res.effective_url).path or "/"
     final_path = _normalize_path(final_path_raw)
     if _should_skip_pagination(final_path):
         return None
@@ -1209,19 +1294,19 @@ def _fetch_html_page(
         log.debug("Skipping duplicate final URL: %s -> %s", key, final_url)
         return None
 
-    if resp.status_code != 200:
-        log.debug("Skipping non-200 response: %s (status=%s)", final_url, resp.status_code)
+    if res.status != 200:
+        log.debug("Skipping non-200 response: %s (status=%s)", final_url, res.status)
         return None
 
-    content_type = resp.headers.get("content-type", "")
+    content_type = res.content_type or ""
     if "text/html" not in content_type.lower():
         log.debug("Skipping non-HTML: %s (content-type=%s)", final_url, content_type)
         return None
 
-    body = resp.content
-    if len(body) > CRAWL_HTML_MAX_BYTES:
+    body = res.body or b""
+    if res.oversize:
         log.info(
-            "Skipping oversized page: url=%s size=%d limit=%d "
+            "Skipping oversized page: url=%s size>=%d limit=%d "
             "(increase CRAWL_HTML_MAX_BYTES if needed)",
             final_url,
             len(body),
@@ -1461,7 +1546,7 @@ def _final_log(
         "seed_people_pages=%d tiers_enqueued=%d high_value_discovered=%d sparse_fallback=%s "
         "aborted=%s abort_reason=%s abort_stage=%s waf_first_n=%d waf_fetches=%d waf_403=%d "
         "nav_expanded=%s nav_enqueued=%d time_budget_no_pages_s=%.1f time_budget_total_s=%.1f "
-        "elapsed_s=%.3f",
+        "elapsed_s=%.3f pacing_s=%.3f",
         dom,
         origin_base.rstrip("/"),
         len(state.pages),
@@ -1482,6 +1567,7 @@ def _final_log(
         _CRAWL_TIME_BUDGET_NO_PAGES_S,
         _CRAWL_TIME_BUDGET_TOTAL_S,
         _elapsed_s(start_monotonic),
+        state.wait_s,
     )
 
 
@@ -1499,7 +1585,6 @@ class _CrawlRun:
     max_depth: int
     stop_min_people: int
     hints: list[str]
-    timeout: Any
     start_monotonic: float
 
     discovered_paths: set[str] = field(default_factory=set)
@@ -1515,10 +1600,19 @@ class _CrawlRun:
 
 
 def _sanitize_domain(domain: str) -> str:
-    dom = (domain or "").strip()
-    if dom.startswith(("http://", "https://")):
-        return (urlparse(dom).netloc or dom).strip()
-    return dom
+    """
+    Normalize a caller-supplied domain, or return "" if it is not safe to crawl.
+
+    WHY: domains arrive here from a scraped company database and from
+    POST /api/browser/runs, i.e. they are attacker-controlled. Left unchecked,
+    "localhost", "crestwell-db" or "169.254.169.254" would turn the crawler into
+    an SSRF proxy into the private Docker network and the cloud metadata service.
+    """
+    host = normalize_host(domain)
+    if not host or not is_public_host(host):
+        log.warning("Refusing to crawl unsafe or unresolvable domain: %r", domain)
+        return ""
+    return host
 
 
 def _build_hints() -> list[str]:
@@ -1531,7 +1625,7 @@ def _maybe_do_discovery(
     dom: str,
     origin_base: str,
     base_host: str,
-    timeout: Any,
+    state: _CrawlState,
 ) -> tuple[set[str], bool, str]:
     if not CRAWL_SEEDS_LINKED_ONLY:
         return set(), False, ""
@@ -1540,7 +1634,7 @@ def _maybe_do_discovery(
         client,
         origin_base=origin_base,
         base_host=base_host,
-        timeout=timeout,
+        state=state,
     )
     discovered_paths.add("/")
 
@@ -1795,7 +1889,6 @@ def _maybe_expand_when_empty(
         stage="queues_empty",
         origin_base=run.origin_base,
         base_host=run.base_host,
-        timeout=run.timeout,
         discovered_paths=run.discovered_paths,
         next_tier_idx=run.next_tier_idx,
     )
@@ -1844,7 +1937,6 @@ def _init_run(
     state: _CrawlState,
     *,
     dom: str,
-    timeout: Any,
     stop_min_people: int,
     max_pages: int,
     max_depth: int,
@@ -1852,7 +1944,7 @@ def _init_run(
     start_monotonic: float,
     result: Any,
 ) -> _CrawlRun | None:
-    origin_base, base_host = _resolve_origin(client, dom=dom, timeout=timeout)
+    origin_base, base_host = _resolve_origin(client, dom=dom, state=state)
 
     if _robots_deny_all(base_host):
         root_url = urljoin(origin_base, "/")
@@ -1875,7 +1967,7 @@ def _init_run(
         dom=dom,
         origin_base=origin_base,
         base_host=base_host,
-        timeout=timeout,
+        state=state,
     )
 
     high_value_enqueued = _enqueue_high_value_discovered(
@@ -1901,7 +1993,6 @@ def _init_run(
         max_depth=max_depth,
         stop_min_people=stop_min_people,
         hints=hints,
-        timeout=timeout,
         start_monotonic=start_monotonic,
         discovered_paths=discovered_paths,
         sparse_fallback_active=sparse_active,
@@ -1954,6 +2045,10 @@ def _attach_result_metrics_from_run(run: _CrawlRun, state: _CrawlState, *, resul
         "spa_shells_detected": int(state.spa_shells_detected),
         "spa_shells_rendered": int(state.spa_shells_rendered),
         "elapsed_seconds": round(_elapsed_s(run.start_monotonic), 3),
+        # Wall-clock spent asleep being polite. Exposed so the pacing budget and
+        # CRAWL_PACING_BUDGET_S can be tuned against real crawls rather than guessed.
+        "pacing_seconds": round(state.wait_s, 3),
+        "pacing_budget_s": _CRAWL_PACING_BUDGET_S,
     }
     if CRAWL_SEEDS_LINKED_ONLY:
         payload["discovered_paths_count"] = len(run.discovered_paths)
@@ -1988,9 +2083,11 @@ def crawl_domain(domain: str, *, result: Any = None) -> list[Page]:
 
     See module docstring for behavior details.
     """
-    import httpx
-
     dom = _sanitize_domain(domain)
+    if not dom:
+        # Unsafe / unresolvable domain (already logged). Fail closed.
+        return []
+
     max_pages = CRAWL_MAX_PAGES_PER_DOMAIN
     max_depth = CRAWL_MAX_DEPTH
     stop_min_people = max(1, int(CRAWL_SEED_STOP_MIN_PEOPLE_PAGES))
@@ -2011,17 +2108,29 @@ def crawl_domain(domain: str, *, result: Any = None) -> list[Page]:
             _headless_ctx = None
             state.headless_browser = None
 
-    headers = {"User-Agent": FETCH_USER_AGENT}
-    timeout = httpx.Timeout(CRAWL_READ_TIMEOUT_S, connect=CRAWL_CONNECT_TIMEOUT_S)
     start_monotonic = time.monotonic()
 
     try:
-        with httpx.Client(follow_redirects=True, headers=headers, timeout=timeout) as client:
+        # FetcherClient owns the httpx.Client (built with follow_redirects=False) and
+        # routes every request through ssrf.safe_get(), which walks redirects manually
+        # and re-validates each hop. It also supplies the per-host pacing, the
+        # retry/backoff, and the conditional cache this crawler used to go without.
+        #
+        # enforce_robots=False because this module already gates robots itself, with
+        # block explainability logging, in _pre_fetch_checks() and
+        # _build_discovered_paths(); letting the client re-check would duplicate that
+        # work and would newly gate _resolve_origin(), which is deliberately unchecked.
+        with FetcherClient(
+            user_agent=FETCH_USER_AGENT,
+            enforce_robots=False,
+            connect_timeout=CRAWL_CONNECT_TIMEOUT_S,
+            read_timeout=CRAWL_READ_TIMEOUT_S,
+            max_body_bytes=CRAWL_HTML_MAX_BYTES,
+        ) as client:
             run = _init_run(
                 client,
                 state,
                 dom=dom,
-                timeout=timeout,
                 stop_min_people=stop_min_people,
                 max_pages=max_pages,
                 max_depth=max_depth,

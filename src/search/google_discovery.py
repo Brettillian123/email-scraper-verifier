@@ -322,64 +322,6 @@ def _company_keywords(company_name: str, domain: str) -> list[str]:
     return keywords
 
 
-def _extract_company_from_title(title: str) -> str:
-    """
-    Extract the company name portion from a LinkedIn search result title.
-
-    LinkedIn titles typically follow:
-      "John Doe - CEO - Acme Corp | LinkedIn"
-      "Jane Smith - Chief Financial Officer at BigCo | LinkedIn"
-
-    Returns the company portion lowercased, or empty string if unparseable.
-    """
-    # Remove " | LinkedIn" or " - LinkedIn" suffix
-    clean = re.split(r"\s*[|\u2013\u2014-]\s*LinkedIn", title, flags=re.IGNORECASE)[0]
-
-    # Split on separators (dash, en-dash, em-dash)
-    segments = re.split(r"\s*[\u2013\u2014-]\s*", clean)
-
-    # Company is usually the last segment (after name and title)
-    # Format: "Name - Role - Company" → segments[-1] is company
-    if len(segments) >= 3:
-        return segments[-1].strip().lower()
-
-    # Sometimes: "Name - Role at Company"
-    if len(segments) >= 2:
-        role_part = segments[-1].strip()
-        at_match = re.search(r"\bat\s+(.+)$", role_part, re.IGNORECASE)
-        if at_match:
-            return at_match.group(1).strip().lower()
-
-    return ""
-
-
-def _result_matches_company(
-    item: dict,
-    keywords: list[str],
-) -> bool:
-    """
-    Strictly validate that a LinkedIn result belongs to the target company.
-
-    Extracts the company name from the LinkedIn title and checks if our
-    company keywords appear in it. Falls back to checking the full
-    title + snippet if the title can't be parsed.
-    """
-    if not keywords:
-        return True  # Can't validate, let it through
-
-    title = item.get("title", "")
-
-    # Primary: check the company field extracted from the LinkedIn title
-    company_from_title = _extract_company_from_title(title)
-    if company_from_title:
-        return any(kw in company_from_title for kw in keywords)
-
-    # Fallback: if we couldn't parse a company from the title,
-    # check the full title + snippet (less strict but better than nothing)
-    text = (title + " " + item.get("snippet", "")).lower()
-    return any(kw in text for kw in keywords)
-
-
 def _extract_role_from_title(title: str) -> str:
     """
     Extract the role/title portion from a LinkedIn search result title.

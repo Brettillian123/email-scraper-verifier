@@ -45,7 +45,6 @@ TestSendStatus = Literal[
 
 HARD_BOUNCE_REASON_DEFAULT = "hard_bounce"
 SOFT_BOUNCE_REASON_DEFAULT = "soft_bounce"
-DELIVERED_ASSUMED_REASON = "no_bounce_after_test_send"
 
 
 @dataclass(frozen=True)
@@ -444,71 +443,49 @@ def assume_delivered_for_stale_test_sends(
     """
     Mark "sent" test-sends older than cfg.delivered_after as delivered_assumed.
 
-    This sets:
+    This sets ONLY:
         test_send_status = 'delivered_assumed'
-        (optionally) verify_status / verify_reason:
 
-        - If verify_status is NULL, 'unknown_timeout', or 'risky_catch_all',
-          we upgrade to 'valid' with verify_reason = DELIVERED_ASSUMED_REASON.
-        - Otherwise we leave verify_status as-is (e.g. already valid/invalid).
+    verify_status is deliberately left alone.  "No bounce arrived" is not
+    evidence of delivery: silent-drop gateways discard unknown recipients
+    without ever emitting an NDR, and large tenants routinely accept at the
+    edge and bounce hours or days later.  Both failure modes bite hardest
+    exactly where this helper applies -- test-sends are escalated from
+    unknown_timeout on probe-hostile MX hosts (see
+    should_escalate_to_test_send), which are the providers least likely to
+    bounce promptly -- and on a catch-all domain nothing at the SMTP or bounce
+    layer can tell a real mailbox from a void at all.
+
+    Delivery-time evidence *can* clear a risky_catch_all, but it takes the
+    domain-level A/B proof in src.verify.delivery_catchall
+    (should_upgrade_risky_to_valid): on the same domain, one address that
+    delivered AND one known-bad address that hard-bounced 5.1.x "user
+    unknown".  Silence on its own is not that proof.
+
+    The 'delivered_assumed' marker is still written, so the evidence stays
+    available to that aggregation and to the UI.
     """
     if cfg is None:
         cfg = TestSendConfig()
     if now is None:
         now = _now_utc()
 
-    cutoff = now - cfg.delivered_after
-    cutoff_iso = _iso(cutoff)
+    cutoff_iso = _iso(now - cfg.delivered_after)
 
-    # Find candidate rows up front so we can count updates accurately.
-    cur = conn.execute(
-        """
-        SELECT id, verify_status
-        FROM verification_results
+    where = """
         WHERE test_send_status = 'sent'
           AND test_send_at IS NOT NULL
           AND test_send_at <= ?
-        """,
-        (cutoff_iso,),
-    )
-    rows = cur.fetchall()
+    """
+
+    # Count first so the return value is accurate across DB drivers.
+    rows = conn.execute("SELECT id FROM verification_results" + where, (cutoff_iso,)).fetchall()
     if not rows:
         return 0
 
-    updated = 0
-    for verif_id, verify_status in rows:
-        verif_id_int = int(verif_id)
-
-        # Always update the test_send_status.
-        conn.execute(
-            """
-            UPDATE verification_results
-            SET test_send_status = 'delivered_assumed'
-            WHERE id = ?
-            """,
-            (verif_id_int,),
-        )
-
-        if cfg.update_verify_status:
-            # Upgrade when we previously had no strong negative signal.
-            # This now includes risky_catch_all, because a real test-send
-            # that never bounces is strong evidence the mailbox is valid.
-            if (
-                verify_status is None
-                or verify_status == "unknown_timeout"
-                or verify_status == "risky_catch_all"
-            ):
-                conn.execute(
-                    """
-                    UPDATE verification_results
-                    SET verify_status = 'valid',
-                        verify_reason = ?
-                    WHERE id = ?
-                    """,
-                    (DELIVERED_ASSUMED_REASON, verif_id_int),
-                )
-
-        updated += 1
-
+    conn.execute(
+        "UPDATE verification_results SET test_send_status = 'delivered_assumed'" + where,
+        (cutoff_iso,),
+    )
     conn.commit()
-    return updated
+    return len(rows)

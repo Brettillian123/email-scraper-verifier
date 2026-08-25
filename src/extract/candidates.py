@@ -131,8 +131,19 @@ def _should_keep_candidate(cand: Candidate) -> bool:
 
 # --- Heuristics & regexes ----------------------------------------------------
 
+# Runs over attacker-controlled crawled text, so both halves are bounded on purpose:
+#   * local part {1,64}: the RFC 5321 4.5.3.1.1 maximum. An unbounded `+` rescans the
+#     whole run at every start offset -- and every `.`/`-`/`%` in a run is a \b, so
+#     "a."*n means n restarts of an O(n) scan. That, not the domain, is the quadratic:
+#     measured 4x per doubling, and 128KB of "a."*n took 63s in one findall().
+#   * domain as explicit labels: [A-Z0-9.-]+ contains the dot that the following \.
+#     must also match, so the two overlap and the domain backtracks over every
+#     position. Labels are 1-63 chars (RFC 1035) and cannot span a dot, so the split
+#     is unique and there is nothing to backtrack.
+# Tightening the domain also drops shapes that were never resolvable anyway
+# (a@b..com, a@-b.com, a@b-.com, a@.b.com, labels over 63 chars).
 EMAIL_RE = re.compile(
-    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    r"\b[A-Z0-9._%+-]{1,64}@(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,}\b",
     re.IGNORECASE,
 )
 

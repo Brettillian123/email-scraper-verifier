@@ -72,7 +72,7 @@ def admin_users_page(request: Request) -> HTMLResponse:
         metadata={"path": "/admin/users"},
     )
 
-    return templates.TemplateResponse("admin_users.html", {"request": request})
+    return templates.TemplateResponse(request, "admin_users.html", {"request": request})
 
 
 @router.get("/users/list")
@@ -259,6 +259,10 @@ def admin_metrics(request: Request) -> dict[str, object]:
     This is the primary R24 surface; it is also reused by the CLI (O20) and
     richer analytics endpoints (O17) as a quick summary.
     """
+    # Every other route in this file gates on superuser; these two did not.
+    # The data here is system-wide and crosses tenants, so a plain approved
+    # user must not reach it.
+    _require_superuser(request)
     summary = get_admin_summary()
 
     # Best-effort audit log; failures are swallowed inside log_admin_action.
@@ -296,6 +300,9 @@ def admin_analytics(
           "error_breakdown": { ... }
         }
     """
+    # See the note on /admin/metrics: cross-tenant data, superuser only.
+    _require_superuser(request)
+
     analytics = get_analytics_summary(
         window_days=window_days,
         top_domains=top_domains,
@@ -486,6 +493,7 @@ def admin_page(request: Request) -> HTMLResponse:
     )
 
     return templates.TemplateResponse(
+        request,
         "admin.html",
         {
             "request": request,

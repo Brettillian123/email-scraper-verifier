@@ -459,10 +459,10 @@
             emptyState.style.display = 'none';
 
             tbody.innerHTML = filteredUsers.map(user => `
-                <tr data-email="${user.email}">
-                    <td class="email-cell" title="${user.email}">
-                        ${user.email}
-                        ${user.display_name ? `<br><small style="color: #6b7280">${user.display_name}</small>` : ''}
+                <tr data-email="${escHtml(user.email)}">
+                    <td class="email-cell" title="${escHtml(user.email)}">
+                        ${escHtml(user.email)}
+                        ${user.display_name ? `<br><small style="color: #6b7280">${escHtml(user.display_name)}</small>` : ''}
                     </td>
                     <td>
                         ${user.is_superuser ? '<span class="badge badge-superuser">Superuser</span> ' : ''}
@@ -477,13 +477,27 @@
                     </td>
                 </tr>
             `).join('');
+
+            // One listener for every row's buttons.
+            tbody.querySelectorAll('button[data-act]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const email = btn.dataset.email;
+                    if (btn.dataset.act === 'approve') approveUser(email);
+                    else if (btn.dataset.act === 'reject') rejectUser(email);
+                    else if (btn.dataset.act === 'toggle') toggleActive(email);
+                });
+            });
         }
 
         function getActionButtons(user) {
+            // data-* + one delegated listener instead of inline onclick: an
+            // email containing a quote used to break straight out into JS.
+            const e = escHtml(user.email);
+
             if (!user.is_approved) {
                 return `
-                    <button class="btn btn-approve" onclick="approveUser('${user.email}')">Approve</button>
-                    <button class="btn btn-reject" onclick="rejectUser('${user.email}')">Reject</button>
+                    <button class="btn btn-approve" data-act="approve" data-email="${e}">Approve</button>
+                    <button class="btn btn-reject" data-act="reject" data-email="${e}">Reject</button>
                 `;
             }
 
@@ -492,8 +506,17 @@
             }
 
             return user.is_active
-                ? `<button class="btn btn-disable" onclick="toggleActive('${user.email}')">Disable</button>`
-                : `<button class="btn btn-enable" onclick="toggleActive('${user.email}')">Enable</button>`;
+                ? `<button class="btn btn-disable" data-act="toggle" data-email="${e}">Disable</button>`
+                : `<button class="btn btn-enable" data-act="toggle" data-email="${e}">Enable</button>`;
+        }
+
+        // user.email and user.display_name are attacker-chosen at registration
+        // and were being interpolated straight into innerHTML, including inside
+        // an onclick="" JS string. Everything user-supplied goes through this.
+        function escHtml(v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[c]);
         }
 
         function formatDate(dateStr) {

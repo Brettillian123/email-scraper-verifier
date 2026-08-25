@@ -20,6 +20,18 @@ but ONLY when the domain has:
 
     delivery_catchall_status = 'not_catchall_proven'
 
+NOTE (2026-08-19): do NOT delete this by analogy with the promotion that was
+removed from src/verify/test_send.py on the same day. That one upgraded
+risky_catch_all -> valid purely on absence of a bounce, with no evidence the
+domain was anything other than a catch-all, which is unsound: on a genuine
+catch-all (or a silent-drop gateway) no bounce is exactly what a nonexistent
+mailbox produces too.
+
+This script is different and is sound, because of the gate above: it only
+promotes on domains PROVEN not to be catch-all, where a delivered test-send
+really is positive evidence. The reason string is the same; the evidence
+standard is not.
+
 It is idempotent: once a row has been upgraded to 'valid', subsequent runs
 will skip it because verify_status != 'risky_catch_all'.
 

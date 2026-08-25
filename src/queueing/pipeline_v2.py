@@ -455,10 +455,12 @@ def _as_bool(x: Any, default: bool = False) -> bool:
 
 def _max_probes_per_person_env() -> int:
     """
-    Must match behavior in task_generate_emails (default 6).
+    Probe budget per person; shared with task_generate_emails (default 3).
     If >0, generation will enqueue probes itself.
     """
-    return max(0, _safe_int(os.getenv("MAX_PROBES_PER_PERSON", "6"), default=6))
+    from src.verify.candidates import max_probes_per_person
+
+    return max_probes_per_person()
 
 
 def _update_run_row(
@@ -837,8 +839,10 @@ def _enqueue(
 
 def _maybe_mark_run_complete_from_job() -> None:
     """
-    Check if the current job is the terminal stage for a pipeline run and,
-    if so, trigger run completion.
+    Per-company job boundary for the generate-fanout and verify-sweep stages.
+
+    Always beats the run heartbeat, then triggers run completion if this job is
+    the terminal stage.
     """
     from rq import get_current_job
 
@@ -848,10 +852,18 @@ def _maybe_mark_run_complete_from_job() -> None:
             return
         meta = job.meta or {}
 
+        run_id = meta.get("run_id")
+
+        # Heartbeat first: this fires on EVERY stage, terminal or not, so
+        # runs.updated_at keeps moving while the per-company jobs grind.
+        if run_id:
+            from src.queueing.tasks import _touch_run_heartbeat
+
+            _touch_run_heartbeat(run_id=str(run_id))
+
         if not meta.get("is_terminal_stage"):
             return
 
-        run_id = meta.get("run_id")
         tenant_id = str(meta.get("tenant_id") or "dev")
         company_id = meta.get("company_id")
         total = meta.get("total_companies")
@@ -955,6 +967,15 @@ def task_generate_company_emails(  # noqa: C901
         redis = _get_redis()
         q = Queue(name=generate_queue, connection=redis)
 
+        # Spend the probe budget where it pays best. A company with a trusted
+        # pattern (>=2 confirmed people) usually lands on the FIRST probe, so
+        # those people jump the queue ahead of companies we would be guessing
+        # at blind. 810 people currently sit at companies where a valid address
+        # is already known but have none of their own - this is that queue.
+        from src.verify.candidates import company_pattern_evidence, has_trusted_pattern
+
+        prioritised = has_trusted_pattern(company_pattern_evidence(con, company_id))
+
         # IMPORTANT: signature is task_generate_emails(person_id, first, last, domain)
         from src.queueing.tasks import task_generate_emails
 
@@ -967,6 +988,7 @@ def task_generate_company_emails(  # noqa: C901
                     first=first,
                     last=last,
                     domain=dom,
+                    at_front=prioritised,
                     job_timeout=job_timeout,
                     meta={
                         "run_id": run_id,
@@ -1045,7 +1067,7 @@ def verify_company_emails(  # noqa: C901
 
     This is a pragmatic heuristic to keep full runs from double-probing generated emails.
     """
-    from src.queueing.tasks import verify_email_task
+    from src.queueing.tasks import task_probe_email
 
     con = _get_conn()
     enqueued = 0
@@ -1087,8 +1109,12 @@ def verify_company_emails(  # noqa: C901
         for row in cur.fetchall() or []:
             try:
                 email_addr = (row[1] or "").strip()
-                if not email_addr:
+                if "@" not in email_addr:
                     continue
+
+                # task_probe_email persists against email_id; without it the
+                # probe result would be dropped on the floor.
+                email_id = int(row[0])
 
                 person_id = None
                 if has_person and len(row) >= 3:
@@ -1098,15 +1124,17 @@ def verify_company_emails(  # noqa: C901
                         person_id = None
 
                 q.enqueue(
-                    verify_email_task,
+                    task_probe_email,
+                    email_id=email_id,
                     email=email_addr,
-                    company_id=company_id,
-                    person_id=person_id,
+                    domain=email_addr.split("@", 1)[1].lower(),
+                    force=False,
                     meta={
                         "run_id": run_id,
                         "tenant_id": tenant_id,
                         "company_id": company_id,
-                        "stage": "verify_email_task",
+                        "person_id": person_id,
+                        "stage": "task_probe_email",
                         "only_with_source_url": only_with_source_url,
                     },
                 )

@@ -219,16 +219,18 @@ def _classify_hard_invalid(
     *,
     rcpt_category: str | None,
     is_5xx: bool,
-    fallback_status: str | None,
 ) -> tuple[VerifyStatus, str] | None:
     """
-    Handle hard invalids (5xx / undeliverable), optionally overridden by fallback.
+    Handle hard invalids (5xx / undeliverable).
+
+    A 5xx "user unknown" from the domain's own MX is the strongest negative
+    signal SMTP offers, and it is authoritative: that server owns the mailbox.
+    Nothing overturns it -- least of all a third-party vendor, whose "deliverable"
+    is at best a cached guess about an address the authority just rejected.
     """
     if rcpt_category != "undeliverable" and not is_5xx:
         return None
 
-    if fallback_status == "deliverable":
-        return "valid", "fallback_valid_overrides_rcpt_5xx"
     return "invalid", "rcpt_5xx_user_unknown"
 
 
@@ -236,52 +238,36 @@ def _classify_good_rcpt(
     *,
     good_rcpt: bool,
     catch_all_status: str | None,
-    fallback_status: str | None,
 ) -> tuple[VerifyStatus, str] | None:
     """
     Handle good (2xx / deliverable) RCPT paths, including catch-all logic.
 
     Policy:
 
-      - Confirmed catch-all domains ("catch_all") Ã¢â€ â€™ risky_catch_all
-        (or invalid if fallback says undeliverable).
-      - Non-catch-all ("not_catch_all") AND unknown/None catch-all status:
-        treat 2xx as valid by default.
-      - Fallback "deliverable" can upgrade the reason string but not downgrade
-        confirmed catch-all to valid.
+      - "not_catch_all" -> valid.  We have positive proof the server
+        distinguishes real mailboxes from made-up ones, so its 2xx means
+        something about *this* local-part.
+      - "catch_all" -> risky_catch_all.  The server accepts every local-part,
+        so the 2xx carries no information about this mailbox.
+      - unknown / None -> risky_catch_all.  We never established that the
+        domain distinguishes mailboxes, so the 2xx is equally unconfirmable.
+        Calling it "valid" asserts something we did not measure; re-running the
+        R17 catch-all probe is what resolves it.
+
+    A fallback/vendor opinion is deliberately not consulted here.  It observes
+    the same RCPT channel we just did, so it adds no independent evidence, and
+    on a catch-all domain no observer can tell a real mailbox from a void.
     """
     if not good_rcpt:
         return None
 
-    # Explicit non-catch-all: 2xx is fully trusted.
     if catch_all_status == "not_catch_all":
-        if fallback_status == "deliverable":
-            return "valid", "rcpt_2xx_non_catchall_fallback_valid"
         return "valid", "rcpt_2xx_non_catchall"
 
-    # Confirmed catch-all: structurally risky.
     if catch_all_status == "catch_all":
-        if fallback_status == "undeliverable":
-            return "invalid", "rcpt_2xx_catchall_fallback_invalid"
-        # Keep as risky even if vendor says deliverable; domain-level
-        # catch-all is a structural risk.
         return "risky_catch_all", "rcpt_2xx_catchall"
 
-    # Unknown / None catch-all status:
-    # The domain's catch-all check failed, timed out, or was never run.
-    # A 2xx RCPT is still a strong positive signal — the server explicitly
-    # accepted this specific recipient.  Catch-all domains are a minority;
-    # defaulting to "risky" here floods the pipeline with false unknowns
-    # and blocks downstream processing for the majority of legitimate emails.
-    #
-    # Policy: treat 2xx with unknown catch-all as provisionally valid.
-    # If catch-all status is later determined, a backfill can downgrade.
-    if fallback_status == "deliverable":
-        return "valid", "rcpt_2xx_catchall_unknown_fallback_deliverable"
-    if fallback_status == "undeliverable":
-        # Vendor disagrees with the 2xx — genuinely ambiguous, stay risky.
-        return "risky_catch_all", "rcpt_2xx_catchall_unknown_fallback_invalid"
-    return "valid", "rcpt_2xx_catchall_unconfirmed"
+    return "risky_catch_all", "rcpt_2xx_catchall_unconfirmed"
 
 
 def _classify_soft_fail(
@@ -294,26 +280,28 @@ def _classify_soft_fail(
     Handle tempfail / timeout / blocked outcomes combined with fallback.
 
     Strategy:
-      - If a vendor has a strong opinion, trust it.
-      - Otherwise, if the domain is known catch-all, treat as risky.
-      - Otherwise, we're stuck with an unknown timeout-style outcome.
+      - A confirmed catch-all domain is unconfirmable by anyone, so that
+        structural fact is checked first and no vendor opinion can make it
+        "valid".
+      - Otherwise we have no signal of our own at all, so a vendor opinion is
+        the only evidence available and we take it.
+      - Otherwise we're stuck with an unknown timeout-style outcome.
     """
     if not soft_fail:
         return None
+
+    # Known catch-all: this RCPT told us nothing, and a vendor probing the same
+    # channel cannot do better. The structural risk stands.
+    if catch_all_status == "catch_all":
+        return "risky_catch_all", "catchall_softfail"
 
     if fallback_status == "deliverable":
         return "valid", "fallback_valid_after_tempfail"
     if fallback_status == "undeliverable":
         return "invalid", "fallback_invalid_after_tempfail"
 
-    # No vendor opinion. If we *do* know the domain is catch-all, that
-    # structural property is still meaningful: it's a risky target even
-    # if this specific RCPT timed out.
-    if catch_all_status == "catch_all":
-        return "risky_catch_all", "catchall_softfail_no_fallback"
-
-    # Otherwise we're genuinely in the dark: the mailbox might exist,
-    # might not, and we only saw tempfail/timeout/blocked.
+    # Genuinely in the dark: the mailbox might exist, might not, and we only
+    # saw tempfail/timeout/blocked.
     return "unknown_timeout", "tempfail_or_timeout"
 
 
@@ -348,14 +336,13 @@ def classify(
     Order of operations (roughly):
 
       1. TTL staleness check.
-      2. Hard invalids (5xx / undeliverable), unless overridden by fallback.
+      2. Hard invalids (5xx / undeliverable) -- final, never overridden.
       3. 2xx / deliverable RCPT:
-         - confirmed catch-all Ã¢â€ â€™ risky
-         - non-catch-all or unknown Ã¢â€ â€™ valid (with distinct reasons)
-           or risky/invalid with fallback.
-      4. Tempfail / timeout / blocked, combined with fallback + catch-all.
-      5. Fallback-only classifications.
-      6. No strong signals Ã¢â€ â€™ unknown_timeout / no_verification_attempt.
+         - proven non-catch-all -> valid
+         - confirmed or unconfirmed catch-all -> risky_catch_all
+      4. Tempfail / timeout / blocked, combined with catch-all + fallback.
+      5. Fallback-only classifications (no RCPT of our own at all).
+      6. No strong signals -> unknown_timeout / no_verification_attempt.
     """
     rcpt_category_raw = _norm(signals.rcpt_category)
     rcpt_category = _norm_rcpt_category(rcpt_category_raw)
@@ -384,7 +371,6 @@ def classify(
     result = _classify_hard_invalid(
         rcpt_category=rcpt_category,
         is_5xx=is_5xx,
-        fallback_status=fallback_status,
     )
     if result is not None:
         return result
@@ -395,7 +381,6 @@ def classify(
     result = _classify_good_rcpt(
         good_rcpt=good_rcpt,
         catch_all_status=catch_all_status,
-        fallback_status=fallback_status,
     )
     if result is not None:
         return result

@@ -83,27 +83,6 @@ def _getenv_bool(name: str, default: bool) -> bool:
     return True
 
 
-def _parse_intervals(v: str | None) -> list[int]:
-    """
-    Parse a CSV list of retry intervals in seconds.
-
-    If unset/empty, returns sensible defaults: [60, 300, 900] (1m, 5m, 15m).
-    """
-    if not v:
-        return [60, 300, 900]
-    out: list[int] = []
-    for tok in (t.strip() for t in v.split(",")):
-        if not tok:
-            continue
-        try:
-            out.append(int(tok))
-        except ValueError as err:
-            raise ValueError(
-                f"VERIFY_RETRY_INTERVALS must be a CSV of integers; got {v!r}"
-            ) from err
-    return out
-
-
 # ---------------------------------------------------------------------------
 # .env loading and identity
 # ---------------------------------------------------------------------------
@@ -343,13 +322,6 @@ THIRD_PARTY_VERIFY_ENABLED: bool = _getenv_bool(
 )
 
 # ---------------------------------------------------------------------------
-# O14/R23: Facets materialized view flag
-# ---------------------------------------------------------------------------
-
-FACET_USE_MV: bool = _getenv_bool("FACET_USE_MV", False)
-
-
-# ---------------------------------------------------------------------------
 # Structured config classes
 # ---------------------------------------------------------------------------
 
@@ -425,6 +397,9 @@ class RetryTimeoutConfig:
     smtp_connect_timeout_seconds: int
     smtp_cmd_timeout_seconds: int
     retry_schedule: list[int]
+    #: Deferred-requeue waits for a 4xx RCPT. Greylisting needs 300s+, so the
+    #: job-level retry_schedule (5s..180s) can never satisfy it.
+    greylist_retry_schedule: list[int]
 
 
 @dataclass(frozen=True)
@@ -523,6 +498,7 @@ def load_settings() -> AppConfig:
             _getenv_int("SMTP_COMMAND_TIMEOUT_SECONDS", SMTP_COMMAND_TIMEOUT),
         ),
         retry_schedule=_getenv_list_int("RETRY_SCHEDULE", "5,15,45,90,180"),
+        greylist_retry_schedule=_getenv_list_int("GREYLIST_RETRY_SCHEDULE", "60,300,900"),
     )
 
     smtp_identity = SmtpIdentityConfig(
@@ -698,8 +674,6 @@ __all__ = [
     "THIRD_PARTY_VERIFY_URL",
     "THIRD_PARTY_VERIFY_API_KEY",
     "THIRD_PARTY_VERIFY_ENABLED",
-    # O14/R23 facets MV flag
-    "FACET_USE_MV",
     # Bot identity
     "BOT_NAME",
     "BOT_NAME_ALIAS",

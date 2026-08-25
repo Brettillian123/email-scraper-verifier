@@ -4,10 +4,13 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import threading
+import time
 
 from rq import Queue
 from rq import SimpleWorker as RQSimpleWorker
 from rq import Worker as RQWorker
+from rq.scheduler import RQScheduler
 
 from src.config import load_settings
 from src.queueing import tasks as _tasks  # noqa: F401  (ensure task module is imported)
@@ -91,6 +94,38 @@ def _select_worker_cls():
     return RQWorker
 
 
+def _start_inline_scheduler(queues: list[Queue], connection, interval: int = 15) -> None:
+    """
+    Promote due scheduled jobs from a thread, for the SimpleWorker path.
+
+    SimpleWorker never gets with_scheduler=True (see run() below), so RQ's
+    forking scheduler subprocess never starts and anything delayed --
+    Retry(interval=...), enqueue_in, enqueue_at -- sits in ScheduledJobRegistry
+    forever. It enqueues without error and never fires, which is the exact
+    class of invisible failure this deployment already has too much of.
+
+    enqueue_scheduled_jobs() is a plain synchronous Redis call, no fork, so it
+    is safe here. Do NOT call scheduler.work() instead: it installs signal
+    handlers, which raises off the main thread.
+    """
+    scheduler = RQScheduler(queues, connection=connection, interval=interval)
+    if not scheduler.acquire_locks():
+        log.info("inline scheduler: locks held by another worker, skipping")
+        return
+
+    def _loop() -> None:
+        while True:
+            try:
+                scheduler.enqueue_scheduled_jobs()
+                scheduler.heartbeat()
+            except Exception:
+                log.exception("inline scheduler: promotion pass failed")
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True, name="inline-scheduler").start()
+    log.info("inline scheduler started (interval=%ss)", interval)
+
+
 def run():
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -137,7 +172,9 @@ def run():
     if worker_cls is RQWorker:
         w.work(with_scheduler=True)
     else:
-        # SimpleWorker path (Windows): no scheduler, no signals
+        # SimpleWorker path (Windows): no forking scheduler, so run the
+        # promotion pass inline or delayed jobs never leave the registry.
+        _start_inline_scheduler(queues, r)
         w.work()
 
 

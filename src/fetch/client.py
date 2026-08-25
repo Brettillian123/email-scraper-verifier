@@ -4,12 +4,16 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from . import cache as http_cache
 from . import robots, throttle
+from .ssrf import SSRFBlocked, safe_get
 
 # --------------------------------------------------------------------------------------------------
 # Public constants (the testkit may probe these by alternate names)
@@ -69,7 +73,16 @@ class FetchResult:
     body: bytes | None
     from_cache: bool
     reason: str  # "fresh-cache" | "validated-cache" | "network"
-    #        | "blocked-by-robots" | "waf-throttle" | "error"
+    #        | "blocked-by-robots" | "blocked-ssrf:*" | "waf-throttle" | "error"
+    #        | "throttle-budget"
+    # Seconds this call spent asleep (per-host pacing + retry backoff). Callers that
+    # enforce a wall-clock budget need this so politeness waiting is not charged
+    # against time meant for productive work.
+    waited_s: float = 0.0
+    # True when the raw body exceeded max_body_bytes. `body` is truncated to the cap;
+    # callers that would rather skip an oversized page than parse a partial one check
+    # this flag instead of measuring len(body).
+    oversize: bool = False
 
 
 class RobotsDisallowed(RuntimeError):
@@ -94,12 +107,39 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _cap_body(body: bytes | None) -> bytes | None:
+def _cap_body(body: bytes | None, limit: int = FETCH_MAX_READ_BYTES) -> tuple[bytes | None, bool]:
+    """Return (body_capped_to_limit, was_oversize)."""
     if body is None:
+        return None, False
+    if len(body) > limit:
+        return body[:limit], True
+    return body, False
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """
+    Parse a Retry-After header into seconds, accepting both the delta-seconds and the
+    HTTP-date forms. Returns None when absent or unparseable so the caller falls back
+    to its own backoff. The value is a *floor* for backoff, not a ceiling -- callers
+    clamp it (throttle.penalize caps at MAX_BACKOFF_S).
+    """
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if not raw:
         return None
-    if len(body) > FETCH_MAX_READ_BYTES:
-        return body[:FETCH_MAX_READ_BYTES]
-    return body
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return max(0.0, (dt - datetime.now(UTC)).total_seconds())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -113,13 +153,13 @@ class FetcherClient:
 
     Flow:
       1) robots.is_allowed(host, path) → if False: blocked result (or raise)
-      2) throttle.wait_for_turn(host)
-      3) cache.get(url) → if fresh: return
-      4) http GET with conditionals from cache
-      5) On 200: cache.store_200; throttle.after_response(2xx)
+         (skipped when enforce_robots=False, for callers that gate robots themselves)
+      2) cache.get(url) → if fresh: return without sleeping or touching the network
+      3) per attempt: throttle.wait_for_turn(host), then http GET with conditionals
+      4) On 200: cache.store_200; throttle.after_response(2xx)
          On 304: cache.store_304; throttle.after_response(304)
-         On 403/429: throttle.penalize; return throttled
-         On >=500: retry with exponential backoff (not the WAF cooloff)
+         On 403/429: throttle.penalize (honoring Retry-After), then retry
+         On >=500: throttle + exponential retry backoff
     """
 
     def __init__(
@@ -128,26 +168,50 @@ class FetcherClient:
         user_agent: str | None = None,
         cache_db: str | None = None,
         raise_on_disallow: bool = False,
+        enforce_robots: bool = True,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_body_bytes: int | None = None,
     ) -> None:
         self.user_agent = user_agent or FETCH_USER_AGENT
         self.raise_on_disallow = raise_on_disallow
+        # enforce_robots=False is for callers that already run their own robots gate
+        # (the crawler does, with block explainability logging) and would otherwise pay
+        # for the check twice. It never means "ignore robots" -- see fetch().
+        self.enforce_robots = enforce_robots
+        self.max_body_bytes = int(max_body_bytes) if max_body_bytes else FETCH_MAX_READ_BYTES
         # Use a singleton cache unless a specific db is requested
         self.cache = http_cache.default() if cache_db is None else http_cache.Cache(cache_db)
 
         self._client = httpx.Client(
             headers={"User-Agent": self.user_agent, "Accept": FETCH_ACCEPT},
-            timeout=httpx.Timeout(READ_TIMEOUT_S, connect=CONNECT_TIMEOUT_S),
-            follow_redirects=True,
+            timeout=httpx.Timeout(
+                READ_TIMEOUT_S if read_timeout is None else read_timeout,
+                connect=CONNECT_TIMEOUT_S if connect_timeout is None else connect_timeout,
+            ),
+            # Redirects are driven by ssrf.safe_get() instead, so that every hop
+            # is re-validated. URLs here come from scraped, attacker-controlled
+            # domains; httpx would follow a 302 into the private network blind.
+            follow_redirects=False,
             max_redirects=MAX_REDIRECTS,
         )
 
     # ---- core fetch ------------------------------------------------------------------
 
-    def fetch(self, url: str) -> FetchResult:
+    def fetch(self, url: str, *, max_wait_s: float | None = None) -> FetchResult:
+        """
+        Fetch `url` politely.
+
+        `max_wait_s` bounds how long this call may sleep waiting for the host's pacing
+        window. When the required wait exceeds it, the call returns immediately with
+        reason="throttle-budget" instead of sleeping, so a caller under a wall-clock
+        budget can give up on a host that has told us to back off for a long time
+        rather than burning its whole budget asleep.
+        """
         host, path = _split_host_path(url)
 
         # (1) robots gate
-        if not robots.is_allowed(host, path):
+        if self.enforce_robots and not robots.is_allowed(host, path):
             if self.raise_on_disallow:
                 raise RobotsDisallowed(f"Blocked by robots.txt for host={host} path={path}")
             return FetchResult(
@@ -160,29 +224,29 @@ class FetcherClient:
                 reason="blocked-by-robots",
             )
 
-        # (2) politeness wait (crawl-delay aware via throttle)
-        throttle.wait_for_turn(host)
-
-        # (3) cache check
+        # (2) cache check -- BEFORE the politeness wait. A fresh hit touches no socket,
+        # so pacing it would slow re-crawls to the speed of a cold crawl and defeat the
+        # point of the cache. It also must not advance the host's window.
         entry, is_fresh = self.cache.get(url)
         if is_fresh and entry is not None:
-            throttle.after_response(host, 304)  # treat like a quick validated hit
-            body = _cap_body(entry.body if entry.body is not None else None)
+            body, oversize = _cap_body(entry.body, self.max_body_bytes)
             return FetchResult(
                 status=entry.status,
                 url=url,
-                effective_url=f"{entry.scheme}://{entry.host}{entry.path}",
+                effective_url=(entry.effective_url or f"{entry.scheme}://{entry.host}{entry.path}"),
                 content_type=entry.content_type,
                 body=body,
                 from_cache=True,
                 reason="fresh-cache",
+                oversize=oversize,
             )
 
         # Prepare conditional headers if we have a cache entry
         headers = self.cache.conditionals(url) if entry is not None else {}
 
-        # (4) network fetch / response handling
-        return self._do_request_with_retries(url, headers, host)
+        # (3) politeness wait + network fetch / response handling. The wait lives inside
+        # the retry loop so that a retry after a 429 actually serves out the backoff.
+        return self._do_request_with_retries(url, headers, host, max_wait_s=max_wait_s)
 
     # ----------------------------------------------------------------------------------
     # Convenience methods
@@ -195,11 +259,56 @@ class FetcherClient:
     # Internals
     # ----------------------------------------------------------------------------------
 
-    def _do_request_with_retries(self, url: str, headers: dict[str, str], host: str) -> FetchResult:
+    def _do_request_with_retries(
+        self,
+        url: str,
+        headers: dict[str, str],
+        host: str,
+        *,
+        max_wait_s: float | None = None,
+    ) -> FetchResult:
         attempt = 0
+        waited = 0.0
         while True:
+            # Politeness wait, re-evaluated on every attempt. Doing this inside the loop
+            # (rather than once before it) is what makes a retry after a 429/5xx actually
+            # serve out the backoff that penalize()/after_response() just scheduled.
+            pending = throttle.next_allowed_at(host) - _now()
+            if max_wait_s is not None and pending > max_wait_s:
+                return FetchResult(
+                    status=429,
+                    url=url,
+                    effective_url=url,
+                    content_type=None,
+                    body=None,
+                    from_cache=False,
+                    reason="throttle-budget",
+                    waited_s=waited,
+                )
+            waited += throttle.wait_for_turn(host)
+
             try:
-                resp = self._client.get(url, headers=headers)
+                resp = safe_get(
+                    self._client,
+                    url,
+                    max_hops=MAX_REDIRECTS,
+                    headers=headers,
+                    # Bound the DECOMPRESSED read. _cap_body below only
+                    # truncates what is already in memory, which is too late
+                    # against a gzip bomb.
+                    max_bytes=self.max_body_bytes,
+                )
+            except SSRFBlocked as exc:
+                return FetchResult(
+                    status=451,
+                    url=url,
+                    effective_url=url,
+                    content_type=None,
+                    body=None,
+                    from_cache=False,
+                    reason=f"blocked-ssrf:{exc}",
+                    waited_s=waited,
+                )
             except httpx.RequestError as exc:
                 status = 599
                 throttle.after_response(host, status)
@@ -212,35 +321,50 @@ class FetcherClient:
                         body=None,
                         from_cache=False,
                         reason=f"error:{type(exc).__name__}",
+                        waited_s=waited,
                     )
-                self._sleep_retry(attempt)
+                waited += self._sleep_retry(attempt)
                 attempt += 1
                 continue
 
             status = int(resp.status_code)
+            retry_after = _retry_after_seconds(resp.headers)
 
             if status == 304:
                 self.cache.store_304(url, resp.headers)
                 throttle.after_response(host, 304)
                 fresh_entry, _ = self.cache.get(url)
-                body = _cap_body(fresh_entry.body if (fresh_entry and fresh_entry.body) else None)
+                body, oversize = _cap_body(
+                    fresh_entry.body if (fresh_entry and fresh_entry.body) else None,
+                    self.max_body_bytes,
+                )
                 content_type = (
                     fresh_entry.content_type if fresh_entry else resp.headers.get("Content-Type")
                 )
                 return FetchResult(
                     status=fresh_entry.status if fresh_entry else 304,
                     url=url,
-                    effective_url=str(resp.url),
+                    effective_url=(
+                        (fresh_entry.effective_url if fresh_entry else None) or str(resp.url)
+                    ),
                     content_type=content_type,
                     body=body,
                     from_cache=True,
                     reason="validated-cache",
+                    waited_s=waited,
+                    oversize=oversize,
                 )
 
             if 200 <= status < 300:
-                body = _cap_body(resp.content or b"")
+                body, oversize = _cap_body(resp.content or b"", self.max_body_bytes)
                 ct = resp.headers.get("Content-Type")
-                self.cache.store_200(url, status, ct, body, resp.headers)
+                # An oversized response is deliberately NOT cached: we only hold a
+                # truncated prefix, and replaying that as a cache hit would hand the
+                # caller a partial page that no longer looks oversized.
+                if not oversize:
+                    self.cache.store_200(
+                        url, status, ct, body, resp.headers, effective_url=str(resp.url)
+                    )
                 throttle.after_response(host, status)
                 return FetchResult(
                     status=status,
@@ -250,22 +374,35 @@ class FetcherClient:
                     body=body,
                     from_cache=False,
                     reason="network",
+                    waited_s=waited,
+                    oversize=oversize,
                 )
 
             if status in (403, 429):
-                throttle.penalize(host)
-                return FetchResult(
-                    status=status,
-                    url=url,
-                    effective_url=str(resp.url),
-                    content_type=resp.headers.get("Content-Type"),
-                    body=None,
-                    from_cache=False,
-                    reason="waf-throttle",
-                )
+                # WAF / rate limit. Schedule an exponential cool-off (honoring
+                # Retry-After when the server sent one), then retry -- the wait at the
+                # top of the loop serves the cool-off. Previously this returned straight
+                # away, which permanently lost the page on a transient 429.
+                throttle.penalize(host, min_seconds=retry_after)
+                if attempt >= FETCH_MAX_RETRIES:
+                    return FetchResult(
+                        status=status,
+                        url=url,
+                        effective_url=str(resp.url),
+                        content_type=resp.headers.get("Content-Type"),
+                        body=None,
+                        from_cache=False,
+                        reason="waf-throttle",
+                        waited_s=waited,
+                    )
+                attempt += 1
+                continue
 
             if status >= 500:
-                throttle.after_response(host, status)
+                if retry_after is not None:
+                    throttle.penalize(host, min_seconds=retry_after)
+                else:
+                    throttle.after_response(host, status)
                 if attempt >= FETCH_MAX_RETRIES:
                     return FetchResult(
                         status=status,
@@ -275,8 +412,9 @@ class FetcherClient:
                         body=None,
                         from_cache=False,
                         reason="error:server",
+                        waited_s=waited,
                     )
-                self._sleep_retry(attempt)
+                waited += self._sleep_retry(attempt)
                 attempt += 1
                 continue
 
@@ -290,12 +428,14 @@ class FetcherClient:
                 body=None,
                 from_cache=False,
                 reason="network",
+                waited_s=waited,
             )
 
-    def _sleep_retry(self, attempt: int) -> None:
+    def _sleep_retry(self, attempt: int) -> float:
         # Basic exponential backoff for 5xx/RequestError; tests can monkeypatch time.sleep
         delay = RETRY_BASE_S * (2**attempt)
         time.sleep(delay)
+        return delay
 
     # ----------------------------------------------------------------------------------
     # Context manager

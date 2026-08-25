@@ -117,19 +117,29 @@ def mark_ok(host: str, crawl_delay_s: float | None = None) -> float:
         return delay
 
 
-def penalize(host: str) -> float:
+def penalize(host: str, min_seconds: float | None = None) -> float:
     """
     Record a WAF block (429 or 403). Increase backoff exponentially and schedule it.
     Returns the cool-off seconds that were scheduled.
     Policy: backoff = min(MAX_BACKOFF_S, BASE_BACKOFF_S * 2**strikes)
       where strikes increments on each penalize() call.
       This yields first backoff of 2 * BASE (e.g., 6s for base=3s).
+
+    `min_seconds` raises the floor of that backoff. It exists so a caller can pass a
+    server-supplied Retry-After: when the origin tells us how long to stay away, that
+    wins over our own guess -- but only upwards, and still clamped to MAX_BACKOFF_S so
+    a hostile or broken `Retry-After: 86400` cannot park a host for a day.
     """
     host = host.strip().lower()
     with _host_lock(host):
         st = _state(host)
         st.waf_strikes += 1
         backoff = BASE_BACKOFF_S * (2**st.waf_strikes)
+        if min_seconds is not None:
+            try:
+                backoff = max(backoff, float(min_seconds))
+            except (TypeError, ValueError):
+                pass
         if backoff > MAX_BACKOFF_S:
             backoff = MAX_BACKOFF_S
         now = _now()

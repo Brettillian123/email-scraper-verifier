@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -43,7 +43,6 @@ from src.db import (
 )
 from src.db_pages import save_pages
 from src.exceptions import PermanentSMTPError, TemporarySMTPError
-from src.extract.candidates import ROLE_ALIASES
 from src.extract.candidates import Candidate as ExtractCandidate
 from src.extract.candidates import extract_candidates as extract_html_candidates
 
@@ -85,11 +84,10 @@ except Exception:  # pragma: no cover
 # O26: role/placeholder handling
 from src.emails.classify import is_role_or_placeholder_email
 from src.generate.patterns import (
-    PATTERNS as CANON_PATTERNS,  # keys of canonical patterns (e.g., "first.last")
-)
-from src.generate.patterns import (
-    generate_candidate_emails_for_person,  # O26 canonical generator
-    infer_domain_pattern,  # O01 canonical inference
+    RENDERABLE_PATTERNS,  # canonical pattern names that can be built into an address
+    first_name_dictionary,  # cached folded first names, for shape inference
+    record_inferred_patterns,  # what a company's PUBLISHED addresses imply
+    record_pattern_outcome,  # per-company evidence: remembers hits AND misses
 )
 from src.ingest.normalize import (
     normalize_row,  # R13 lightweight full-row normalization
@@ -110,8 +108,20 @@ from src.queueing.rate_limit import (
 from src.queueing.redis_conn import get_redis
 from src.resolve.domain import resolve
 from src.resolve.mx import resolve_mx as _resolve_mx  # R15
+from src.verify.candidates import (  # evidence-ranked probe planning
+    catchall_confidence,
+    company_employee_count,
+    company_pattern_evidence,
+    has_trusted_pattern,
+    max_probes_per_person,
+    rank_candidates,
+)
 from src.verify.catchall import check_catchall_for_domain  # R17 domain-level catch-all
-from src.verify.smtp import probe_rcpt  # R16 SMTP probe core
+from src.verify.smtp import (  # R16 SMTP probe core
+    is_greylist_deferral,
+    probe_rcpt,
+    probe_rcpt_batch,  # one session, several RCPTs
+)
 from src.verify.status import (
     VerificationSignals,
     classify,  # R18 classifier
@@ -270,6 +280,35 @@ def _track_company_completion(*, run_id: str, tenant_id: str, company_id: int, t
             pass
 
     return True
+
+
+def _touch_run_heartbeat(*, run_id: str) -> None:
+    """Bump runs.updated_at so the reaper can tell a working run from a dead one.
+
+    The reaper judges liveness from runs.updated_at, but fan-out finishes in
+    seconds while the real work runs for hours in separate per-company RQ jobs.
+    This is the worker-side heartbeat: one tiny UPDATE at each per-company job
+    boundary, on every stage (not just the terminal one), so updated_at keeps
+    moving for as long as companies keep completing.
+
+    Best-effort by contract: it must never fail the job it rides on.
+    """
+    con = None
+    try:
+        con = _conn()
+        con.execute(
+            "UPDATE runs SET updated_at = ? WHERE id = ? AND status IN ('queued','running')",
+            (_utc_now_iso_z(), run_id),
+        )
+        con.commit()
+    except Exception:
+        log.debug("run heartbeat failed", exc_info=True, extra={"run_id": run_id})
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        except Exception:
+            pass
 
 
 def _check_run_completion(
@@ -493,6 +532,17 @@ def smtp_probe(email: str, helo_domain: str) -> tuple[str, str]:
     return ("unknown", "stub_not_verified")
 
 
+class ThrottledError(TemporarySMTPError):
+    """We hit our own concurrency/RPS cap and never opened the connection.
+
+    Distinct from TemporarySMTPError, which means the *MX* asked us to come
+    back later -- that is a (weak) signal about the address.  A throttle is a
+    signal about us, and must never be written to verification_results as a
+    verdict: doing so freezes "we did not get to ask" into a terminal row that
+    no sweep will revisit.
+    """
+
+
 def _bool_env(name: str) -> str | None:
     """
     Return '1' or '0' if explicitly set, otherwise None.
@@ -550,6 +600,9 @@ def verify_email_task(  # noqa: C901
     status: str = "unknown"
     reason: str | None = "unstarted"
 
+    # A throttle means we never asked; nothing gets written in that case.
+    persist_result = True
+
     got_global = False
     got_mx = False
 
@@ -569,11 +622,11 @@ def verify_email_task(  # noqa: C901
         # ---- Acquire concurrency semaphores ----
         got_global = try_acquire(redis, GLOBAL_SEM, _cfg.rate.global_max_concurrency)
         if not got_global:
-            raise TemporarySMTPError("global concurrency cap reached")
+            raise ThrottledError("global concurrency cap reached")
 
         got_mx = try_acquire(redis, mx_key, _cfg.rate.per_mx_max_concurrency_default)
         if not got_mx:
-            raise TemporarySMTPError("per-MX concurrency cap reached")
+            raise ThrottledError("per-MX concurrency cap reached")
 
         # Record/advance job attempt counter
         if job:
@@ -592,7 +645,7 @@ def verify_email_task(  # noqa: C901
             key_global_rps,
             int(_cfg.rate.global_rps),
         ):
-            raise TemporarySMTPError("global RPS throttle")
+            raise ThrottledError("global RPS throttle")
 
         # Optional RPS smoothing (per MX)
         if _cfg.rate.per_mx_rps_default and not can_consume_rps(
@@ -600,7 +653,7 @@ def verify_email_task(  # noqa: C901
             key_mx_rps,
             int(_cfg.rate.per_mx_rps_default),
         ):
-            raise TemporarySMTPError("MX RPS throttle")
+            raise ThrottledError("MX RPS throttle")
 
         # ---- Probe (Tenacity handles retries on TemporarySMTPError) ----
         verify_status, probe_reason = smtp_probe(
@@ -650,9 +703,16 @@ def verify_email_task(  # noqa: C901
             # Propagate to RQ -> Failed/DLQ
             raise
 
+    except ThrottledError as e:
+        # We hit our own cap and never opened a connection, so we learned
+        # nothing about this address. Recording "unknown" here would freeze a
+        # non-answer into a terminal row.
+        persist_result = False
+        status, reason = "unknown", (str(e) or "throttled")
+
     except TemporarySMTPError as e:
-        # Throttling / soft failure; do not re-raise by default.
-        status, reason = "unknown", (str(e) or "temp_error")
+        # The MX asked us to come back later; do not re-raise by default.
+        status, reason = "unknown_timeout", (str(e) or "temp_error")
         latency_ms = int((time.perf_counter() - start) * 1000)
         log.warning(
             "temporary failure handled",
@@ -687,7 +747,7 @@ def verify_email_task(  # noqa: C901
         # Idempotent UPSERT on every outcome (success, temp/perm error, crash)
         try:
             resolved_email_id = email_id
-            if resolved_email_id is None:
+            if resolved_email_id is None and persist_result:
                 con_db = None
                 try:
                     con_db = _conn()
@@ -753,7 +813,15 @@ def verify_email_task(  # noqa: C901
 
             ts_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            if resolved_email_id is None:
+            if not persist_result:
+                # Leaving verification_results untouched is exactly what makes
+                # this retryable: the verify sweep selects emails that have no
+                # verification row, so the address is picked up again.
+                log.info(
+                    "throttled before probe: no verification result persisted",
+                    extra={"email": email, "mx": mx_host, "reason": reason},
+                )
+            elif resolved_email_id is None:
                 log.warning(
                     "skip upsert_verification_result: missing email_id",
                     extra={
@@ -1980,11 +2048,180 @@ def _maybe_escalate_to_test_send(
     )
 
 
+_DEFINITIVE_VERIFY_STATUSES = frozenset({"valid", "invalid", "risky_catch_all"})
+
+
+def _existing_definitive_status(email_id: int) -> str | None:
+    """Best-effort lookup of an already-decided verify_status for email_id."""
+    try:
+        con = get_conn()
+    except Exception:
+        return None
+    try:
+        row = con.execute(
+            "SELECT verify_status FROM verification_results WHERE email_id = ?",
+            (int(email_id),),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    if not row:
+        return None
+    try:
+        val = row["verify_status"]
+    except Exception:
+        val = row[0]
+    return val.strip().lower() if isinstance(val, str) else None
+
+
+def _maybe_defer_greylist_retry(
+    *,
+    email_id: int,
+    email: str,
+    domain: str,
+    mx_host: str | None,
+    code: int | None,
+    message: str | None,
+    defer_attempt: int,
+) -> bool:
+    """
+    Requeue this probe after the next greylist interval instead of sleeping.
+
+    Production threw 20,443 temp_fails away (32% of all probes) after two inline
+    sleeps of 1s and 2s. Greylisting needs 300s+, so none of those probes could
+    ever have succeeded. Only a 4xx the server actually SPOKE (code AND message
+    present) is deferred; a timeout or a dropped socket returns False, because
+    waiting fifteen minutes for a dead socket buys nothing and the caller
+    already has the only answer it is going to get.
+
+    Returns True if a retry was scheduled, in which case an interim temp_fail
+    row is persisted and the caller must not write a verdict.
+    """
+    if code is None or not message:
+        return False
+
+    schedule = _cfg.retry_timeout.greylist_retry_schedule
+    if defer_attempt >= len(schedule):
+        return False
+
+    delay_s = schedule[defer_attempt]
+    reason = (
+        "greylist_deferred" if is_greylist_deferral(code, message) else "policy_temp_fail_deferred"
+    )
+
+    try:
+        q = Queue(name="verify", connection=get_redis())
+        q.enqueue_in(
+            timedelta(seconds=delay_s),
+            task_probe_email,
+            email_id=int(email_id),
+            email=email,
+            company_domain=domain,
+            force=False,
+            defer_attempt=defer_attempt + 1,
+            job_timeout=30,
+            retry=None,
+        )
+    except Exception:
+        log.warning(
+            "greylist retry enqueue failed; treating as exhausted",
+            exc_info=True,
+            extra={"email_id": email_id, "email": email},
+        )
+        return False
+
+    # verification_results has no attempt column; the reason string carries the
+    # progress, matching this file's existing colon-delimited reason idiom.
+    _persist_probe_result_r18(
+        db_path=os.getenv("DATABASE_PATH") or "data/dev.db",
+        email_id=int(email_id),
+        email=email,
+        domain=domain,
+        mx_host=mx_host,
+        category="temp_fail",
+        code=code,
+        error=f"{reason}:attempt={defer_attempt + 1}/{len(schedule)}:retry_in={delay_s}s",
+        fallback_status=None,
+        fallback_raw=None,
+        tcp25_ok=True,
+    )
+    log.info(
+        "verify probe deferred",
+        extra={
+            "email_id": email_id,
+            "email": email,
+            "domain": domain,
+            "reason": reason,
+            "defer_attempt": defer_attempt + 1,
+            "delay_s": delay_s,
+        },
+    )
+    return True
+
+
+_SELECT_REFUTATION_CONTEXT = """
+    SELECT p.company_id, p.first_name, p.last_name, e.source_note
+    FROM emails e JOIN people p ON p.id = e.person_id
+    WHERE e.id = ?
+"""
+
+
+def _record_probe_refutation(*, email_id: int, email: str, domain: str) -> None:
+    """
+    File a hard 5xx as a REFUTATION of the format that produced it.
+
+    36,320 hard failures produced exactly one stored row in production: the
+    async probe path never touched the pattern evidence, so a dead format was
+    re-guessed for every person at the company. The pattern is read from the
+    source_note the generator wrote ("generated:pattern=flast:rank=1") --
+    re-deriving it from the person's name lands on `other` whenever the name is
+    messy, and a refutation filed under `other` stops nothing.
+    """
+    try:
+        con = get_conn()
+    except Exception:
+        return
+    try:
+        row = con.execute(_SELECT_REFUTATION_CONTEXT, (int(email_id),)).fetchone()
+        if not row:
+            return
+        pattern = None
+        for tok in str(row[3] or "").split(":"):
+            if tok.startswith("pattern="):
+                pattern = tok.split("=", 1)[1] or None
+        _record_pattern_outcome_safe(
+            con,
+            company_id=row[0],
+            domain=domain,
+            email=email,
+            first=row[1] or "",
+            last=row[2] or "",
+            ok=False,
+            pattern=pattern,
+        )
+    except Exception:
+        log.debug(
+            "failed to record probe refutation",
+            exc_info=True,
+            extra={"email_id": email_id, "email": email},
+        )
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def _task_probe_email_impl(  # noqa: C901
     email_id: int,
     email: str,
     domain: str,
     force: bool = False,
+    defer_attempt: int = 0,
 ) -> dict:
     """
     Adjustments:
@@ -1996,6 +2233,20 @@ def _task_probe_email_impl(  # noqa: C901
     if isinstance(normalized, dict):
         return normalized
     email_str, dom = normalized
+
+    # A deferred retry can race the sequential verifier, which may already have
+    # decided this address. Re-probing a settled mailbox is pure waste.
+    if not force:
+        already = _existing_definitive_status(int(email_id))
+        if already in _DEFINITIVE_VERIFY_STATUSES:
+            return {
+                "ok": True,
+                "skipped": "already_decided",
+                "verify_status": already,
+                "email_id": int(email_id),
+                "email": email_str,
+                "domain": dom,
+            }
 
     db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
     start = time.perf_counter()
@@ -2103,6 +2354,45 @@ def _task_probe_email_impl(  # noqa: C901
         code = result.get("code")
         error_val = result.get("error")
 
+        # A server-issued 4xx says "come back later", not "no". Requeue past the
+        # greylisting window rather than burning the fallback API and writing a
+        # verdict we never got.
+        #
+        # The 4xx has to be real. _classify_exc() buckets timeouts AND every
+        # unexpected exception as temp_fail with code=None, so gating on the
+        # category alone would put a socket timeout -- or a TypeError in our own
+        # code -- on the 60/300/900s greylist schedule. Those 319 timeout probes
+        # already burned 16.5% of all SMTP wall-time at one attempt each;
+        # retrying them three more times is the opposite of the point. No code
+        # means no server reply, which means nothing to come back to.
+        if category == "temp_fail" and code is not None and 400 <= code < 500:
+            if _maybe_defer_greylist_retry(
+                email_id=int(email_id),
+                email=email_str,
+                domain=dom,
+                mx_host=mx_host,
+                code=code,
+                message=result.get("message"),
+                defer_attempt=defer_attempt,
+            ):
+                return {
+                    "ok": False,
+                    "status": "deferred_retry_scheduled",
+                    "category": category,
+                    "code": code,
+                    "mx_host": mx_host,
+                    "domain": dom,
+                    "email_id": int(email_id),
+                    "email": email_str,
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                    "error": error_val,
+                    "defer_attempt": defer_attempt + 1,
+                }
+            if defer_attempt > 0:
+                error_val = (
+                    f"{error_val or 'temp_fail'}:greylist_exhausted:attempts={defer_attempt}"
+                )
+
         fallback_status, fallback_raw = _maybe_run_fallback(email_str, category)
 
         base: dict[str, Any] = {
@@ -2139,6 +2429,9 @@ def _task_probe_email_impl(  # noqa: C901
             base["verify_reason"] = v_reason
             base["verified_mx"] = v_mx
             base["verified_at"] = v_at
+
+        if category == "hard_fail":
+            _record_probe_refutation(email_id=int(email_id), email=email_str, domain=dom)
 
         _maybe_escalate_to_test_send(
             db_path=db_path,
@@ -2231,6 +2524,7 @@ def task_probe_email(
     domain: str | None = None,
     company_domain: str | None = None,
     force: bool = False,
+    defer_attempt: int = 0,
 ) -> dict:
     """RQ entrypoint for R16/R18 probes.
 
@@ -2246,6 +2540,7 @@ def task_probe_email(
         email=email,
         domain=dom,
         force=force,
+        defer_attempt=defer_attempt,
     )
 
 
@@ -2271,139 +2566,6 @@ def _has_table(con: Any, name: str) -> bool:
         return False
 
 
-def _examples_for_domain(con: Any, domain: str) -> list[tuple[str, str, str]]:
-    """
-    Build [(first, last, localpart)] examples for a domain using 'published' emails.
-
-
-
-
-    We:
-      - Prefer a join from emails Ã¢â€ â€™ people when both tables/columns exist.
-      - Fall back to names stored directly on emails when available.
-      - Filter out obvious role/placeholder locals (info@, support@, etc.).
-    """
-    examples: list[tuple[str, str, str]] = []
-    dom = (domain or "").strip().lower()
-    if not dom:
-        return examples
-
-    # 1) Preferred: join emails Ã¢â€ â€™ people, using the email's domain.
-    try:
-        rows = con.execute(
-            """
-            SELECT p.first_name, p.last_name, e.email
-            FROM emails e
-            JOIN people p ON p.id = e.person_id
-            WHERE lower(substr(e.email, instr(e.email, '@') + 1)) = ?
-              AND e.is_published = 1
-            """,
-            (dom,),
-        ).fetchall()
-    except Exception:
-        # Fallback without is_published filter.
-        try:
-            rows = con.execute(
-                """
-                SELECT p.first_name, p.last_name, e.email
-                FROM emails e
-                JOIN people p ON p.id = e.person_id
-                WHERE lower(substr(e.email, instr(e.email, '@') + 1)) = ?
-                """,
-                (dom,),
-            ).fetchall()
-        except Exception:
-            rows = []
-
-    for fn, ln, em in rows:
-        if not em or "@" not in em or not fn or not ln:
-            continue
-        local = em.split("@", 1)[0].lower()
-        if local in ROLE_ALIASES:
-            continue
-        examples.append((str(fn), str(ln), local))
-
-    if examples:
-        return examples
-
-    # 2) Fallback: names stored directly on emails table.
-    try:
-        rows = con.execute(
-            """
-            SELECT first_name, last_name, email
-            FROM emails
-            WHERE lower(substr(email, instr(email, '@') + 1)) = ?
-              AND is_published = 1
-            """,
-            (dom,),
-        ).fetchall()
-    except Exception:
-        try:
-            rows = con.execute(
-                """
-                SELECT first_name, last_name, email
-                FROM emails
-                WHERE lower(substr(email, instr(email, '@') + 1)) = ?
-                """,
-                (dom,),
-            ).fetchall()
-        except Exception:
-            rows = []
-
-    for fn, ln, em in rows:
-        if not em or "@" not in em or not fn or not ln:
-            continue
-        local = em.split("@", 1)[0].lower()
-        if local in ROLE_ALIASES:
-            continue
-        examples.append((str(fn), str(ln), local))
-
-    return examples
-
-
-def _load_cached_pattern(con: Any, domain: str) -> str | None:
-    """Read a cached canonical pattern key for a domain if the table exists."""
-    if not _has_table(con, "domain_patterns"):
-        return None
-    try:
-        row = con.execute(
-            "SELECT pattern FROM domain_patterns WHERE domain = ?", (domain,)
-        ).fetchone()
-        pat = row[0] if row and row[0] else None
-        if pat in CANON_PATTERNS:
-            return pat
-    except Exception:
-        pass
-    return None
-
-
-def _save_inferred_pattern(
-    con: Any, domain: str, pattern: str, confidence: float, samples: int
-) -> None:
-    """Upsert the inferred pattern if the table exists."""
-    if not _has_table(con, "domain_patterns"):
-        return
-    try:
-        # Use CURRENT_TIMESTAMP for cross-database compatibility
-        con.execute(
-            """
-            INSERT INTO domain_patterns (domain, pattern, confidence, samples)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(domain) DO UPDATE SET
-              pattern=excluded.pattern,
-              confidence=excluded.confidence,
-              samples=excluded.samples,
-              inferred_at=CURRENT_TIMESTAMP
-            """,
-            (domain, pattern, float(confidence), int(samples)),
-        )
-    except Exception:
-        # Non-fatal; skip caching errors
-        log.exception(
-            "failed to upsert domain_patterns", extra={"domain": domain, "pattern": pattern}
-        )
-
-
 def _company_id_for_person(con: Any, person_id: int) -> int | None:
     """
     Helper: resolve company_id for a person, if available.
@@ -2423,13 +2585,11 @@ def _company_id_for_person(con: Any, person_id: int) -> int | None:
 
 def _load_company_email_pattern(con: Any, company_id: int | None) -> str | None:
     """
-    O26: read a per-company email pattern from companies.attrs["email_pattern"]
-    when present and valid.
+    Operator override: a pattern pinned on companies.attrs["email_pattern"].
 
-
-
-
-    The value must be one of the canonical pattern keys from src.generate.patterns.
+    Outranks the statistical base rate but not confirmed evidence -- see
+    src.verify.candidates.rank_patterns(). The value must be a renderable
+    pattern name from src.generate.patterns.
     """
     if not company_id:
         return None
@@ -2458,11 +2618,11 @@ def _load_company_email_pattern(con: Any, company_id: int | None) -> str | None:
             return None
 
         pat = attrs.get("email_pattern")
-        if isinstance(pat, str) and pat in CANON_PATTERNS:
+        if isinstance(pat, str) and pat in RENDERABLE_PATTERNS:
             return pat
     except Exception:
         log.debug(
-            "O26: failed to load company email_pattern",
+            "failed to load company email_pattern override",
             exc_info=True,
             extra={"company_id": company_id},
         )
@@ -2536,31 +2696,22 @@ def task_generate_emails(  # noqa: C901
     domain: str,
 ) -> dict:
     """
-    Generate and verify email permutations for a person.
+    Generate and verify candidate addresses for one person.
 
-
-
+    Candidates are ORDERED BY EVIDENCE, not guessed once and abandoned:
+    patterns this company has already confirmed come first, then an operator
+    override, then the size-adjusted global base rate. Patterns this company has
+    only ever failed are skipped. See src.verify.candidates.rank_patterns().
 
     Modes (controlled by SEQUENTIAL_VERIFICATION env):
-    - SEQUENTIAL_VERIFICATION=1: Verify permutations sequentially, stop on valid
-    - SEQUENTIAL_VERIFICATION=0 (default): Parallel enqueue (legacy behavior)
+    - SEQUENTIAL_VERIFICATION=1 (default): probe the list in order, stop at the
+      first `valid`, and record every decided outcome back into the per-company
+      pattern evidence.
+    - SEQUENTIAL_VERIFICATION=0: parallel enqueue (legacy behaviour).
 
-
-
-
-    Sequential mode:
-      - Verifies permutations one by one in ranked order
-      - STOPS immediately when a valid email is found
-      - CONTINUES to next permutation after invalid
-      - RETRIES on temp_fail (up to 3 attempts)
-      - Only persists the winning email to DB
-
-
-
-
-    Parallel mode (legacy):
-      - Persists all generated candidates
-      - Enqueues all probes independently
+    MAX_PROBES_PER_PERSON caps the list (default 3). It is a budget, not a
+    target: walking many addresses at one domain is the directory-harvest
+    pattern that gets a probing IP throttled.
     """
     con = get_conn()
     dom = (domain or "").lower().strip()
@@ -2574,10 +2725,7 @@ def task_generate_emails(  # noqa: C901
             "person_id": person_id,
         }
 
-    try:
-        max_probes = max(0, int(os.getenv("MAX_PROBES_PER_PERSON", "6")))
-    except Exception:
-        max_probes = 6
+    max_probes = max_probes_per_person()
 
     # Check for sequential verification mode
     seq_env = os.getenv("SEQUENTIAL_VERIFICATION", "1").strip().lower()
@@ -2608,38 +2756,17 @@ def task_generate_emails(  # noqa: C901
             "person_id": person_id,
         }
 
-    cached_pattern = _load_cached_pattern(con, dom)
-    examples = _examples_for_domain(con, dom)
-
-    domain_pattern: str | None = None
-    inf_conf: float = 0.0
-    inf_samples: int = 0
-
-    if cached_pattern in CANON_PATTERNS:
-        domain_pattern = cached_pattern
-    elif examples:
-        inf_result = infer_domain_pattern(examples)
-        if inf_result.pattern in CANON_PATTERNS and inf_result.confidence >= 0.5:
-            domain_pattern = inf_result.pattern
-            inf_conf = inf_result.confidence
-            inf_samples = inf_result.sample_count
-            _save_inferred_pattern(con, dom, inf_result.pattern, inf_conf, inf_samples)
-
-    effective_pattern = company_pattern or domain_pattern
-
-    ranked_candidates = generate_candidate_emails_for_person(
+    evidence = company_pattern_evidence(con, company_id)
+    ranked_candidates = rank_candidates(
+        evidence,
         nf,
         nl,
         dom,
-        effective_pattern,
+        employee_count=company_employee_count(con, company_id),
+        override=company_pattern,
+        limit=max_probes if max_probes > 0 else None,
     )
-
-    if max_probes > 0:
-        ranked_candidates = ranked_candidates[:max_probes]
-
-    # Normalize ranked_candidates to (email, pattern_key) tuples.
-    if ranked_candidates and isinstance(ranked_candidates[0], str):
-        ranked_candidates = [(a, "unknown") for a in ranked_candidates]
+    effective_pattern = ranked_candidates[0][1] if ranked_candidates else None
 
     # ----- SEQUENTIAL VERIFICATION MODE -----
     if sequential_mode:
@@ -2650,9 +2777,7 @@ def task_generate_emails(  # noqa: C901
             ranked_candidates=ranked_candidates,
             effective_pattern=effective_pattern,
             company_pattern=company_pattern,
-            domain_pattern=domain_pattern,
-            inf_conf=inf_conf,
-            inf_samples=inf_samples,
+            evidence=evidence,
             max_probes=max_probes,
             nf=nf,
             nl=nl,
@@ -2662,20 +2787,7 @@ def task_generate_emails(  # noqa: C901
     # ----- PARALLEL MODE (LEGACY) -----
     inserted = 0
     enqueued = 0
-    for rank, cand in enumerate(ranked_candidates, 1):
-        if isinstance(cand, dict):
-            email_addr = str(cand.get("email") or cand.get("addr") or "")
-            pattern_key = str(
-                cand.get("pattern") or cand.get("pattern_key") or cand.get("key") or "unknown"
-            )
-        elif isinstance(cand, (list, tuple)):
-            email_addr = str(cand[0]) if len(cand) > 0 else ""
-            pattern_key = str(cand[1]) if len(cand) > 1 and cand[1] is not None else "unknown"
-        else:
-            email_addr = str(cand)
-            pattern_key = "unknown"
-        if not email_addr:
-            continue
+    for rank, (email_addr, pattern_key) in enumerate(ranked_candidates, 1):
         try:
             upsert_generated_email(
                 conn=con,
@@ -2737,9 +2849,6 @@ def task_generate_emails(  # noqa: C901
                 "last_norm": nl,
                 "only_pattern": effective_pattern,
                 "company_pattern": company_pattern,
-                "domain_pattern": domain_pattern,
-                "inference_confidence": inf_conf,
-                "inference_samples": inf_samples,
                 "count": inserted,
                 "enqueued": enqueued,
                 "max_probes_per_person": max_probes,
@@ -2750,8 +2859,6 @@ def task_generate_emails(  # noqa: C901
         "enqueued": enqueued,
         "max_probes_per_person": max_probes,
         "only_pattern": effective_pattern,
-        "inference_confidence": inf_conf,
-        "inference_samples": inf_samples,
         "domain": dom,
         "person_id": person_id,
     }
@@ -2770,12 +2877,18 @@ def _persist_sequential_verification_result(
     catch_all_status: str | None,
     company_id: int | None = None,
     person_id: int | None = None,
+    confidence: float | None = None,
+    confidence_grade: str | None = None,
 ) -> None:
     """
     Persist verification result from sequential verification.
 
     IMPORTANT: must work on Postgres in production, so avoid raw INSERTs
     with SQLite-only PRAGMA introspection. Use the canonical DB upsert helper.
+
+    `confidence`/`confidence_grade` carry the pattern-evidence grade for an
+    address SMTP could not decide. They annotate the row; they never change the
+    verdict, which stays risky_catch_all.
     """
     from datetime import datetime as dt
 
@@ -2806,6 +2919,36 @@ def _persist_sequential_verification_result(
         company_id=company_id,
         person_id=person_id,
     )
+
+    if confidence is None and confidence_grade is None:
+        return
+
+    # Additive columns (db/migrations/2026_08_19_verification_pattern_confidence.sql).
+    # upsert_verification_result() only writes columns it knows about, so the
+    # grade is applied here; skip silently on a database without the migration.
+    try:
+        cols = _table_cols(con, "verification_results")
+        if "pattern_confidence" not in cols or "pattern_confidence_grade" not in cols:
+            return
+        con.execute(
+            """
+            UPDATE verification_results
+               SET pattern_confidence = ?, pattern_confidence_grade = ?
+             WHERE email_id = ?
+            """,
+            (confidence, confidence_grade, int(email_id)),
+        )
+        con.commit()
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        log.debug(
+            "failed to persist pattern confidence",
+            exc_info=True,
+            extra={"email_id": email_id, "grade": confidence_grade},
+        )
 
 
 def _delete_email_and_verification_results(con: Any, email_id: int) -> None:
@@ -3004,41 +3147,177 @@ def _cleanup_invalid_generated_email(email_id: int, verify_status: str) -> bool:
         return False
 
 
+def _record_pattern_outcome_safe(
+    con: Any,
+    *,
+    company_id: int | None,
+    domain: str,
+    email: str,
+    first: str,
+    last: str,
+    ok: bool,
+    pattern: str | None = None,
+) -> str | None:
+    """
+    Remember what this guess did, so the next person at this company benefits.
+
+    Pass `pattern` whenever the caller GENERATED the address: re-deriving the
+    format from the person's name lands on `other` when the name is messy, and
+    a refutation filed under `other` never stops the format that actually
+    missed from being tried again.
+
+    Only `valid` and `invalid` are evidence. A catch-all 250 and a timeout say
+    nothing about the format, so callers must not route them here.
+
+    This is the ONLY memory of a failed guess: the invalid address row itself is
+    deleted by CLEANUP_INVALID_GENERATED, by design.
+    """
+    if not company_id:
+        return None
+    try:
+        pattern = record_pattern_outcome(
+            con,
+            company_id=int(company_id),
+            domain=domain,
+            email=email,
+            first_name=first,
+            last_name=last,
+            ok=ok,
+            pattern=pattern,
+        )
+        con.commit()
+        return pattern
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        log.debug(
+            "failed to record pattern outcome",
+            exc_info=True,
+            extra={"company_id": company_id, "email": email, "ok": ok},
+        )
+        return None
+
+
+def _record_inferred_patterns_safe(con: Any, *, company_id: int, dom: str, emails) -> None:
+    """
+    Teach the pattern store from the addresses the site PUBLISHED.
+
+    Shape inference needs no matching person row, which is why it is the path
+    from 35 companies with a known format to 128. Deliberately kept out of
+    confirmed_count: a published address proves what the website says, not that
+    SMTP accepts it.
+    """
+    want = (dom or "").strip().lower()
+    local_parts = [
+        e.split("@", 1)[0]
+        for e in emails
+        if "@" in e and e.split("@", 1)[1].strip().lower() == want
+    ]
+    if not (company_id and local_parts):
+        return
+    try:
+        counts = record_inferred_patterns(
+            con,
+            company_id=int(company_id),
+            domain=want,
+            local_parts=local_parts,
+            first_names=first_name_dictionary(con),
+        )
+        con.commit()
+        if counts:
+            log.info(
+                "pattern shapes inferred from published addresses",
+                extra={"company_id": company_id, "domain": want, "counts": counts},
+            )
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        log.debug(
+            "shape inference unavailable",
+            exc_info=True,
+            extra={"company_id": company_id, "domain": want},
+        )
+
+
+def _set_email_source_note(con: Any, email_id: int | None, note: str) -> None:
+    """Best-effort source_note update; the column is absent on older schemas."""
+    if email_id is None:
+        return
+    try:
+        if "source_note" not in _table_cols(con, "emails"):
+            return
+        con.execute("UPDATE emails SET source_note = ? WHERE id = ?", (note, int(email_id)))
+        con.commit()
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        log.debug("failed to update source_note", exc_info=True, extra={"email_id": email_id})
+
+
 def _generate_emails_sequential(  # noqa: C901
     *,
     con: Any,
     person_id: int,
     domain: str,
-    ranked_candidates: list,
+    ranked_candidates: list[tuple[str, str]],
     effective_pattern: str | None,
     company_pattern: str | None,
-    domain_pattern: str | None,
-    inf_conf: float,
-    inf_samples: int,
+    evidence: list[dict[str, Any]],
     max_probes: int,
     nf: str,
     nl: str,
     company_id: int | None = None,
 ) -> dict:
     """
-    Sequential permutation verification: verify one at a time, stop on valid.
+    Walk the evidence-ranked candidates until one verifies.
 
-
-
-
-    Strategy:
-    1. Try each permutation in ranked order
-    2. STOP when valid or risky_catch_all is found
-    3. CONTINUE after invalid (try next permutation)
-    4. RETRY on temp_fail (up to 3 times per permutation)
-    5. Persist verification results to verification_results table
-    6. Mark invalid emails in source_note (preserve for audit trail)
+    1. Probe candidates in order; STOP at the first `valid`. A single miss no
+       longer loses the person -- that was the old one-blind-guess behaviour.
+    2. Record every DECIDED outcome (valid/invalid) into the per-company pattern
+       evidence. Catch-all and timeout results are recorded nowhere: they are
+       not evidence either way.
+    3. On a domain already known to be catch-all, probe NOTHING. Every
+       local-part gets a 250 there, so the probes buy no information and only
+       spend the domain's tolerance for us. Store the single best candidate and
+       grade it from the pattern evidence instead.
     """
     db_path = os.getenv("DATABASE_PATH") or "data/dev.db"
 
     _cleanup_env2 = os.getenv("CLEANUP_INVALID_GENERATED", "1").strip().lower()
     cleanup_enabled = _cleanup_env2 in ("1", "true", "yes")
-    catch_all_status: str | None = None
+
+    def _result(
+        *,
+        status: str,
+        valid_email: str | None = None,
+        valid_pattern: str | None = None,
+        attempts: list[dict] | None = None,
+        probes: int = 0,
+        confidence: float | None = None,
+        grade: str | None = None,
+    ) -> dict:
+        return {
+            "count": 1 if valid_email else 0,
+            "enqueued": 0,  # No async enqueue in sequential mode
+            "verified": probes,
+            "valid_email": valid_email,
+            "valid_pattern": valid_pattern,
+            "status": status,
+            "attempts": attempts or [],
+            "max_probes_per_person": max_probes,
+            "only_pattern": effective_pattern,
+            "company_pattern": company_pattern,
+            "pattern_confidence": confidence,
+            "pattern_confidence_grade": grade,
+            "domain": domain,
+            "person_id": person_id,
+        }
 
     # Get MX info once for the domain
     mx_host, behavior_hint = _mx_info(domain, force=False, db_path=db_path)
@@ -3047,17 +3326,7 @@ def _generate_emails_sequential(  # noqa: C901
             "R12 sequential: no MX host found",
             extra={"person_id": person_id, "domain": domain},
         )
-        return {
-            "count": 0,
-            "enqueued": 0,
-            "verified": 0,
-            "valid_email": None,
-            "status": "no_mx",
-            "max_probes_per_person": max_probes,
-            "only_pattern": effective_pattern,
-            "domain": domain,
-            "person_id": person_id,
-        }
+        return _result(status="no_mx")
 
     # Get catch-all status for the domain.
     # Prefer the pre-resolved status passed via job meta from
@@ -3094,29 +3363,156 @@ def _generate_emails_sequential(  # noqa: C901
             )
             catch_all_status = None
 
+    def _accept(
+        email_addr: str,
+        pattern_key: str,
+        email_id: int | None,
+        status: str,
+        rank: int,
+    ) -> None:
+        """Mark a candidate as this person's address (valid or risky_catch_all)."""
+        _set_email_source_note(con, email_id, f"verified:{status}:pattern={pattern_key}")
+        log.info(
+            "R12 sequential: accepted %s address",
+            status,
+            extra={
+                "person_id": person_id,
+                "domain": domain,
+                "email": email_addr,
+                "email_id": email_id,
+                "pattern": pattern_key,
+                "rank": rank,
+            },
+        )
+
+    # ----- CATCH-ALL: grade, do not probe -----
+    if catch_all_status == "catch_all":
+        if not ranked_candidates:
+            return _result(status="no_candidates")
+
+        email_addr, pattern_key = ranked_candidates[0]
+        confidence, grade = catchall_confidence(evidence, pattern_key)
+
+        email_id: int | None = None
+        try:
+            email_id = upsert_generated_email(
+                conn=con,
+                person_id=person_id,
+                email=email_addr,
+                domain=domain,
+                source_note=f"sequential_candidate:rank=1:pattern={pattern_key}",
+            )
+            con.commit()
+        except Exception:
+            log.debug(
+                "R12 sequential: failed to insert catch-all candidate",
+                exc_info=True,
+                extra={"person_id": person_id, "email": email_addr},
+            )
+
+        if email_id is not None:
+            _persist_sequential_verification_result(
+                con=con,
+                email_id=email_id,
+                email=email_addr,
+                domain=domain,
+                mx_host=mx_host,
+                status="risky_catch_all",
+                reason="catchall_pattern_graded",
+                code=None,
+                catch_all_status=catch_all_status,
+                company_id=company_id,
+                person_id=person_id,
+                confidence=confidence,
+                confidence_grade=grade,
+            )
+            _accept(email_addr, pattern_key, email_id, "risky_catch_all", 1)
+
+        log.info(
+            "R12 sequential: catch-all domain, graded without probing",
+            extra={
+                "person_id": person_id,
+                "domain": domain,
+                "email": email_addr,
+                "pattern": pattern_key,
+                "pattern_confidence": confidence,
+                "pattern_confidence_grade": grade,
+            },
+        )
+        return _result(
+            status="risky_found",
+            valid_email=email_addr,
+            valid_pattern=pattern_key,
+            attempts=[
+                {
+                    "email": email_addr,
+                    "pattern": pattern_key,
+                    "rank": 1,
+                    "status": "risky_catch_all",
+                    "reason": "catchall_pattern_graded",
+                    "retries": 0,
+                    "email_id": email_id,
+                }
+            ],
+            confidence=confidence,
+            grade=grade,
+        )
+
     attempts: list[dict] = []
-    valid_email: str | None = None
-    valid_pattern: str | None = None
-    final_status = "exhausted"
     total_probes = 0
 
-    for rank, cand in enumerate(ranked_candidates, 1):
-        # Parse candidate
-        if isinstance(cand, dict):
-            email_addr = str(cand.get("email") or cand.get("addr") or "")
-            pattern_key = str(
-                cand.get("pattern") or cand.get("pattern_key") or cand.get("key") or "unknown"
-            )
-        elif isinstance(cand, (list, tuple)):
-            email_addr = str(cand[0]) if len(cand) > 0 else ""
-            pattern_key = str(cand[1]) if len(cand) > 1 and cand[1] is not None else "unknown"
-        else:
-            email_addr = str(cand)
-            pattern_key = "unknown"
+    # ONE SMTP session for the whole plan, but only while we are GUESSING.
+    # A company with a confirmed pattern lands on candidate #1, so opening a
+    # session for three addresses there would spend probes it does not need.
+    # With no evidence we expect to walk the list anyway, so lane A's
+    # multi-RCPT session is strictly cheaper -- and it decides catch-all for
+    # free, which is what makes the follow-up sanity connection unnecessary.
+    batch_plan: list[str] = []
+    if catch_all_status != "catch_all" and not has_trusted_pattern(evidence):
+        batch_plan = [e for e, _p in ranked_candidates if not is_role_or_placeholder_email(e)]
 
-        if not email_addr:
-            continue
+    probed: dict[str, dict] = {}
+    taught: set[str] = set()
+    deferred_scheduled = False
 
+    def _probe(addr: str) -> dict:
+        if addr not in probed:
+            plan = [a for a in batch_plan if a not in probed]
+            if addr not in plan:
+                plan = [addr]
+            for res in _probe_candidates(plan, mx_host, catch_all_status):
+                probed[res["email"]] = res
+        return probed[addr]
+
+    def _teach(addr: str, pattern_key: str, ok: bool) -> None:
+        if addr in taught:
+            return
+        taught.add(addr)
+        _record_pattern_outcome_safe(
+            con,
+            company_id=company_id,
+            domain=domain,
+            email=addr,
+            first=nf,
+            last=nl,
+            ok=ok,
+            pattern=pattern_key,
+        )
+
+    def _teach_unprocessed() -> None:
+        """Bank the hard failures this session already paid for.
+
+        The loop returns at the first accept, so in production the RCPTs after
+        it were discarded -- 36,320 hard failures stored exactly one row. They
+        were issued on the same connection; recording them costs nothing and is
+        what stops the next 5.9 people at this domain re-probing a dead format.
+        """
+        for addr, pat in ranked_candidates:
+            res = probed.get(addr)
+            if res and res.get("status") == "invalid":
+                _teach(addr, pat, False)
+
+    for rank, (email_addr, pattern_key) in enumerate(ranked_candidates, 1):
         # Skip role/placeholder emails
         if is_role_or_placeholder_email(email_addr):
             attempts.append(
@@ -3134,12 +3530,12 @@ def _generate_emails_sequential(  # noqa: C901
         # Step 1: Probe FIRST, before inserting into DB.
         # This avoids creating email rows for permutations that are never
         # verified (which show up as "Unknown" in the dashboard).
-        attempt_result = _verify_permutation_with_retry(
-            email_addr=email_addr,
-            mx_host=mx_host,
-            catch_all_status=catch_all_status,
-            max_retries=3,
-        )
+        attempt_result = dict(_probe(email_addr))
+
+        # An accept alongside a hard_fail on the same session proves this MX
+        # distinguishes real mailboxes; that IS the catch-all measurement.
+        if attempt_result.get("catchall_ruled_out") and catch_all_status != "catch_all":
+            catch_all_status = "not_catch_all"
 
         attempt_result["pattern"] = pattern_key
         attempt_result["rank"] = rank
@@ -3151,8 +3547,12 @@ def _generate_emails_sequential(  # noqa: C901
         code = attempt_result.get("code")
 
         # Step 2: Only insert the email into DB if we got a definitive result.
-        email_id: int | None = None
-        if status in ("valid", "risky_catch_all", "invalid"):
+        email_id = None
+        # Only the deferral we are actually going to retry earns a row. The
+        # siblings a greylisting MX also 4xx'd would otherwise become permanent
+        # "Unknown" rows for addresses nobody will ever re-probe.
+        will_defer = status == "deferred" and not deferred_scheduled
+        if status in ("valid", "risky_catch_all", "invalid") or will_defer:
             try:
                 email_id = upsert_generated_email(
                     conn=con,
@@ -3171,8 +3571,83 @@ def _generate_emails_sequential(  # noqa: C901
 
         attempt_result["email_id"] = email_id
 
-        # Step 3: Persist verification result (only if we have an email_id)
-        if email_id is not None:
+        # Step 3: A "valid" verdict is only trustworthy on a domain PROVEN not
+        # to be catch-all. Some servers reject obvious garbage but accept any
+        # plausible-looking local-part, which fools catch-all detection.
+        if (
+            status == "valid"
+            and catch_all_status == "not_catch_all"
+            and not attempt_result.get("catchall_ruled_out")
+        ):
+            try:
+                import secrets as _secrets
+
+                sanity_check_addr = f"_invalid_sanity_{_secrets.token_hex(6)}@{domain}"
+                sanity_result = _verify_permutation_with_retry(
+                    email_addr=sanity_check_addr,
+                    mx_host=mx_host,
+                    catch_all_status=None,  # Don't use cached status for sanity check
+                )
+                sanity_code = sanity_result.get("code")
+
+                # If the sanity address ALSO gets 2xx, the domain is catch-all.
+                if isinstance(sanity_code, int) and 200 <= sanity_code < 300:
+                    log.warning(
+                        "R12 sequential: catch-all sanity check FAILED"
+                        " - domain accepts garbage addresses",
+                        extra={
+                            "person_id": person_id,
+                            "domain": domain,
+                            "email": email_addr,
+                            "sanity_check_addr": sanity_check_addr,
+                            "sanity_code": sanity_code,
+                        },
+                    )
+                    status = "risky_catch_all"
+                    reason = "rcpt_2xx_catchall_sanity_failed"
+                    catch_all_status = "catch_all"  # Update for subsequent iterations
+                    attempt_result["status"] = status
+                    attempt_result["reason"] = reason
+            except Exception:
+                log.debug(
+                    "R12 sequential: catch-all sanity check exception (ignoring)",
+                    exc_info=True,
+                    extra={"domain": domain, "email": email_addr},
+                )
+
+        # Step 4: Persist the (possibly downgraded) result, with a confidence
+        # grade whenever SMTP could not decide it.
+        confidence: float | None = None
+        grade: str | None = None
+        if status == "risky_catch_all":
+            confidence, grade = catchall_confidence(evidence, pattern_key)
+
+        # Step 4b: a server-issued 4xx is "come back later", not a verdict.
+        # Requeue past the greylisting window instead of blocking the worker,
+        # and let that path own the interim row rather than writing it twice.
+        # ONE retry per person: a 4xx is this MX deferring US, not this mailbox,
+        # so a second scheduled probe of a sibling address buys nothing. If a
+        # later candidate resolves first, the pending job sees the decided row
+        # and skips (_existing_definitive_status).
+        just_deferred = False
+        if will_defer and email_id is not None:
+            just_deferred = _maybe_defer_greylist_retry(
+                email_id=email_id,
+                email=email_addr,
+                domain=domain,
+                mx_host=mx_host,
+                code=code,
+                message=attempt_result.get("message"),
+                defer_attempt=0,
+            )
+            deferred_scheduled = just_deferred
+            if not just_deferred:
+                status = "temp_fail"
+                reason = f"{reason}:not_scheduled"
+                attempt_result["status"] = status
+                attempt_result["reason"] = reason
+
+        if email_id is not None and not just_deferred:
             try:
                 _persist_sequential_verification_result(
                     con=con,
@@ -3186,6 +3661,8 @@ def _generate_emails_sequential(  # noqa: C901
                     catch_all_status=catch_all_status,
                     company_id=company_id,
                     person_id=person_id,
+                    confidence=confidence,
+                    confidence_grade=grade,
                 )
                 con.commit()
             except Exception:
@@ -3195,220 +3672,38 @@ def _generate_emails_sequential(  # noqa: C901
                     extra={"person_id": person_id, "email": email_addr, "status": status},
                 )
 
-        # Step 4: Handle result - keep valid, delete invalid
-        if status == "valid":
-            # SAFETY CHECK: If we're about to label this "valid" but catch_all_status
-            # was "not_catch_all", verify that the domain truly isn't catch-all.
-            # Some domains reject random/garbage addresses but accept real-looking patterns,
-            # fooling our catch-all detection.
-            if catch_all_status == "not_catch_all":
-                try:
-                    # Re-probe with a clearly invalid address to double-check
-                    import secrets as _secrets
-
-                    sanity_check_addr = f"_invalid_sanity_{_secrets.token_hex(6)}@{domain}"
-                    sanity_result = _verify_permutation_with_retry(
-                        email_addr=sanity_check_addr,
-                        mx_host=mx_host,
-                        catch_all_status=None,  # Don't use cached status for sanity check
-                        max_retries=1,
-                    )
-                    sanity_code = sanity_result.get("code")
-
-                    # If sanity check address ALSO gets 2xx, domain is actually catch-all
-                    if isinstance(sanity_code, int) and 200 <= sanity_code < 300:
-                        log.warning(
-                            "R12 sequential: catch-all sanity check FAILED"
-                            " - domain accepts garbage addresses",
-                            extra={
-                                "person_id": person_id,
-                                "domain": domain,
-                                "email": email_addr,
-                                "sanity_check_addr": sanity_check_addr,
-                                "sanity_code": sanity_code,
-                            },
-                        )
-                        # Downgrade from "valid" to "risky_catch_all"
-                        status = "risky_catch_all"
-                        reason = "rcpt_2xx_catchall_sanity_failed"
-                        catch_all_status = "catch_all"  # Update for subsequent iterations
-
-                        # Update persisted result to reflect the downgrade
-                        if email_id is not None:
-                            try:
-                                _persist_sequential_verification_result(
-                                    con=con,
-                                    email_id=email_id,
-                                    email=email_addr,
-                                    domain=domain,
-                                    mx_host=mx_host,
-                                    status=status,
-                                    reason=reason,
-                                    code=code,
-                                    catch_all_status=catch_all_status,
-                                    company_id=company_id,
-                                    person_id=person_id,
-                                )
-                                con.commit()
-                            except Exception:
-                                pass
-                except Exception:
-                    log.debug(
-                        "R12 sequential: catch-all sanity check exception (ignoring)",
-                        exc_info=True,
-                        extra={"domain": domain, "email": email_addr},
-                    )
-
-            # Now handle based on (possibly updated) status
-            if status == "valid":
-                valid_email = email_addr
-                valid_pattern = pattern_key
-                final_status = "valid_found"
-
-                # Update email source_note to indicate it's verified valid (if column exists)
-                if email_id is not None:
-                    try:
-                        cols = _table_cols(con, "emails")
-                        if "source_note" in cols:
-                            con.execute(
-                                "UPDATE emails SET source_note = ? WHERE id = ?",
-                                (f"verified:valid:pattern={pattern_key}", email_id),
-                            )
-                            con.commit()
-                    except Exception:
-                        try:
-                            con.rollback()
-                        except Exception:
-                            pass
-
-                log.info(
-                    "R12 sequential: found valid email",
-                    extra={
-                        "person_id": person_id,
-                        "domain": domain,
-                        "email": email_addr,
-                        "email_id": email_id,
-                        "pattern": pattern_key,
-                        "rank": rank,
-                        "total_probes": total_probes,
-                    },
-                )
-                break
-
-            # If sanity check downgraded to risky_catch_all, handle it here
-            elif status == "risky_catch_all":
-                valid_email = email_addr
-                valid_pattern = pattern_key
-                final_status = "risky_found"
-
-                # Update email source_note (if column exists)
-                if email_id is not None:
-                    try:
-                        cols = _table_cols(con, "emails")
-                        if "source_note" in cols:
-                            con.execute(
-                                "UPDATE emails SET source_note = ? WHERE id = ?",
-                                (f"verified:risky_catch_all:pattern={pattern_key}", email_id),
-                            )
-                            con.commit()
-                    except Exception:
-                        try:
-                            con.rollback()
-                        except Exception:
-                            pass
-
-                log.info(
-                    "R12 sequential: found risky_catch_all email (sanity check downgrade)",
-                    extra={
-                        "person_id": person_id,
-                        "domain": domain,
-                        "email": email_addr,
-                        "email_id": email_id,
-                        "pattern": pattern_key,
-                        "rank": rank,
-                        "total_probes": total_probes,
-                    },
-                )
-                break
-
-        if status == "risky_catch_all":
-            valid_email = email_addr
-            valid_pattern = pattern_key
-            final_status = "risky_found"
-
-            # Update email source_note (if column exists)
-            if email_id is not None:
-                try:
-                    cols = _table_cols(con, "emails")
-                    if "source_note" in cols:
-                        con.execute(
-                            "UPDATE emails SET source_note = ? WHERE id = ?",
-                            (f"verified:risky_catch_all:pattern={pattern_key}", email_id),
-                        )
-                        con.commit()
-                except Exception:
-                    try:
-                        con.rollback()
-                    except Exception:
-                        pass
-
-            log.info(
-                "R12 sequential: found risky_catch_all email",
-                extra={
-                    "person_id": person_id,
-                    "domain": domain,
-                    "email": email_addr,
-                    "email_id": email_id,
-                    "pattern": pattern_key,
-                    "rank": rank,
-                    "total_probes": total_probes,
-                },
-            )
+        # Every candidate the batch already answered is still worth walking --
+        # those RCPTs are paid for. But do not open FRESH sessions into an MX
+        # that is deferring us; that is the 6,671-probes-for-69-accepts pattern.
+        if just_deferred and not batch_plan:
             break
 
-        # Optional cleanup: remove ONLY hard-invalid permutations
-        # (and their results) to reduce clutter.
-        # Default: enabled (CLEANUP_INVALID_GENERATED=1). Disable to preserve full audit trail.
-        if status == "invalid" and email_id is not None:
-            # Try to mark invalid in source_note (if column exists); then delete
-            email_cols = _table_cols(con, "emails")
-            if "source_note" in email_cols:
-                try:
-                    con.execute(
-                        "UPDATE emails SET source_note = ? WHERE id = ?",
-                        (f"invalid:{reason}:pattern={pattern_key}", email_id),
-                    )
-                    con.commit()
-                except Exception:
-                    log.debug("Failed to update source_note for invalid email", exc_info=True)
-                    try:
-                        con.rollback()
-                    except Exception:
-                        pass
+        # Step 5: Teach the evidence store. Only decided outcomes count.
+        if status in ("valid", "invalid"):
+            _teach(email_addr, pattern_key, status == "valid")
 
-            if cleanup_enabled:
+        # Step 6: Stop on anything the server accepted; otherwise keep walking.
+        if status in ("valid", "risky_catch_all"):
+            _teach_unprocessed()
+            _accept(email_addr, pattern_key, email_id, status, rank)
+            return _result(
+                status="valid_found" if status == "valid" else "risky_found",
+                valid_email=email_addr,
+                valid_pattern=pattern_key,
+                attempts=attempts,
+                probes=total_probes,
+                confidence=confidence,
+                grade=grade,
+            )
+
+        if status == "invalid":
+            # Mark, then delete: the address is gone but the pattern-level
+            # failure was already recorded above, which is the whole point.
+            _set_email_source_note(con, email_id, f"invalid:{reason}:pattern={pattern_key}")
+            if cleanup_enabled and email_id is not None:
                 try:
                     _delete_email_and_verification_results(con, int(email_id))
                     con.commit()
-
-                    # Verify the delete worked
-                    check = con.execute(
-                        "SELECT 1 FROM emails WHERE id = ?", (int(email_id),)
-                    ).fetchone()
-                    if check is None:
-                        log.info(
-                            "R12 sequential: deleted invalid generated email",
-                            extra={
-                                "email_id": email_id,
-                                "email": email_addr,
-                                "reason": reason,
-                            },
-                        )
-                    else:
-                        log.warning(
-                            "R12 sequential: delete did NOT work - email still exists",
-                            extra={"email_id": email_id, "email": email_addr},
-                        )
                 except Exception:
                     log.warning(
                         "R12 sequential: failed to delete invalid email",
@@ -3419,24 +3714,6 @@ def _generate_emails_sequential(  # noqa: C901
                         con.rollback()
                     except Exception:
                         pass
-
-        elif email_id is not None:
-            # For temp_fail/unknown after max retries: mark email but don't delete
-            try:
-                email_cols_check = _table_cols(con, "emails")
-                if "source_note" in email_cols_check:
-                    con.execute(
-                        "UPDATE emails SET source_note = ? WHERE id = ?",
-                        (f"unverified:{status}:{reason}:pattern={pattern_key}", email_id),
-                    )
-                    con.commit()
-            except Exception:
-                try:
-                    con.rollback()
-                except Exception:
-                    pass
-
-        if status == "invalid":
             log.debug(
                 "R12 sequential: permutation invalid, trying next",
                 extra={
@@ -3448,6 +3725,9 @@ def _generate_emails_sequential(  # noqa: C901
             )
             continue
 
+        # temp_fail / unknown after retries: keep the row, do not delete, do not
+        # record evidence — we learned nothing about the pattern.
+        _set_email_source_note(con, email_id, f"unverified:{status}:{reason}:pattern={pattern_key}")
         log.debug(
             "R12 sequential: permutation %s after retries, trying next",
             status,
@@ -3458,10 +3738,15 @@ def _generate_emails_sequential(  # noqa: C901
             },
         )
 
-    # Determine final status if not already set
-    if final_status == "exhausted":
-        all_invalid = all(a.get("status") in ("invalid", "skipped") for a in attempts)
-        final_status = "all_invalid" if all_invalid else "exhausted"
+    _teach_unprocessed()
+
+    all_invalid = bool(attempts) and all(
+        a.get("status") in ("invalid", "skipped") for a in attempts
+    )
+    final_status = "all_invalid" if all_invalid else "exhausted"
+    if deferred_scheduled:
+        # Not a dead end: a probe is queued and will land in verification_results.
+        final_status = "deferred"
 
     log.info(
         "R12 sequential verification complete",
@@ -3469,111 +3754,103 @@ def _generate_emails_sequential(  # noqa: C901
             "person_id": person_id,
             "domain": domain,
             "status": final_status,
-            "valid_email": valid_email,
+            "valid_email": None,
             "total_probes": total_probes,
             "attempts": len(attempts),
             "only_pattern": effective_pattern,
         },
     )
+    return _result(status=final_status, attempts=attempts, probes=total_probes)
 
-    return {
-        "count": 1 if valid_email else 0,
-        "enqueued": 0,  # No async enqueue in sequential mode
-        "verified": total_probes,
-        "valid_email": valid_email,
-        "valid_pattern": valid_pattern,
-        "status": final_status,
-        "attempts": attempts,
-        "max_probes_per_person": max_probes,
-        "only_pattern": effective_pattern,
-        "inference_confidence": inf_conf,
-        "inference_samples": inf_samples,
-        "domain": domain,
-        "person_id": person_id,
-    }
+
+def _probe_candidates(
+    emails: list[str],
+    mx_host: str,
+    catch_all_status: str | None,
+) -> list[dict]:
+    """
+    Probe one or more addresses at one MX on a SINGLE SMTP session and classify
+    each result for the sequential verifier.
+
+    No sleeping, ever. The old loop slept 1s then 2s on a temp_fail and threw
+    the answer away; greylisting needs 300s+, so those 20,443 probes were spent
+    on an outcome that could not happen. A 4xx the server actually SPOKE (code
+    and message present) now becomes "deferred": the caller persists it and
+    hands it to _maybe_defer_greylist_retry, which re-probes minutes later off
+    the worker thread. A connection-level temp_fail (code is None) stays
+    "temp_fail" and the caller moves on to the next candidate immediately.
+
+    When a multi-address batch contains BOTH an accept and a hard_fail, this MX
+    has rejected one plausible local-part and accepted another -- which is
+    exactly what the separate catch-all probe measures. That promotes the
+    accept to "valid" and sets catchall_ruled_out, so the caller can skip the
+    extra sanity connection it would otherwise open.
+    """
+    try:
+        results = probe_rcpt_batch(
+            emails,
+            mx_host,
+            helo_domain=SMTP_HELO_DOMAIN,
+            mail_from=SMTP_MAIL_FROM,
+            connect_timeout=float(SMTP_CONNECT_TIMEOUT),
+            command_timeout=float(SMTP_COMMAND_TIMEOUT),
+            behavior_hint=None,
+        )
+    except Exception as exc:
+        return [
+            {
+                "email": e,
+                "status": "unknown",
+                "reason": f"exception:{type(exc).__name__}",
+                "code": None,
+                "message": None,
+                "retries": 1,
+                "catchall_ruled_out": False,
+            }
+            for e in emails
+        ]
+
+    seen = [r.get("category") for r in results if r.get("attempted", True)]
+    discriminates = "accept" in seen and "hard_fail" in seen
+    ca = catch_all_status
+    if discriminates and ca != "catch_all":
+        ca = "not_catch_all"
+
+    out: list[dict] = []
+    for email_addr, r in zip(emails, results, strict=True):
+        code = r.get("code")
+        message = r.get("message")
+        status, reason = _classify_probe_for_sequential(
+            code, r.get("error"), r.get("category", "unknown"), ca
+        )
+        if status == "temp_fail" and code is not None and message:
+            status = "deferred"
+            reason = (
+                "greylist_deferred"
+                if is_greylist_deferral(code, message)
+                else "policy_temp_fail_deferred"
+            )
+        out.append(
+            {
+                "email": email_addr,
+                "status": status,
+                "reason": reason,
+                "code": code,
+                "message": message,
+                "retries": 1,
+                "catchall_ruled_out": discriminates,
+            }
+        )
+    return out
 
 
 def _verify_permutation_with_retry(
     email_addr: str,
     mx_host: str,
     catch_all_status: str | None,
-    max_retries: int = 3,
-    retry_delay_base: float = 1.0,
 ) -> dict:
-    """
-    Verify a single email permutation with retry logic for temp_fail.
-
-
-
-
-    Returns:
-        {
-            "email": str,
-            "status": "valid" | "invalid" | "risky_catch_all" | "temp_fail" | "unknown",
-            "reason": str,
-            "code": int | None,
-            "retries": int,
-        }
-    """
-    result = {
-        "email": email_addr,
-        "status": "unknown",
-        "reason": "not_probed",
-        "code": None,
-        "retries": 0,
-    }
-
-    for attempt in range(max_retries):
-        result["retries"] = attempt + 1
-
-        try:
-            # Use the core probe function
-            probe_result = probe_rcpt(
-                email_addr,
-                mx_host,
-                helo_domain=SMTP_HELO_DOMAIN,
-                mail_from=SMTP_MAIL_FROM,
-                connect_timeout=float(SMTP_CONNECT_TIMEOUT),
-                command_timeout=float(SMTP_COMMAND_TIMEOUT),
-                behavior_hint=None,
-            )
-
-            code = probe_result.get("code")
-            error = probe_result.get("error")
-            category = probe_result.get("category", "unknown")
-
-            result["code"] = code
-
-            # Classify the response
-            status, reason = _classify_probe_for_sequential(code, error, category, catch_all_status)
-            result["status"] = status
-            result["reason"] = reason
-
-            # Don't retry on definitive results
-            if status in ("valid", "invalid", "risky_catch_all"):
-                return result
-
-            # Retry on temp_fail
-            if status == "temp_fail" and attempt < max_retries - 1:
-                delay = retry_delay_base * (2**attempt) + (time.time() % 1)  # Add jitter
-                time.sleep(delay)
-                continue
-
-            # Unknown or exhausted retries
-            return result
-
-        except Exception as exc:
-            result["status"] = "unknown"
-            result["reason"] = f"exception:{type(exc).__name__}"
-
-            if attempt < max_retries - 1:
-                delay = retry_delay_base * (2**attempt) + (time.time() % 1)
-                time.sleep(delay)
-                continue
-
-            return result
-
-    return result
+    """One address, one probe, no sleep. See _probe_candidates."""
+    return _probe_candidates([email_addr], mx_host, catch_all_status)[0]
 
 
 def _classify_probe_for_sequential(
@@ -3584,18 +3861,27 @@ def _classify_probe_for_sequential(
 ) -> tuple[str, str]:
     """Classify an SMTP RCPT probe for the sequential verifier (R12).
 
-    Critical invariant:
-      - Confirmed catch-all domains + RCPT 2xx → risky_catch_all (not valid).
-      - Unknown catch-all status + RCPT 2xx → valid (provisionally).
+    Critical invariant: only a domain *proven* not to be catch-all can turn a
+    2xx into "valid".
+
+      - "not_catch_all" + 2xx -> valid.
+      - "catch_all" + 2xx -> risky_catch_all: the server accepts every
+        local-part, so the 2xx says nothing about this mailbox.
+      - unknown catch-all + 2xx -> risky_catch_all as well.  We never
+        established that this domain distinguishes real mailboxes, so the 2xx
+        is just as unconfirmable; "valid" would assert what we did not measure.
+
+    Mirrors src.verify.status._classify_good_rcpt, which classifies the same
+    signals on the async R16/R18 path.
     """
     ca = (catch_all_status or "").strip().lower() or None
 
     if category == "accept":
-        if ca == "catch_all":
-            return "risky_catch_all", "rcpt_2xx_catchall"
         if ca == "not_catch_all":
             return "valid", "rcpt_2xx_accepted"
-        return "valid", "rcpt_2xx_catchall_unconfirmed"
+        if ca == "catch_all":
+            return "risky_catch_all", "rcpt_2xx_catchall"
+        return "risky_catch_all", "rcpt_2xx_catchall_unconfirmed"
 
     # Handle both "reject" and "hard_fail" - smtp.py returns "hard_fail" for 5xx codes
     if category in ("reject", "hard_fail"):
@@ -3609,11 +3895,11 @@ def _classify_probe_for_sequential(
 
     # Fallback for implementations that only provide codes
     if isinstance(code, int) and 200 <= code < 300:
-        if ca == "catch_all":
-            return "risky_catch_all", "rcpt_2xx_catchall"
         if ca == "not_catch_all":
             return "valid", "rcpt_2xx_accepted"
-        return "valid", "rcpt_2xx_catchall_unconfirmed"
+        if ca == "catch_all":
+            return "risky_catch_all", "rcpt_2xx_catchall"
+        return "risky_catch_all", "rcpt_2xx_catchall_unconfirmed"
 
     # Fallback for implementations that only provide codes (not category)
     if isinstance(code, int) and 500 <= code < 600:
@@ -3772,6 +4058,10 @@ def autodiscover_company(company_id: int) -> dict:  # noqa: C901
             run_id = meta.get("run_id")
             if not run_id:
                 return
+
+            # Heartbeat first: this fires on EVERY stage, including the
+            # non-terminal autodiscovery pass that takes most of the wall clock.
+            _touch_run_heartbeat(run_id=str(run_id))
 
             if meta.get("is_terminal_stage") is False:
                 return
@@ -4324,6 +4614,12 @@ def _candidate_full_name(cand: ExtractCandidate) -> str | None:
     return " ".join(parts) if parts else None
 
 
+# Title values that mean "we never actually captured one". "Auto-discovered"
+# is the legacy placeholder this function used to write; "" and None are the
+# other ways the field ends up empty.
+_PLACEHOLDER_TITLES: frozenset[str] = frozenset({"", "Auto-discovered"})
+
+
 def _upsert_person_from_candidate(
     con: Any,
     *,
@@ -4334,18 +4630,54 @@ def _upsert_person_from_candidate(
     """
     Upsert a person row for (company_id, full_name).
 
+    This genuinely upserts. It previously returned on the existing row without
+    touching any field, which made `title` WRITE-ONCE: whoever was inserted
+    first without a title kept the "Auto-discovered" placeholder forever, and
+    every later extraction pass -- including successful AI extractions that had
+    read the title correctly -- looked the person up, found them, and discarded
+    the result. 2,209 of 5,569 people carried no real title because of this,
+    565 of them at companies where the extractor demonstrably DID get titles
+    for their colleagues.
 
-
+    So on an existing row we now fill in what is missing. We only ever fill
+    blanks -- a real stored title is never overwritten by a later pass, because
+    a fresh crawl is not automatically more correct than an earlier one.
 
     Returns (person_id, inserted_new).
     """
+    cand_title = getattr(cand, "title", None)
+    cand_title = str(cand_title).strip() if cand_title else None
+    if cand_title in _PLACEHOLDER_TITLES:
+        cand_title = None
+    cand_source = getattr(cand, "source_url", None)
+
     row_p = con.execute(
-        "SELECT id FROM people WHERE company_id = ? AND full_name = ?", (company_id, full_name)
+        "SELECT id, title, source_url FROM people WHERE company_id = ? AND full_name = ?",
+        (company_id, full_name),
     ).fetchone()
     if row_p:
-        return int(row_p[0]), False
+        person_id = int(row_p[0])
+        stored_title = (row_p[1] or "").strip()
+        stored_source = (row_p[2] or "").strip()
 
-    title_val = getattr(cand, "title", None) or "Auto-discovered"
+        sets: list[str] = []
+        vals: list[Any] = []
+        if cand_title and stored_title in _PLACEHOLDER_TITLES:
+            sets.append("title = ?")
+            vals.append(cand_title)
+        if cand_source and not stored_source:
+            sets.append("source_url = ?")
+            vals.append(cand_source)
+
+        if sets:
+            vals.append(person_id)
+            con.execute(f"UPDATE people SET {', '.join(sets)} WHERE id = ?", tuple(vals))
+        return person_id, False
+
+    # NULL, not a magic string. The old "Auto-discovered" placeholder made the
+    # gap invisible to COUNT(title) and to any "has a title" filter, which is
+    # exactly how it went unnoticed.
+    title_val = cand_title
 
     cur_p = con.execute(
         """
@@ -4589,6 +4921,10 @@ def _persist_candidates_for_company(  # noqa: C901
                 exc_info=True,
                 extra={"email": email_norm, "company_id": company_id, "exc": str(e)},
             )
+
+    _record_inferred_patterns_safe(
+        con, company_id=company_id, dom=dom, emails=list(candidates_by_email)
+    )
 
     try:
         log.info(

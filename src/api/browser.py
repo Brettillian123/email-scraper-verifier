@@ -10,62 +10,16 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from src.api.deps import AuthContext, get_auth_context
 
 RQ_REDIS_URL = (
     os.getenv("RQ_REDIS_URL") or os.getenv("REDIS_URL") or "redis://127.0.0.1:6379/0"
 ).strip()
 router = APIRouter(prefix="/api/browser", tags=["browser"])
-
-
-# --------------------------------------------------------------------------------------
-# Auth / tenant scoping
-# --------------------------------------------------------------------------------------
-
-try:
-    # Preferred dependency provider (avoids importing FastAPI app module).
-    from src.api.deps import AuthContext, get_auth_context  # type: ignore
-except Exception:  # pragma: no cover
-    from fastapi import Header
-
-    class AuthContext(BaseModel):  # type: ignore[no-redef]
-        tenant_id: str = Field(default=os.getenv("DEV_TENANT_ID", "dev").strip() or "dev")
-        user_id: str = Field(default=os.getenv("DEV_USER_ID", "user_dev").strip() or "user_dev")
-        email: str | None = None
-        roles: list[str] = Field(default_factory=list)
-
-    def get_auth_context(  # type: ignore[no-redef]
-        request: Request,
-        x_tenant_id: str | None = Header(default=None),
-        x_user_id: str | None = Header(default=None),
-        x_user_email: str | None = Header(default=None),
-    ) -> AuthContext:
-        # 1. Try session cookie first (dashboard browser calls)
-        try:
-            from src.auth.core import SESSION_COOKIE_NAME, get_session
-
-            session_id = request.cookies.get(SESSION_COOKIE_NAME)
-            if session_id:
-                session, user = get_session(session_id)
-                if session and user:
-                    return AuthContext(
-                        tenant_id=user.tenant_id,
-                        user_id=user.id,
-                        email=user.email,
-                        roles=["admin"] if user.is_superuser else [],
-                    )
-        except Exception:
-            pass
-
-        # 2. Fall back to header-based auth (API / dev callers)
-        tenant = (x_tenant_id or "").strip() or os.getenv("DEV_TENANT_ID", "dev").strip() or "dev"
-        user = (
-            (x_user_id or "").strip() or os.getenv("DEV_USER_ID", "user_dev").strip() or "user_dev"
-        )
-        email = (x_user_email or "").strip() or None
-        return AuthContext(tenant_id=tenant, user_id=user, email=email, roles=[])
 
 
 def _get_conn():
@@ -1278,7 +1232,23 @@ def list_emails(
     company_id: int = Query(None),
     status: str = Query(None),
     search: str = Query(None),
+    include_unusable: bool = Query(False),
 ) -> PaginatedResponse:
+    """
+    List generated/scraped addresses with their latest verification verdict.
+
+    By default this HIDES addresses that are not usable for outreach --
+    'invalid' and 'risky_catch_all' -- because together they are the bulk of the
+    table and drown out the addresses you can actually send to. They are still
+    stored, still counted in /stats, and still reachable here:
+
+      * status=invalid            -> just the confirmed-bad ones
+      * status=risky_catch_all    -> just the catch-all domains
+      * include_unusable=true     -> everything, unfiltered
+
+    Never-verified rows (verify_status IS NULL) are always shown; they are
+    pending work, not a negative result.
+    """
     con = _get_conn()
     try:
         offset = (page - 1) * page_size
@@ -1297,8 +1267,15 @@ def list_emails(
         status_clause = ""
         status_param: list[Any] = []
         if status:
+            # An explicit status always wins -- this is how the UI opens the
+            # "invalid" / "risky" sections.
             status_clause = "AND vr.verify_status = %s"
             status_param.append(status)
+        elif not include_unusable:
+            status_clause = (
+                "AND (vr.verify_status IS NULL "
+                "OR vr.verify_status NOT IN ('invalid', 'risky_catch_all'))"
+            )
 
         where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else "WHERE 1=1"
 

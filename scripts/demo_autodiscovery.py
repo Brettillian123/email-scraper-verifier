@@ -79,7 +79,6 @@ from src.queueing.tasks import (
 from src.queueing.tasks import (
     task_probe_email as _task_probe_email,
 )
-from src.search.indexing import LeadSearchParams, search_people_leads
 
 # Task A: Robots explainability imports
 try:
@@ -3202,82 +3201,6 @@ def _print_v_emails_latest_snapshot(dom: str, emails: list[dict[str, Any]]) -> N
         print("\t".join(line))
 
 
-def _has_people_fts(conn: Any) -> bool:
-    return bool(
-        conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='people_fts'"
-        ).fetchone()
-    )
-
-
-def _search_backend_sanity_check(
-    conn: Any,
-    *,
-    dom: str,
-    search_hint: str | None,
-) -> None:
-    if not _has_people_fts(conn):
-        print("\n(people_fts not present; skipping search backend check)")
-        return
-
-    print("\n=== Search backend sanity check ===")
-
-    raw_hint = (search_hint or dom or "").strip()
-    if not raw_hint:
-        print("(no search hint available; skipping search backend check)")
-        return
-    search_token = raw_hint.split()[0]
-
-    sig = inspect.signature(LeadSearchParams)
-    params = sig.parameters
-    kwargs: dict[str, Any] = {}
-
-    if "q" in params:
-        kwargs["q"] = search_token
-    elif "query" in params:
-        kwargs["query"] = search_token
-    elif "term" in params:
-        kwargs["term"] = search_token
-
-    if "limit" in params:
-        kwargs["limit"] = 20
-    elif "page_size" in params:
-        kwargs["page_size"] = 20
-
-    lp = LeadSearchParams(**kwargs)
-    raw_rows = search_people_leads(conn, lp)
-
-    if isinstance(raw_rows, tuple) and raw_rows:
-        rows = raw_rows[0]
-    else:
-        rows = raw_rows
-
-    rows_list: list[dict[str, Any]] = []
-    for r in rows:
-        if isinstance(r, dict):
-            rows_list.append(r)
-        else:
-            rows_list.append(dict(r))
-
-    if not rows_list:
-        print(
-            "No rows returned from local FTS search for search token",
-            repr(search_token),
-        )
-        return
-
-    print(f"Search returned {len(rows_list)} rows; first few:")
-    for row in rows_list[:5]:
-        print(
-            "-",
-            row.get("email"),
-            "|",
-            (row.get("company") or row.get("company_name") or ""),
-            "| verify_status=",
-            row.get("verify_status"),
-        )
-
-
 def print_summary(
     conn: Any,
     domain: str,
@@ -3285,8 +3208,7 @@ def print_summary(
     result: AutodiscoveryResult | None = None,
 ) -> None:
     """
-    Print a small table of leads for this domain from v_emails_latest, plus
-    a short search-based check when FTS is available.
+    Print a small table of leads for this domain from v_emails_latest.
 
     Task D: Also prints the AutodiscoveryResult summary if provided.
     """
@@ -3323,7 +3245,6 @@ def print_summary(
     dom = (domain or "").strip().lower()
     emails = _fetch_v_emails_latest_rows(conn, dom)
     _print_v_emails_latest_snapshot(dom, emails)
-    _search_backend_sanity_check(conn, dom=dom, search_hint=search_hint)
 
     if result is not None:
         print("=" * 70 + "\n")

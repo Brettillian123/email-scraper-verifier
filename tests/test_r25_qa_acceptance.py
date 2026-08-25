@@ -7,7 +7,6 @@ These tests verify end-to-end behavior of the verification pipeline.
 NOTE: This module uses SQLite-specific features:
 - PRAGMA table_info() and PRAGMA foreign_keys
 - sqlite3.Connection.executescript()
-- SqliteFtsBackend for search
 
 These tests must be skipped when running against PostgreSQL.
 The conftest.py db_conn fixture would override our SQLite fixtures,
@@ -32,7 +31,7 @@ _IS_POSTGRES = "postgresql" in _DB_URL.lower() or "postgres" in _DB_URL.lower()
 # Skip all tests in this module if PostgreSQL is configured
 pytestmark = pytest.mark.skipif(
     _IS_POSTGRES,
-    reason="R25 tests use SQLite-specific features (PRAGMA, executescript, SqliteFtsBackend)",
+    reason="R25 tests use SQLite-specific features (PRAGMA, executescript)",
 )
 
 # Directory where this test file lives

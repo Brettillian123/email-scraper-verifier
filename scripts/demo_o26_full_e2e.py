@@ -27,8 +27,6 @@ This script orchestrates the full bounce-based verification flow:
 
   4) Show verification_results snapshot for the domain.
 
-  5) Show search-backend snapshot (SqliteFtsBackend / LeadSearchParams).
-
 Prereqs:
   - DB schema + migrations already applied (e.g. via scripts/accept_r25.ps1).
   - AWS SES + SNS+SQS integration configured (same as your existing setup).
@@ -55,8 +53,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.search.backend import SqliteFtsBackend
-from src.search.indexing import LeadSearchParams
 from src.verify.test_send import assume_delivered_for_stale_test_sends
 
 
@@ -116,41 +112,6 @@ def _verification_snapshot(db_path: Path, domain: str) -> None:
                 f"reason={r['verify_reason'] or 'None':<24}  "
                 f"test={r['test_send_status'] or 'None':<14}  "
                 f"code={r['bounce_code'] or 'None'}"
-            )
-    finally:
-        conn.close()
-
-
-def _search_snapshot(db_path: Path, query: str) -> None:
-    print()
-    print("=" * 80)
-    print(f"Search backend snapshot for query: {query!r}")
-    print("=" * 80)
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        backend = SqliteFtsBackend(conn)
-        params = LeadSearchParams(
-            query=query,
-            sort="icp_desc",
-            limit=50,
-        )
-        rows = backend.search_leads(params)
-        if not rows:
-            print("(no rows returned from search backend)")
-            return
-
-        for row in rows:
-            email = row["email"]
-            vs = row.get("verify_status")
-            label = row.get("verify_label")
-            is_primary = row.get("is_primary_for_person")
-            print(
-                f"{email:<40}  "
-                f"vs={vs or 'None':<16}  "
-                f"label={label or 'None':<20}  "
-                f"is_primary={is_primary!r}"
             )
     finally:
         conn.close()
@@ -451,9 +412,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4) Snapshot: verification_results for this domain
     _verification_snapshot(db_path, args.domain)
-
-    # 5) Snapshot: search backend for this domain token
-    _search_snapshot(db_path, query=args.domain.split(".", 1)[0])
 
     print()
     print("✔ Full O26 end-to-end demo completed.")

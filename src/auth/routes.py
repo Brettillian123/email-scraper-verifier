@@ -135,7 +135,12 @@ def _render_template(
         "registration_enabled": REGISTRATION_ENABLED,
         **(context or {}),
     }
-    return templates.TemplateResponse(template_name, ctx, status_code=status_code)
+    # Starlette 1.x removed the legacy TemplateResponse(name, context) order.
+    # Passing it that way made `name` the context dict, so Jinja2 tried to use a
+    # dict as a cache key and every template route 500'd with "unhashable type:
+    # 'dict'" -- which is why /auth/login, /auth/register, /auth/forgot-password
+    # and /demo were all dead. request goes first now.
+    return templates.TemplateResponse(request, template_name, ctx, status_code=status_code)
 
 
 def _get_session_user(request: Request) -> tuple[str | None, User | None]:

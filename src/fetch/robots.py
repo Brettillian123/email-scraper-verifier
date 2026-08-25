@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from src.config import FETCH_USER_AGENT
+from src.fetch.ssrf import SSRFBlocked, safe_get
 
 log = logging.getLogger(__name__)
 
@@ -346,15 +347,34 @@ def _build_policy_from_text(text: str) -> _Policy:
 def _fetch_and_resolve(host: str) -> _Policy:
     """
     Fetch https://{host}/robots.txt and return a resolved policy for our UA.
+
+    WHY safe_get: `host` originates from a scraped, attacker-controlled domain
+    list, and this is the very first request made for any new domain. Fetching
+    https://{host}/robots.txt with follow_redirects=True would let a hostile
+    domain redirect us into the private Docker network before the crawl even
+    starts. Unsafe hosts fail closed as deny_all.
     """
     url = f"{_ROBOTS_SCHEME}://{host}/robots.txt"
     try:
         with httpx.Client(
             timeout=ROBOTS_TIMEOUT_SECONDS,
-            follow_redirects=True,
+            follow_redirects=False,
+            max_redirects=0,
             headers={"User-Agent": FETCH_USER_AGENT},
         ) as client:
-            resp = client.get(url)
+            resp = safe_get(client, url)
+    except SSRFBlocked as exc:
+        log.warning("Blocked robots.txt fetch for unsafe host %r: %s", host, exc)
+        now = _now()
+        return _Policy(
+            kind="deny_all",
+            crawl_delay=ROBOTS_DEFAULT_DELAY_SECONDS,
+            reason="blocked-unsafe-host",
+            status_code=None,
+            robots_url=url,
+            fetched_at=now,
+            expires_at=now + ROBOTS_DENY_TTL_SECONDS,
+        )
     except (httpx.RequestError, httpx.TimeoutException):
         now = _now()
         pol = _Policy(

@@ -1,9 +1,6 @@
 # tests/test_r24_admin_ui.py
 from __future__ import annotations
 
-import os
-
-import pytest
 from fastapi.testclient import TestClient
 
 import src.api.admin as admin_module
@@ -139,28 +136,31 @@ def _install_fake_analytics(monkeypatch) -> None:
     )
 
 
-def _install_fake_superuser(monkeypatch) -> None:
+def _install_session_user(monkeypatch, *, is_superuser: bool = True):
     """
-    Monkeypatch admin._require_superuser so it returns a fake User object
-    without needing a real session cookie. The admin HTML page route calls
-    _require_superuser(request) directly, which otherwise raises 403.
+    Give admin._require_superuser a session user without a real session cookie.
+
+    Only the session lookup is stubbed; the real _require_superuser gate still
+    runs, so these tests exercise the actual authorisation decision.
     """
-    from dataclasses import dataclass
+    from src.auth.core import User
 
-    @dataclass
-    class _FakeUser:
-        id: str = "test-admin"
-        tenant_id: str = "dev"
-        email: str = "admin@test.local"
-        display_name: str | None = "Test Admin"
-        is_active: bool = True
-        is_verified: bool = True
-        is_superuser: bool = True
-        is_approved: bool = True
-        created_at: str = "2025-01-01T00:00:00Z"
-        last_login_at: str | None = None
-
-    monkeypatch.setattr(admin_module, "_require_superuser", lambda request: _FakeUser())
+    user = User(
+        id="test-admin",
+        tenant_id="dev",
+        email="admin@test.local",
+        display_name="Test Admin",
+        is_active=True,
+        is_verified=True,
+        is_superuser=is_superuser,
+        is_approved=True,
+        created_at="2025-01-01T00:00:00Z",
+        last_login_at=None,
+    )
+    monkeypatch.setattr(
+        admin_module, "_get_current_user_from_session", lambda request: user
+    )
+    return user
 
 
 def _install_dev_auth_mode(monkeypatch) -> None:
@@ -177,59 +177,27 @@ def _install_dev_auth_mode(monkeypatch) -> None:
     monkeypatch.setattr(app_mod, "AUTH_MODE", "dev")
 
 
-def _request_with_admin_auth(client: TestClient, path: str):
-    """
-    Helper that performs a GET to an admin endpoint, taking into account the
-    optional O23 API-key guard.
-
-    Behaviour:
-    - If ADMIN_API_KEY is not set, perform a plain unauthenticated GET.
-    - If ADMIN_API_KEY is set, try a small set of common header formats.
-      If one yields a non-401 response, return it.
-      If all yield 401, skip the test and rely on test_o23_admin_auth for auth.
-    """
-    api_key = os.getenv("ADMIN_API_KEY")
-    if not api_key:
-        return client.get(path)
-
-    candidate_headers: list[dict[str, str]] = [
-        {"X-Admin-API-Key": api_key},
-        {"X-API-Key": api_key},
-        {"X-Admin-Key": api_key},
-        {"Authorization": f"Bearer {api_key}"},
-        {"Authorization": f"ApiKey {api_key}"},
-    ]
-
-    last_resp = None
-    for headers in candidate_headers:
-        resp = client.get(path, headers=headers)
-        last_resp = resp
-        if resp.status_code != 401:
-            return resp
-
-    # If we could not find a header format that authenticates, treat this as a
-    # configuration mismatch and skip. O23 tests cover the auth behavior.
-    if last_resp is not None and last_resp.status_code == 401:
-        pytest.skip(
-            "Admin endpoints require API key but header format is unknown; "
-            "auth behavior is covered by test_o23_admin_auth."
-        )
-
-    # Fallback (should not normally be reached)
-    return last_resp or client.get(path)
-
-
 def test_admin_metrics_shape(monkeypatch) -> None:
     """
     /admin/metrics returns the expected top-level keys and nested structure.
 
-    This is the primary R24 JSON status surface.
+    This is the primary R24 JSON status surface. It is superuser-only: the
+    payload is system-wide and crosses tenants, so an unauthorised caller must
+    be refused even when AUTH_MODE is the permissive dev mode.
     """
     _install_fake_summary(monkeypatch)
     _install_dev_auth_mode(monkeypatch)
     client = TestClient(app)
 
-    resp = _request_with_admin_auth(client, "/admin/metrics")
+    # No session at all -> refused, dev auth mode notwithstanding.
+    assert client.get("/admin/metrics").status_code == 403
+
+    # Signed in, but not a superuser -> still refused.
+    _install_session_user(monkeypatch, is_superuser=False)
+    assert client.get("/admin/metrics").status_code == 403
+
+    _install_session_user(monkeypatch, is_superuser=True)
+    resp = client.get("/admin/metrics")
     assert resp.status_code == 200
 
     data = resp.json()
@@ -275,16 +243,23 @@ def test_admin_metrics_shape(monkeypatch) -> None:
 
 def test_admin_analytics_shape(monkeypatch) -> None:
     """
-    /admin/analytics returns expected keys and basic nested structure (O17).
+    /admin/analytics returns expected keys and basic nested structure (O17),
+    and like /admin/metrics it is superuser-only.
     """
     _install_fake_analytics(monkeypatch)
     _install_dev_auth_mode(monkeypatch)
     client = TestClient(app)
+    path = "/admin/analytics?window_days=7&top_domains=5&top_errors=3"
 
-    resp = _request_with_admin_auth(
-        client,
-        "/admin/analytics?window_days=7&top_domains=5&top_errors=3",
-    )
+    # No session at all -> refused, dev auth mode notwithstanding.
+    assert client.get(path).status_code == 403
+
+    # Signed in, but not a superuser -> still refused.
+    _install_session_user(monkeypatch, is_superuser=False)
+    assert client.get(path).status_code == 403
+
+    _install_session_user(monkeypatch, is_superuser=True)
+    resp = client.get(path)
     assert resp.status_code == 200
 
     data = resp.json()
@@ -313,15 +288,22 @@ def test_admin_analytics_shape(monkeypatch) -> None:
 def test_admin_html_page_renders(monkeypatch) -> None:
     """
     /admin/ returns an HTML dashboard shell that references both
-    /admin/metrics and /admin/analytics.
+    /admin/metrics and /admin/analytics, and is superuser-only.
     """
     _install_fake_summary(monkeypatch)
     _install_fake_analytics(monkeypatch)
-    _install_fake_superuser(monkeypatch)
     _install_dev_auth_mode(monkeypatch)
     client = TestClient(app)
 
-    resp = _request_with_admin_auth(client, "/admin/")
+    # No session at all -> refused, dev auth mode notwithstanding.
+    assert client.get("/admin/").status_code == 403
+
+    # Signed in, but not a superuser -> still refused.
+    _install_session_user(monkeypatch, is_superuser=False)
+    assert client.get("/admin/").status_code == 403
+
+    _install_session_user(monkeypatch, is_superuser=True)
+    resp = client.get("/admin/")
     assert resp.status_code == 200
     content_type = resp.headers.get("content-type", "")
     assert content_type.startswith("text/html")

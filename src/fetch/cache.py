@@ -42,6 +42,11 @@ class CacheEntry:
     body: bytes | None
     fetched_at: float
     expires_at: float | None
+    # URL the response actually came from after redirects. Stored because the cache is
+    # keyed by the *requested* URL: without this, replaying a cached hit would report
+    # the pre-redirect URL as the page's location, and the crawler uses that value both
+    # to lock its canonical origin and to attribute extracted people to a source page.
+    effective_url: str | None = None
 
     @property
     def fresh(self) -> bool:
@@ -202,10 +207,16 @@ class Cache:
               body BLOB,
               fetched_at REAL NOT NULL,
               expires_at REAL,
+              effective_url TEXT,
               PRIMARY KEY (scheme, host, path)
             )
             """
         )
+        # Additive migration: FETCH_CACHE_DB may point at a file written before
+        # effective_url existed, and CREATE TABLE IF NOT EXISTS will not add it.
+        cols = {row[1] for row in self._cx.execute("PRAGMA table_info(http_cache)")}
+        if "effective_url" not in cols:
+            self._cx.execute("ALTER TABLE http_cache ADD COLUMN effective_url TEXT")
         self._cx.commit()
 
     # ---- public API ------------------------------------------------------------------
@@ -218,7 +229,7 @@ class Cache:
         row = self._cx.execute(
             (
                 "SELECT scheme,host,path,etag,last_modified,status,content_type,body,"
-                "fetched_at,expires_at "
+                "fetched_at,expires_at,effective_url "
                 "FROM http_cache "
                 "WHERE scheme=? AND host=? AND path=?"
             ),
@@ -238,6 +249,7 @@ class Cache:
             body=row[7],
             fetched_at=float(row[8]),
             expires_at=None if row[9] is None else float(row[9]),
+            effective_url=row[10],
         )
         return entry, entry.fresh
 
@@ -264,6 +276,7 @@ class Cache:
         headers: Mapping[str, str],
         *,
         now: float | None = None,
+        effective_url: str | None = None,
     ) -> CacheEntry:
         """
         Store a 200-series response. Respects max-age/Expires and caps body size/types.
@@ -285,9 +298,9 @@ class Cache:
             INSERT INTO http_cache (
                 scheme, host, path,
                 etag, last_modified, status,
-                content_type, body, fetched_at, expires_at
+                content_type, body, fetched_at, expires_at, effective_url
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (scheme, host, path) DO UPDATE SET
                 etag=excluded.etag,
                 last_modified=excluded.last_modified,
@@ -295,7 +308,8 @@ class Cache:
                 content_type=excluded.content_type,
                 body=excluded.body,
                 fetched_at=excluded.fetched_at,
-                expires_at=excluded.expires_at
+                expires_at=excluded.expires_at,
+                effective_url=excluded.effective_url
             """,
             (
                 scheme,
@@ -308,6 +322,7 @@ class Cache:
                 body_to_store,
                 float(now),
                 None if expires_at is None else float(expires_at),
+                effective_url,
             ),
         )
         self._cx.commit()
@@ -415,8 +430,12 @@ def store_200(
     content_type: str | None,
     body: bytes | None,
     headers: Mapping[str, str],
+    *,
+    effective_url: str | None = None,
 ) -> CacheEntry:
-    return default().store_200(url, status, content_type, body, headers)
+    return default().store_200(
+        url, status, content_type, body, headers, effective_url=effective_url
+    )
 
 
 def store_304(url: str, headers: Mapping[str, str]) -> CacheEntry | None:

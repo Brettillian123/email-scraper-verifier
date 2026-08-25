@@ -30,6 +30,14 @@ from src.db import get_conn
 
 DEFAULT_TTL_SECONDS = 86400  # 24h
 
+#: Minimum probes before get_mx_behavior_hint() will call a host a tarpit.
+#: Callers skip tarpits without opening a socket, so a false positive costs
+#: every address behind that MX until the evidence window rolls over.
+TARPIT_MIN_SAMPLES = 30
+#: Share of probes answered 4xx above which a host is deferring us on purpose.
+#: Mimecast sits at 0.95 (6,671 probes, 69 accepts); Google at 0.20.
+TARPIT_TEMP_FAIL_RATE = 0.30
+
 # Exposed for tests to patch
 _DNSPY_AVAILABLE = False
 try:  # pragma: no cover
@@ -192,11 +200,6 @@ def _get_domain_column(conn: Any) -> str:
 
     _domain_column_cache[conn_id] = col
     return col
-
-
-def _clear_domain_column_cache() -> None:
-    """Clear the domain column cache (for testing)."""
-    _domain_column_cache.clear()
 
 
 def _ensure_table(conn: Any) -> None:
@@ -850,7 +853,21 @@ def get_mx_behavior_hint(
     p95 = _percentile(elats, 95)
     tfr = round(temps / total, 3)
     srate = round(accpt / total, 3)
-    tarpit = (p95 > 2000) or (tfr > 0.30)
+
+    # A tarpit is a host that DEFERS us, so only the temp_fail rate says so.
+    # Latency alone does not: measured against 389 production MX hosts, 35 of
+    # them clear p95 > 2000ms while deferring at or below the 0.30 rate -- they
+    # are distant or slow, not hostile, and several have already yielded
+    # confirmed-valid addresses. Latency stays in the payload so callers can
+    # widen timeouts (see _apply_hint_timeouts), which is the right response to
+    # a slow host; skipping it is not.
+    #
+    # TARPIT_MIN_SAMPLES exists because _percentile() of a single probe IS that
+    # probe: without a floor, one slow first-of-session hard-fail (56% of all
+    # production probes hard-fail) marks a brand-new MX a tarpit on n=1. That
+    # matters most for hosts we have only just started probing, which is exactly
+    # the population a coverage push introduces.
+    tarpit = total >= TARPIT_MIN_SAMPLES and tfr > TARPIT_TEMP_FAIL_RATE
 
     return {
         "n": total,

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import base64
 import csv
-import hashlib
-import hmac
 import io
 import json
 import os
@@ -13,18 +10,21 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from src.api import admin as admin_routes
 from src.api import browser as browser_routes
+from src.api import pipeline as pipeline_routes
+
+# AUTH_MODE is re-exported so existing callers/tests can still read
+# src.api.app.AUTH_MODE; src.api.deps owns the value and all auth decisions.
+from src.api.deps import AUTH_MODE, AuthContext, get_auth_context  # noqa: F401
 from src.api.middleware.body_limit import BodySizeLimitMiddleware
 from src.auth import routes as auth_routes
 from src.auth.middleware import RequireAuthMiddleware
-from src.search.backend import SearchBackend, SearchResult
-from src.search.indexing import LeadSearchParams
 
 # --------------------------------------------------------------------------------------
 # Config
@@ -43,20 +43,7 @@ def _is_postgres_configured() -> bool:
     return url.startswith("postgres://") or url.startswith("postgresql://")
 
 
-# Auth modes:
-#   - "none": no auth enforced (NOT for production)
-#   - "dev": header-based dev auth (recommended for local testing)
-#   - "hs256": minimal HS256 JWT verification using stdlib only
-AUTH_MODE = os.getenv("AUTH_MODE", "dev").strip().lower()
-
-# Dev auth defaults (used when AUTH_MODE is none/dev)
-DEV_TENANT_ID = os.getenv("DEV_TENANT_ID", "dev").strip()
-DEV_USER_ID = os.getenv("DEV_USER_ID", "user_dev").strip()
-
-# HS256 JWT settings (AUTH_MODE=hs256)
-AUTH_HS256_SECRET = os.getenv("AUTH_HS256_SECRET", "").strip()
-AUTH_JWT_ISSUER = os.getenv("AUTH_JWT_ISSUER", "").strip() or None
-AUTH_JWT_AUDIENCE = os.getenv("AUTH_JWT_AUDIENCE", "").strip() or None
+# Auth modes are documented in src/api/deps.py, which owns AuthContext resolution.
 
 # RQ / Redis
 RUNS_QUEUE_NAME = os.getenv("RUNS_QUEUE_NAME", "orchestrator").strip()
@@ -74,8 +61,8 @@ app.add_middleware(
     RequireAuthMiddleware,
     exclude_paths=[
         "/auth/",  # Login, register, logout, etc.
-        "/api/",  # API routes use header/JWT auth via AuthContext
-        "/leads/",  # Lead search uses AuthContext (header/JWT auth)
+        "/api/",  # Enforced per-route by the get_auth_context dependency (src/api/deps.py)
+        "/leads/",  # Same: get_auth_context dependency
         "/admin/",  # Admin routes use require_admin dependency
         "/static/",  # Static files
         "/health",  # Health checks
@@ -95,6 +82,13 @@ app.include_router(auth_routes.router)
 
 # Browser/dashboard API routes
 app.include_router(browser_routes.router)
+
+# Sales pipeline tracker
+app.include_router(pipeline_routes.router)
+
+# Email queue (Gmail auto-sender) is deliberately NOT mounted: it sends on a
+# timer outside the approval queue, suppression and CAN-SPAM checks, and its
+# routes carried no auth at all. Business rule is that no send is automated.
 
 # ---------------------------------------------------------------------------
 # Dashboard Route (Main UI at root)
@@ -126,6 +120,7 @@ def dashboard_page(request: Request) -> HTMLResponse:
     """
     user = _get_current_user_from_session(request)
     return dashboard_templates.TemplateResponse(
+        request,
         "dashboard.html",
         {
             "request": request,
@@ -144,6 +139,7 @@ def demo_page(request: Request) -> HTMLResponse:
     No authentication required.
     """
     return dashboard_templates.TemplateResponse(
+        request,
         "demo.html",
         {
             "request": request,
@@ -165,129 +161,6 @@ def _error_response(status_code: int, error: str, detail: str) -> JSONResponse:
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# --------------------------------------------------------------------------------------
-# Auth (tenant scoping primitive)
-# --------------------------------------------------------------------------------------
-
-
-class AuthContext(BaseModel):
-    tenant_id: str
-    user_id: str
-    email: str | None = None
-    roles: list[str] = Field(default_factory=list)
-
-
-def _b64url_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode((data + padding).encode("utf-8"))
-
-
-def _jwt_hs256_verify(token: str) -> dict[str, Any]:
-    """
-    Minimal HS256 JWT verifier using the Python stdlib.
-
-    This is intentionally minimal for an MVP without adding new deps.
-    In production, prefer a hosted auth provider + RS256/JWKS validation.
-    """
-    if not AUTH_HS256_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="AUTH_MODE=hs256 requires AUTH_HS256_SECRET to be set",
-        )
-
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise HTTPException(status_code=401, detail="Invalid bearer token format")
-
-    header_b64, payload_b64, sig_b64 = parts
-    try:
-        header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
-        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid bearer token encoding") from exc
-
-    if (header.get("alg") or "").upper() != "HS256":
-        raise HTTPException(status_code=401, detail="Unsupported JWT alg (expected HS256)")
-
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-    expected_sig = hmac.new(
-        AUTH_HS256_SECRET.encode("utf-8"),
-        signing_input,
-        hashlib.sha256,
-    ).digest()
-    actual_sig = _b64url_decode(sig_b64)
-
-    if not hmac.compare_digest(expected_sig, actual_sig):
-        raise HTTPException(status_code=401, detail="Invalid token signature")
-
-    # Optional issuer/audience checks
-    if AUTH_JWT_ISSUER and payload.get("iss") != AUTH_JWT_ISSUER:
-        raise HTTPException(status_code=401, detail="Invalid token issuer")
-    if AUTH_JWT_AUDIENCE:
-        aud = payload.get("aud")
-        if isinstance(aud, str):
-            ok = aud == AUTH_JWT_AUDIENCE
-        elif isinstance(aud, list):
-            ok = AUTH_JWT_AUDIENCE in aud
-        else:
-            ok = False
-        if not ok:
-            raise HTTPException(status_code=401, detail="Invalid token audience")
-
-    return payload
-
-
-def get_auth_context(
-    authorization: str | None = Header(default=None),
-    x_tenant_id: str | None = Header(default=None),
-    x_user_id: str | None = Header(default=None),
-    x_user_email: str | None = Header(default=None),
-) -> AuthContext:
-    """
-    Resolve (tenant_id, user_id) for tenant scoping.
-
-    - AUTH_MODE=none: returns DEV_* defaults
-    - AUTH_MODE=dev: uses X-Tenant-Id / X-User-Id headers (falls back to DEV_*)
-    - AUTH_MODE=hs256: reads Authorization: Bearer <jwt> and maps claims to tenant/user
-    """
-    if AUTH_MODE == "none":
-        return AuthContext(tenant_id=DEV_TENANT_ID, user_id=DEV_USER_ID, email=x_user_email)
-
-    if AUTH_MODE == "dev":
-        tenant = (x_tenant_id or "").strip() or DEV_TENANT_ID
-        user = (x_user_id or "").strip() or DEV_USER_ID
-        email = (x_user_email or "").strip() or None
-        return AuthContext(tenant_id=tenant, user_id=user, email=email)
-
-    if AUTH_MODE == "hs256":
-        if not authorization or not authorization.lower().startswith("bearer "):
-            raise HTTPException(status_code=401, detail="Missing bearer token")
-        token = authorization.split(" ", 1)[1].strip()
-        claims = _jwt_hs256_verify(token)
-
-        # Map common claim names to your tenant model.
-        # Adjust these once you choose Clerk/Auth0/Supabase Auth, etc.
-        tenant = (
-            claims.get("tenant_id") or claims.get("org_id") or claims.get("organization_id") or ""
-        ).strip()
-        user = (claims.get("sub") or claims.get("user_id") or "").strip()
-        email = (claims.get("email") or "").strip() or None
-
-        if not tenant or not user:
-            raise HTTPException(status_code=401, detail="Token missing tenant_id and/or sub")
-
-        roles: list[str] = []
-        raw_roles = claims.get("roles") or claims.get("role") or []
-        if isinstance(raw_roles, str):
-            roles = [raw_roles]
-        elif isinstance(raw_roles, list):
-            roles = [str(r) for r in raw_roles if r]
-
-        return AuthContext(tenant_id=tenant, user_id=user, email=email, roles=roles)
-
-    raise HTTPException(status_code=500, detail=f"Unsupported AUTH_MODE={AUTH_MODE!r}")
 
 
 # Dependency object (avoids B008: function calls in defaults)
@@ -427,253 +300,6 @@ def _fetchone_dict(cur) -> dict[str, Any] | None:
 
 
 # --------------------------------------------------------------------------------------
-# Existing search API helpers
-# --------------------------------------------------------------------------------------
-
-
-def _parse_csv_param(raw: str | None) -> list[str] | None:
-    if raw is None:
-        return None
-    parts = [item.strip() for item in raw.split(",")]
-    values = [item for item in parts if item]
-    return values or None
-
-
-def _decode_cursor(cursor: str) -> dict[str, Any] | None:
-    if not cursor:
-        return None
-    padding = "=" * (-len(cursor) % 4)
-    token = cursor + padding
-    try:
-        raw = base64.urlsafe_b64decode(token.encode("ascii"))
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-def _encode_cursor(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    token = base64.urlsafe_b64encode(raw).decode("ascii")
-    return token
-
-
-def _extract_tech_keywords(company_attrs: Any) -> list[str]:
-    if not company_attrs:
-        return []
-    data: Any
-    if isinstance(company_attrs, str):
-        try:
-            data = json.loads(company_attrs)
-        except json.JSONDecodeError:
-            return []
-    elif isinstance(company_attrs, dict):
-        data = company_attrs
-    else:
-        return []
-    tech = data.get("tech_keywords")
-    if isinstance(tech, list):
-        return [str(t) for t in tech if t]
-    if isinstance(tech, str):
-        return [tech]
-    return []
-
-
-def _row_to_lead(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "email": row.get("email"),
-        "first_name": row.get("first_name"),
-        "last_name": row.get("last_name"),
-        "full_name": row.get("full_name"),
-        "title": row.get("title"),
-        "role_family": row.get("role_family"),
-        "seniority": row.get("seniority"),
-        "company": row.get("company"),
-        "company_id": row.get("company_id"),
-        "company_domain": row.get("company_domain"),
-        "industry": row.get("industry"),
-        "company_size": row.get("company_size"),
-        "tech": _extract_tech_keywords(row.get("company_attrs")),
-        "icp_score": row.get("icp_score"),
-        "verify_status": row.get("verify_status"),
-        "verified_at": row.get("verified_at"),
-        "source": row.get("source"),
-        "source_url": row.get("source_url"),
-        "verify_label": row.get("verify_label"),
-        "is_primary_for_person": row.get("is_primary_for_person"),
-    }
-
-
-def _get_search_backend(request: Request) -> SearchBackend:
-    backend: SearchBackend | None = getattr(request.app.state, "search_backend", None)
-    if backend is not None:
-        return backend
-
-    # Use the backend factory which handles both PostgreSQL and SQLite.
-    from src.search.backend import build_search_backend
-
-    try:
-        backend = build_search_backend()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Search backend unavailable: {exc}",
-        ) from exc
-
-    request.app.state.search_backend = backend
-    return backend
-
-
-def _normalize_sort(sort: str | None) -> tuple[str, JSONResponse | None]:
-    normalized = sort or "icp_desc"
-    if normalized not in {"icp_desc", "verified_desc"}:
-        return normalized, _error_response(
-            400,
-            "invalid_sort",
-            "sort must be one of: icp_desc, verified_desc",
-        )
-    return normalized, None
-
-
-def _parse_icp_min(raw: str | None) -> tuple[int | None, JSONResponse | None]:
-    if raw is None:
-        return None, None
-    try:
-        return int(raw), None
-    except ValueError:
-        return None, _error_response(400, "invalid_icp_min", "icp_min must be an integer")
-
-
-def _parse_recency_days(raw: str | None) -> tuple[int | None, JSONResponse | None]:
-    if raw is None:
-        return None, None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None, _error_response(
-            400,
-            "invalid_recency_days",
-            "recency_days must be an integer",
-        )
-    if value <= 0:
-        return None, _error_response(
-            400,
-            "invalid_recency_days",
-            "recency_days must be a positive integer",
-        )
-    return value, None
-
-
-def _parse_limit(raw: str | None) -> tuple[int, JSONResponse | None]:
-    if raw is None or not raw.strip():
-        value = 50
-    else:
-        try:
-            value = int(raw)
-        except ValueError:
-            return 0, _error_response(400, "invalid_limit", "limit must be an integer")
-    if value < 1 or value > 100:
-        return 0, _error_response(400, "invalid_limit", "limit must be between 1 and 100")
-    return value, None
-
-
-def _parse_cursor(
-    cursor: str | None,
-    sort: str,
-) -> tuple[int | None, str | None, int | None, JSONResponse | None]:
-    if cursor is None:
-        return None, None, None, None
-
-    cursor_data = _decode_cursor(cursor)
-    if cursor_data is None:
-        return (
-            None,
-            None,
-            None,
-            _error_response(
-                400,
-                "invalid_cursor",
-                "cursor is malformed or cannot be decoded",
-            ),
-        )
-
-    cursor_sort = cursor_data.get("sort")
-    if cursor_sort != sort:
-        return (
-            None,
-            None,
-            None,
-            _error_response(
-                400,
-                "invalid_cursor",
-                "cursor sort does not match requested sort",
-            ),
-        )
-
-    try:
-        if sort == "icp_desc":
-            cursor_icp = int(cursor_data["icp_score"])
-            cursor_person_id = int(cursor_data["person_id"])
-            return cursor_icp, None, cursor_person_id, None
-
-        cursor_verified_at = str(cursor_data["verified_at"])
-        cursor_person_id = int(cursor_data["person_id"])
-        return None, cursor_verified_at, cursor_person_id, None
-    except (KeyError, TypeError, ValueError):
-        return (
-            None,
-            None,
-            None,
-            _error_response(
-                400,
-                "invalid_cursor",
-                "cursor payload is missing required fields",
-            ),
-        )
-
-
-def _search_leads_with_cache(
-    backend: SearchBackend,
-    params: LeadSearchParams,
-    cursor: str | None,
-) -> SearchResult:
-    if cursor is not None:
-        return backend.search(params)
-    try:
-        from src.search.cache import search_with_cache
-    except ImportError:
-        return backend.search(params)
-    return search_with_cache(backend, params)
-
-
-def _build_next_cursor(rows: list[dict[str, Any]], sort: str, limit: int) -> str | None:
-    if len(rows) != limit or not rows:
-        return None
-
-    last = rows[-1]
-    if sort == "icp_desc":
-        icp_score = last.get("icp_score")
-        person_id = last.get("person_id")
-        if icp_score is None or person_id is None:
-            return None
-        payload = {"sort": "icp_desc", "icp_score": int(icp_score), "person_id": int(person_id)}
-        return _encode_cursor(payload)
-
-    verified_at = last.get("verified_at")
-    person_id = last.get("person_id")
-    if verified_at is None or person_id is None:
-        return None
-    payload = {
-        "sort": "verified_desc",
-        "verified_at": str(verified_at),
-        "person_id": int(person_id),
-    }
-    return _encode_cursor(payload)
-
-
-# --------------------------------------------------------------------------------------
 # New: Runs API (Control Plane)
 # --------------------------------------------------------------------------------------
 
@@ -688,10 +314,13 @@ def _enqueue_pipeline_start(run_id: str, tenant_id: str) -> None:
     """
     Enqueue the orchestrator job that kicks off the fan-out pipeline.
 
-    Expected future function:
-        src.queueing.tasks.pipeline_start(run_id=..., tenant_id=...)
-
-    If not yet implemented, we raise a clear 501 so the API remains explicit.
+    The orchestrator is src.queueing.pipeline_v2.pipeline_start (an alias for
+    pipeline_start_v2, pipeline_v2.py:2290). This used to import it from
+    src.queueing.tasks, where it has never existed -- so the import always
+    failed and POST /runs answered 501 on every call. Nothing could start a run
+    through the API at all, which is the likeliest reason no run has been
+    created since 2026-04-08. The 501 remains as a genuine guard, but it now
+    only fires if the orchestrator is actually missing.
     """
     try:
         from redis import Redis  # type: ignore
@@ -700,13 +329,13 @@ def _enqueue_pipeline_start(run_id: str, tenant_id: str) -> None:
         raise HTTPException(status_code=500, detail=f"RQ/Redis not available: {exc}") from exc
 
     try:
-        from src.queueing.tasks import pipeline_start  # type: ignore
+        from src.queueing.pipeline_v2 import pipeline_start  # type: ignore
     except Exception as exc:
         raise HTTPException(
             status_code=501,
             detail=(
-                "pipeline_start is not implemented yet (expected at "
-                "src.queueing.tasks.pipeline_start)"
+                "pipeline_start is not available (expected at "
+                "src.queueing.pipeline_v2.pipeline_start)"
             ),
         ) from exc
 
@@ -939,6 +568,44 @@ def _db_run_results(
 # --------------------------------------------------------------------------------------
 
 
+@app.get("/leads/search")
+async def leads_search(
+    q: str = "",
+    limit: str | None = None,
+    sort: str | None = None,
+    _auth: AuthContext = AUTH_CTX_DEP,
+):
+    """Compatibility stub for the retired lead-search subsystem.
+
+    The subsystem behind this route (src/search/*, ~2,700 lines) was deleted:
+    it read from `lead_search_docs`, which has 0 rows in production and has
+    never been populated, so every query it ever served returned nothing.
+
+    The route itself is kept because two live admin UI components still call
+    it -- CrestwellIQ.tsx and PipelineTracker.tsx in the marketing site. They
+    handle an empty result set; they would surface a 404 as an error. Removing
+    the route without touching them would turn a silently-empty search box into
+    a visibly broken one.
+
+    So this returns exactly the shape the old endpoint returned on its success
+    path, with no results. Behaviour in the UI is unchanged from today.
+
+    To actually retire it: point those two components at
+    /api/browser/search (which works and reads live data), then delete this.
+    """
+    try:
+        limit_val = max(1, min(int(limit), 200)) if limit else 50
+    except (TypeError, ValueError):
+        limit_val = 50
+    return {
+        "results": [],
+        "limit": limit_val,
+        "sort": sort or "relevance",
+        "next_cursor": None,
+        "facets": {},
+    }
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -1110,103 +777,3 @@ async def export_run(
         "Content-Type": "text/csv; charset=utf-8",
     }
     return StreamingResponse(io.BytesIO(data), headers=headers)
-
-
-# -----------------------
-# Existing Leads Search API
-# -----------------------
-
-
-@app.get("/leads/search")
-async def leads_search(
-    request: Request,
-    q: str = "",
-    verify_status: str | None = None,
-    icp_min: str | None = None,
-    roles: str | None = None,
-    seniority: str | None = None,
-    industries: str | None = None,
-    sizes: str | None = None,
-    tech: str | None = None,
-    source: str | None = None,
-    recency_days: str | None = None,
-    sort: str = "icp_desc",
-    limit: str | None = None,
-    cursor: str | None = None,
-    facets: str | None = None,
-    _auth: AuthContext = AUTH_CTX_DEP,
-):
-    """
-    R22/R23: /leads/search API.
-
-    Note:
-      - This endpoint currently uses the SqliteFtsBackend and is not yet tenant-scoped.
-      - When you migrate to Postgres as the system of record, replace this with a
-        Postgres-backed search (or keep SQLite as a derived read model).
-    """
-    if not q or not q.strip():
-        return _error_response(400, "invalid_query", "q must be a non-empty search query")
-
-    normalized_sort, sort_error = _normalize_sort(sort)
-    if sort_error is not None:
-        return sort_error
-
-    icp_min_val, icp_error = _parse_icp_min(icp_min)
-    if icp_error is not None:
-        return icp_error
-
-    recency_days_val, recency_error = _parse_recency_days(recency_days)
-    if recency_error is not None:
-        return recency_error
-
-    limit_val, limit_error = _parse_limit(limit)
-    if limit_error is not None:
-        return limit_error
-
-    verify_status_list = _parse_csv_param(verify_status)
-    roles_list = _parse_csv_param(roles)
-    seniority_list = _parse_csv_param(seniority)
-    industries_list = _parse_csv_param(industries)
-    sizes_list = _parse_csv_param(sizes)
-    tech_list = _parse_csv_param(tech)
-    source_list = _parse_csv_param(source)
-    facets_list = _parse_csv_param(facets)
-
-    cursor_icp, cursor_verified_at, cursor_person_id, cursor_error = _parse_cursor(
-        cursor,
-        normalized_sort,
-    )
-    if cursor_error is not None:
-        return cursor_error
-
-    params = LeadSearchParams(
-        query=q,
-        verify_status=verify_status_list,
-        icp_min=icp_min_val,
-        roles=roles_list,
-        seniority=seniority_list,
-        industries=industries_list,
-        sizes=sizes_list,
-        tech=tech_list,
-        source=source_list,
-        recency_days=recency_days_val,
-        sort=normalized_sort,
-        limit=limit_val,
-        cursor_icp=cursor_icp,
-        cursor_verified_at=cursor_verified_at,
-        cursor_person_id=cursor_person_id,
-        facets=facets_list,
-    )
-
-    backend = _get_search_backend(request)
-    result = _search_leads_with_cache(backend, params, cursor)
-    results = [_row_to_lead(row) for row in result.leads]
-    next_cursor = _build_next_cursor(result.leads, normalized_sort, limit_val)
-
-    return {
-        "results": results,
-        "limit": limit_val,
-        "sort": normalized_sort,
-        "next_cursor": next_cursor,
-        "facets": result.facets or {},
-    }

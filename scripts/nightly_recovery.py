@@ -50,30 +50,43 @@ PROBES_PER_PERSON = int(os.getenv("MAX_PROBES_PER_PERSON", "3"))
 PREFLIGHT_MX = os.getenv("RECOVERY_PREFLIGHT_MX", "aspmx.l.google.com")
 GENERATE_QUEUE = os.getenv("RECOVERY_QUEUE", "generate")
 
-#: Priority order.
+#: WHAT CANNOT BE USED TO FIND THE LOST ADDRESSES.
 #:
-#: NOTE ON WHAT CANNOT BE DONE HERE. The obvious ordering would be "companies
-#: that lost an address in the outage, first". That is not expressible. When an
-#: address is deleted its `emails` row, its `verification_results` rows and any
-#: pattern evidence go with it, so a company that lost everything leaves no trace
-#: distinguishing it from one that never had anything. `first_valid_at` only
-#: exists on surviving rows, and `company_email_pattern` was created during this
-#: same session, so neither can see backwards. An earlier version of this query
-#: tried it anyway with a clause that could never be true -- `had_before` is a
-#: strict subset of `confirmed_now` -- and silently ordered by nothing.
+#: The obvious approach is "companies that lost an address, first". Not
+#: expressible: deleting an address takes its `emails` row, its
+#: `verification_results` rows and its pattern evidence with it, so a company
+#: that lost everything is indistinguishable from one that never had anything.
+#: `first_valid_at` exists only on surviving rows; `company_email_pattern` was
+#: created during this same session and cannot see backwards. An earlier version
+#: tried anyway, with a clause that could never be true -- `had_before` was a
+#: strict subset of `confirmed_now` -- and silently ordered by nothing at all.
 #:
-#: What IS expressible: a company whose pattern we have CONFIRMED but which holds
-#: no address today must have lost one, because the confirmation required an
-#: accept. That is a small set now (the pattern table is young) and will be the
-#: precise signal if this ever happens again.
+#: WHAT CAN. The verdicts themselves carry a timestamp, and the throttling window
+#: is known to the minute. That is the handle.
+#:
+#: The window in which verdicts cannot be trusted.
+#:
+#: Probe telemetry pins the onset precisely. Through 01:36 the run was healthy --
+#: 7, 21, 33 and 46 accepts per minute with zero 450s. From 01:45 the throttling
+#: responses begin and accepts collapse to 0-3 per minute. Every `all_invalid`
+#: recorded after that point was decided while the provider was refusing us, and
+#: a throttling provider rejects rather than defers: at the SMTP layer that is
+#: indistinguishable from "no such user". Those verdicts deleted the addresses.
+#:
+#: 1,589 people carry a verdict from this window and hold no address today. They
+#: are the recovery cohort. The upper bound excludes the clean slices run after
+#: the block lifted, whose verdicts ARE trustworthy.
+SUSPECT_FROM = os.getenv("RECOVERY_SUSPECT_FROM", "2026-08-26T01:45:00Z")
+SUSPECT_TO = os.getenv("RECOVERY_SUSPECT_TO", "2026-08-26T12:00:00Z")
+
 SQL = """
 WITH confirmed_pattern AS (
   SELECT DISTINCT company_id FROM company_email_pattern WHERE confirmed_count > 0
 ),
-has_address_now AS (
-  SELECT DISTINCT p.company_id
-    FROM emails e JOIN people p ON p.id = e.person_id
-   WHERE e.first_valid_at IS NOT NULL
+suspect AS (
+  SELECT id FROM people
+   WHERE generation_at::timestamptz >= %s AND generation_at::timestamptz < %s
+     AND generation_status IN ('all_invalid', 'exhausted')
 )
 SELECT p.id, p.first_name, p.last_name, lower(c.domain)
   FROM people p
@@ -82,12 +95,17 @@ SELECT p.id, p.first_name, p.last_name, lower(c.domain)
    AND p.first_name <> '' AND p.last_name <> ''
    -- nothing currently on file for this person
    AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.person_id = p.id)
-   -- and not already answered by a previous night
-   AND (p.generation_status IS NULL OR p.generation_status IN ('deferred', 'exhausted'))
+   AND (
+     -- never asked
+     p.generation_status IS NULL
+     -- or asked and the question is still open
+     OR p.generation_status IN ('deferred', 'exhausted')
+     -- or answered, but answered while the provider was throttling us
+     OR p.id IN (SELECT id FROM suspect)
+   )
  ORDER BY
-   -- 1. proven pattern, nothing on file: it worked once and is gone now
-   (p.company_id IN (SELECT company_id FROM confirmed_pattern)
-    AND p.company_id NOT IN (SELECT company_id FROM has_address_now)) DESC,
+   -- 1. verdicts taken under throttling: this is the actual recovery
+   (p.id IN (SELECT id FROM suspect)) DESC,
    -- 2. companies with a confirmed pattern: these land on probe #1, so they are
    --    the cheapest results available per unit of provider patience
    (p.company_id IN (SELECT company_id FROM confirmed_pattern)) DESC,
@@ -151,7 +169,7 @@ def main() -> int:
 
     con = get_conn()
     try:
-        rows = con.execute(SQL, (cap,)).fetchall()
+        rows = con.execute(SQL, (SUSPECT_FROM, SUSPECT_TO, cap)).fetchall()
     finally:
         try:
             con.close()

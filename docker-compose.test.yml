@@ -1,0 +1,52 @@
+# Disposable Postgres + Redis for the test suite.
+#
+# WHY THIS EXISTS. Without a database the autouse fixture in tests/conftest.py
+# skips almost everything: the suite reports "10 passed, 772 skipped", so 98.7%
+# of it never runs and "tests pass" means almost nothing. That gap is also what
+# blocked the run-completion fix, which cannot be validated without real Redis
+# and RQ.
+#
+# Deliberately isolated from production:
+#   * its own project name and network, so it can never reach cw-iq-db
+#   * non-default host ports (55432 / 56379)
+#   * tmpfs storage -- the data dies with the container, by design
+#
+# Usage:  scripts/run_tests.sh [pytest args]
+
+name: cw-iq-test
+
+services:
+  test-db:
+    image: postgres:16-alpine
+    container_name: cw-iq-test-db
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: iq_test
+      # No durability needed for a database that is thrown away every run.
+      PGDATA: /var/lib/postgresql/data
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d iq_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [test]
+
+  test-redis:
+    image: redis:7-alpine
+    container_name: cw-iq-test-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [test]
+
+networks:
+  test:
+    name: cw-iq-test-net

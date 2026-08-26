@@ -68,14 +68,20 @@ class _FakeConn:
 
 
 def test_export_domains_txt_happy_path(monkeypatch) -> None:
-    """GET /admin/export-domains.txt returns sorted, deduplicated domains."""
+    """GET /admin/export-domains.txt returns sorted, deduplicated domains.
+
+    Patches ``src.db.get_conn``, NOT ``src.api.admin.get_conn``: admin.py imports
+    get_conn inside each handler, so there is no module-level attribute to patch
+    and monkeypatch raises AttributeError. These three tests had been asserting
+    against the old module-level import and could not have run since it moved.
+    """
     _install_dev_auth(monkeypatch)
     _install_fake_superuser(monkeypatch)
     _stub_audit(monkeypatch)
 
     fake_rows = [("alpha.com",), ("beta.io",), ("gamma.org",)]
     monkeypatch.setattr(
-        "src.api.admin.get_conn",
+        "src.db.get_conn",
         lambda: _FakeConn(fake_rows),
     )
 
@@ -98,7 +104,7 @@ def test_export_domains_txt_empty_db(monkeypatch) -> None:
     _stub_audit(monkeypatch)
 
     monkeypatch.setattr(
-        "src.api.admin.get_conn",
+        "src.db.get_conn",
         lambda: _FakeConn([]),
     )
 
@@ -117,7 +123,7 @@ def test_export_domains_txt_filters_none_rows(monkeypatch) -> None:
 
     fake_rows = [("alpha.com",), (None,), ("gamma.org",)]
     monkeypatch.setattr(
-        "src.api.admin.get_conn",
+        "src.db.get_conn",
         lambda: _FakeConn(fake_rows),
     )
 

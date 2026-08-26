@@ -136,6 +136,14 @@ poor yield to the wrong subsystem entirely.
    completed run. Fan-out writes the initial record and nothing revises it, so a
    stalled domain and a finished one look identical.
 
+   ADDRESSED 2026-08-25, by derivation rather than by syncing the blob:
+   `GET /api/browser/runs/{id}` now returns a `live` object counted from the rows
+   the pipeline already writes (`companies_crawled`, `people_processed`, `valid`,
+   `catch_all`). Keeping `progress_json` current would mean a read-modify-write
+   on a 77KB document from two workers on every job -- a race with nothing to
+   gain. Derived counts cannot drift because there is nothing to drift from.
+   `progress_json` itself is still stale; read `live`.
+
 3. **A company that yields nothing recorded no reason.** FIXED 2026-08-25 --
    `people.generation_status` now holds the generator's own verdict (`no_mx`,
    `no_candidates`, `all_invalid`, `exhausted`, `deferred`, `valid_found`,

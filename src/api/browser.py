@@ -1415,6 +1415,55 @@ def list_runs(
             pass
 
 
+def _derive_run_progress(con: Any, *, started_at: str | None) -> dict[str, Any]:
+    """Live counts derived from the work itself, not from ``progress_json``.
+
+    ``progress_json`` is written once at fan-out and never revised: on a
+    COMPLETED 256-domain run every domain still read ``state: "enqueued"`` and
+    ``metrics.total_companies: 0``. A stalled domain and a finished one looked
+    identical.
+
+    Rather than keep that blob in sync -- a read-modify-write on a 77KB document
+    from two workers per job, which is a race waiting to happen -- these numbers
+    are counted from the rows the pipeline already writes. They cannot drift,
+    because there is nothing to drift from.
+
+    Also worth knowing when reading these: a run reaches ``succeeded`` before its
+    verify tail drains, so ``valid`` here keeps climbing after the run says it is
+    finished. That is a real defect, documented in docs/ARCHITECTURE.md; until it
+    is fixed these counts are the honest view and the status is not.
+    """
+    if not started_at:
+        return {}
+    out: dict[str, Any] = {}
+    probes = (
+        (
+            "companies_crawled",
+            "SELECT count(DISTINCT company_id) FROM sources"
+            " WHERE fetched_at::timestamptz >= %s",
+        ),
+        ("people_processed", "SELECT count(*) FROM people WHERE generation_at::timestamptz >= %s"),
+        (
+            "valid",
+            "SELECT count(*) FROM verification_results WHERE verify_status='valid'"
+            " AND checked_at::timestamptz >= %s",
+        ),
+        (
+            "catch_all",
+            "SELECT count(*) FROM verification_results WHERE verify_status='risky_catch_all'"
+            " AND checked_at::timestamptz >= %s",
+        ),
+    )
+    for key, sql in probes:
+        try:
+            r = con.execute(sql, (started_at,)).fetchone()
+            out[key] = int(r[0]) if r and r[0] is not None else 0
+        except Exception:
+            # A missing column (pre-migration) must not take the endpoint down.
+            out[key] = None
+    return out
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: str, auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[str, Any]:
     con = _get_conn()
@@ -1439,6 +1488,7 @@ def get_run(run_id: str, auth: Annotated[AuthContext, Depends(get_auth_context)]
             "domains": domains,
             "options": options,
             "progress": progress,
+            "live": _derive_run_progress(con, started_at=row[8]),
             "error": row[6],
             "created_at": row[7],
             "started_at": row[8],

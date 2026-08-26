@@ -271,3 +271,52 @@ probing.
 Applied 2026-08-25: 622 rows across 120 companies, 1,261 failure counts dropped.
 A pre-repair dump of the table is at `/root/company_email_pattern.pre-repair.sql`
 on the VPS.
+
+### Measured after the fix
+
+Run `3c392669`, 2026-08-25: the 115 companies the bug had written off, re-run with
+the evidence cleared and the corrected teaching logic.
+
+| | |
+|---|---:|
+| companies re-run | 115 |
+| **companies that recovered a valid address** | **12** |
+| **valid addresses recovered** | **98** |
+| companies recording their first-ever valid address | 11 |
+| company coverage | 346 → **355** |
+| valid addresses total | 1,807 → **1,847** |
+| **companies re-poisoned (all patterns refuted, none confirmed)** | **0** |
+
+Every one of those 115 companies had produced **zero** before: all patterns
+refuted, ~535 people never probed. `caremessage.org` — the 26-person company used
+as the illustration above — returned 6 valid addresses.
+`uplandspecialty.com` returned 39 and `mhubchicago.com` 16.
+
+The zero in the last row is the load-bearing number. Before the fix, 73 companies
+sat in that state. This run created none, because every company that recorded
+failures also recorded a confirmation — which is precisely the condition the fix
+requires.
+
+End-to-end check in production: re-probing Kelly LeVeque at `magicspoon.com`
+returns `all_invalid` at 3 probes and writes **nothing** to
+`company_email_pattern` — all six patterns still read `failed_count = 0` with
+`last_seen_at` untouched. Under the old code that single person would have
+refuted three formats.
+
+---
+
+## 8. Queue priority: the stages were running serially
+
+RQ dequeues from queues in **strict priority order**, not round-robin. Both
+workers ran `orchestrator,crawl,generate,verify`, so every crawl job in a run had
+to finish before either worker would look at generate.
+
+Measured on run `3c392669`: the crawl queue drained for over an hour while the
+generate queue grew to 655 and produced **not one verification**. Only when crawl
+hit zero did generation begin. The two stages ran end to end when they could have
+overlapped.
+
+Worker 2 now runs `orchestrator,generate,verify,crawl` — generate first, falling
+back to crawl when there is nothing to generate, so neither queue starves the
+other and neither worker idles. Set in
+`docker-compose.crestwelliq.yml`; worker 1 keeps the original order.

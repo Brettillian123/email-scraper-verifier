@@ -568,3 +568,63 @@ For issues:
 2. Verify services: `esctl all status`
 3. Test connections: `esctl health`
 4. Review configuration: `cat /opt/email-scraper/.env`
+
+---
+
+## Nightly address-recovery pass
+
+Cron on the VPS (`crontab -l` as root). **The host runs America/Chicago, so cron
+times are local, not UTC.**
+
+```
+0 1-5 * * * /usr/local/bin/cw-iq-recovery.sh >> /opt/crestwell/crestwelliq/logs/recovery.log 2>&1
+```
+
+Five hourly slices of 100 people (~300 probes each) between 01:00 and 05:00, the
+last draining by 06:00. It re-confirms addresses deleted during the 2026-08-25
+outage, priority-ordered so companies that held a confirmed address before August
+and hold none now go first.
+
+### It is designed to refuse to run
+
+`scripts/nightly_recovery.py` checks outbound port 25 before enqueuing anything.
+If SMTP is blocked it logs and exits 0 without queuing a single job. **Do not
+remove that preflight to "get recovery moving"** — probing a blocked port nightly
+while the host decides whether to lift a block is what keeps the block in place.
+
+It also refuses to exceed the daily ceilings (`SMTP_DAILY_PROBE_CAP` 3,000,
+`SMTP_DAILY_PROBE_CAP_PER_MX` 750). Anything the per-MX cap turns down comes back
+`unknown`, never `invalid`, so an over-large night degrades into no-ops rather
+than deleting rows.
+
+### Checking on it
+
+```bash
+tail -40 /opt/crestwell/crestwelliq/logs/recovery.log
+```
+
+Budget consumed so far today:
+
+```bash
+docker exec cw-iq-worker-1 python -c "from src.queueing.rate_limit import daily_probe_usage; from src.queueing.redis_conn import get_redis; print(daily_probe_usage(get_redis(), 'aspmx.l.google.com'))"
+```
+
+Run one slice by hand (respects the same budget):
+
+```bash
+/usr/local/bin/cw-iq-recovery.sh
+```
+
+Dry run, selects and reports but enqueues nothing:
+
+```bash
+docker exec -w /app -e PYTHONPATH=/app cw-iq-worker-1 python scripts/nightly_recovery.py --dry-run
+```
+
+### How long recovery should take
+
+At 100 people per slice and 5 slices, ~500 people per night, but the per-MX
+ceiling binds first: most prospects sit on Google or Outlook, so expect roughly
+250 people per provider per day. The ~132 companies that lost addresses are a few
+nights' work. When `nightly_recovery.py` starts logging "no unprobed people
+remain", the backlog is clear and the cron can be removed.

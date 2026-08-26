@@ -50,19 +50,30 @@ PROBES_PER_PERSON = int(os.getenv("MAX_PROBES_PER_PERSON", "3"))
 PREFLIGHT_MX = os.getenv("RECOVERY_PREFLIGHT_MX", "aspmx.l.google.com")
 GENERATE_QUEUE = os.getenv("RECOVERY_QUEUE", "generate")
 
-#: Priority order. Companies that HELD a confirmed address before August and
-#: hold none now are the outage's actual victims, so they go first. Then people
-#: whose title makes them worth having. Then everyone else.
+#: Priority order.
+#:
+#: NOTE ON WHAT CANNOT BE DONE HERE. The obvious ordering would be "companies
+#: that lost an address in the outage, first". That is not expressible. When an
+#: address is deleted its `emails` row, its `verification_results` rows and any
+#: pattern evidence go with it, so a company that lost everything leaves no trace
+#: distinguishing it from one that never had anything. `first_valid_at` only
+#: exists on surviving rows, and `company_email_pattern` was created during this
+#: same session, so neither can see backwards. An earlier version of this query
+#: tried it anyway with a clause that could never be true -- `had_before` is a
+#: strict subset of `confirmed_now` -- and silently ordered by nothing.
+#:
+#: What IS expressible: a company whose pattern we have CONFIRMED but which holds
+#: no address today must have lost one, because the confirmation required an
+#: accept. That is a small set now (the pattern table is young) and will be the
+#: precise signal if this ever happens again.
 SQL = """
-WITH confirmed_now AS (
+WITH confirmed_pattern AS (
+  SELECT DISTINCT company_id FROM company_email_pattern WHERE confirmed_count > 0
+),
+has_address_now AS (
   SELECT DISTINCT p.company_id
     FROM emails e JOIN people p ON p.id = e.person_id
    WHERE e.first_valid_at IS NOT NULL
-),
-had_before AS (
-  SELECT DISTINCT p.company_id
-    FROM emails e JOIN people p ON p.id = e.person_id
-   WHERE e.first_valid_at::timestamptz < '2026-08-01'
 )
 SELECT p.id, p.first_name, p.last_name, lower(c.domain)
   FROM people p
@@ -71,14 +82,17 @@ SELECT p.id, p.first_name, p.last_name, lower(c.domain)
    AND p.first_name <> '' AND p.last_name <> ''
    -- nothing currently on file for this person
    AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.person_id = p.id)
+   -- and not already answered by a previous night
+   AND (p.generation_status IS NULL OR p.generation_status IN ('deferred', 'exhausted'))
  ORDER BY
-   -- 1. companies that lost everything they had
-   (p.company_id IN (SELECT company_id FROM had_before)
-    AND p.company_id NOT IN (SELECT company_id FROM confirmed_now)) DESC,
-   -- 2. decision-makers
+   -- 1. proven pattern, nothing on file: it worked once and is gone now
+   (p.company_id IN (SELECT company_id FROM confirmed_pattern)
+    AND p.company_id NOT IN (SELECT company_id FROM has_address_now)) DESC,
+   -- 2. companies with a confirmed pattern: these land on probe #1, so they are
+   --    the cheapest results available per unit of provider patience
+   (p.company_id IN (SELECT company_id FROM confirmed_pattern)) DESC,
+   -- 3. decision-makers
    (p.title ~* '(ceo|chief executive|founder|co-?founder|owner|president|managing)') DESC,
-   -- 3. companies where a pattern is already confirmed: these land on probe #1
-   (p.company_id IN (SELECT company_id FROM confirmed_now)) DESC,
    p.company_id, p.id
  LIMIT %s
 """

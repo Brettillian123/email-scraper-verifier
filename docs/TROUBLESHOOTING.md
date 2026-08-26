@@ -1,5 +1,31 @@
 # Troubleshooting
 
+## Verification stopped entirely / every probe times out
+
+Check the host's outbound port 25 before anything else. On 2026-08-25 a backfill
+issued ~8,700 probes in one run and the hosting provider blocked outbound SMTP;
+it had to be lifted by hand. The signature in the database:
+
+```sql
+SELECT code, category, coalesce(error_kind,'-'), count(*)
+  FROM mx_probe_stats WHERE ts::timestamptz > now() - interval '6 hours'
+ GROUP BY 1,2,3 ORDER BY 4 DESC;
+```
+
+`port25_unreachable` in bulk means the host is blocking, not the recipient MX.
+A large count of `450` alongside it means a provider is throttling us as well.
+
+Current usage against the daily ceilings:
+
+```bash
+docker exec cw-iq-worker-1 python -c "from src.queueing.rate_limit import daily_probe_usage; from src.queueing.redis_conn import get_redis; print(daily_probe_usage(get_redis(), 'aspmx.l.google.com'))"
+```
+
+Caps are `SMTP_DAILY_PROBE_CAP` (3,000/day) and `SMTP_DAILY_PROBE_CAP_PER_MX`
+(750/day). Hitting them is the system working: probes return `unknown`, nothing
+is graded invalid, and no rows are deleted. Raise them only with a reason, and
+never to push a backfill through in one sitting -- that is what caused the block.
+
 ## Common Issues
 
 ### Workers Not Processing Jobs

@@ -72,7 +72,21 @@ All configuration is managed through environment variables, loaded from a `.env`
 | Variable | Default | Description |
 |---|---|---|
 | `SMTP_PROBES_ENABLED` | `true` | Master switch for SMTP probing |
+| `SMTP_DAILY_PROBE_CAP` | 3000 | Rolling 24h ceiling on total RCPT probes. Refused probes return `unknown`, never `invalid`. |
+| `SMTP_DAILY_PROBE_CAP_PER_MX` | 750 | Rolling 24h ceiling per MX host. The one that actually prevents a provider block -- see the note below. |
 | `SMTP_PROBES_ALLOWED_HOSTS` | (empty = all) | Comma-separated hostnames where probing is allowed. Empty means unrestricted. **In Docker, see the warning below.** |
+
+
+> **The daily probe caps exist because of a real outage.** On 2026-08-25 a
+> backfill issued ~8,700 RCPT probes in one run, ~6,400 of them at a single
+> provider. The provider throttled us (921 x `450`) and the HOST blocked outbound
+> port 25 outright; verification stopped for a day and the block was lifted by
+> hand. The per-second RPS limiter did not object, because it caps burst and
+> every individual second was inside budget.
+>
+> `SMTP_DAILY_PROBE_CAP_PER_MX` is the effective guard: at ~3 probes per person,
+> 750/day is roughly 250 people per provider per day. A backfill spanning
+> thousands of people belongs spread across days. Raise these only with a reason.
 
 > **`SMTP_PROBES_ALLOWED_HOSTS` is matched against the machine's OWN hostname,**
 > not against the host being probed (`src/verify/preflight.py`). A container's

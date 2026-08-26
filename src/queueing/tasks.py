@@ -102,6 +102,7 @@ from src.queueing.rate_limit import (
     RPS_KEY_GLOBAL,
     RPS_KEY_MX,
     can_consume_rps,
+    daily_probe_budget,
     release,
     try_acquire,
 )
@@ -3127,6 +3128,16 @@ def _cleanup_invalid_generated_email(email_id: int, verify_status: str) -> bool:
                 )
                 return False
 
+            # An address we once CONFIRMED is never deleted by a later 550.
+            # See _was_ever_valid(): a throttling provider rejects rather than
+            # defers, and that is indistinguishable from "no such user" here.
+            if _was_ever_valid(con, eid):
+                log.info(
+                    "Skipping cleanup: address was previously confirmed valid",
+                    extra={"email_id": eid, "verify_status": vs},
+                )
+                return False
+
             _delete_email_and_verification_results(con, eid)
             con.commit()
 
@@ -3260,6 +3271,50 @@ def _set_email_source_note(con: Any, email_id: int | None, note: str) -> None:
         except Exception:
             pass
         log.debug("failed to update source_note", exc_info=True, extra={"email_id": email_id})
+
+
+def _was_ever_valid(con: Any, email_id: int) -> bool:
+    """True if this address has ever verified valid.
+
+    Such an address is never deleted on a later `invalid`. A 550 is not always a
+    verdict about the mailbox -- a provider throttling us can reject rather than
+    defer, and a policy rejection under directory-harvest suspicion is
+    indistinguishable from "no such user" at the SMTP layer. The 2026-08-25
+    backfill drew 921 throttling responses from one provider and tripped the
+    host's outbound SMTP block; confirmed addresses fell 1,847 to 1,564 in that
+    single run, and how much of that was genuine churn cannot now be known,
+    because the rows were deleted.
+
+    Fails CLOSED: if the column is missing or the query errors, the answer is
+    "yes, it was valid", so the address survives. Keeping a dead address costs a
+    stale row; deleting a live one costs the result outright.
+    """
+    try:
+        row = con.execute(
+            "SELECT first_valid_at FROM emails WHERE id = ?", (int(email_id),)
+        ).fetchone()
+    except Exception:
+        log.debug("could not read first_valid_at; refusing deletion", exc_info=True)
+        return True
+    return bool(row and row[0])
+
+
+def _mark_first_valid(con: Any, email_id: int | None) -> None:
+    """Stamp the first confirmation. Never cleared, so the guard above holds."""
+    if email_id is None:
+        return
+    try:
+        con.execute(
+            "UPDATE emails SET first_valid_at = ? WHERE id = ? AND first_valid_at IS NULL",
+            (_utc_now_iso_z(), int(email_id)),
+        )
+        con.commit()
+    except Exception:
+        log.debug("could not stamp first_valid_at", exc_info=True, extra={"email_id": email_id})
+        try:
+            con.rollback()
+        except Exception:
+            pass
 
 
 def _record_generation_outcome(con: Any, *, person_id: int, result: dict) -> None:
@@ -3415,6 +3470,9 @@ def _generate_emails_sequential(  # noqa: C901
     ) -> None:
         """Mark a candidate as this person's address (valid or risky_catch_all)."""
         _set_email_source_note(con, email_id, f"verified:{status}:pattern={pattern_key}")
+        if status == "valid":
+            # Permanent: from here on a later 550 can never delete this row.
+            _mark_first_valid(con, email_id)
         log.info(
             "R12 sequential: accepted %s address",
             status,
@@ -3798,6 +3856,16 @@ def _generate_emails_sequential(  # noqa: C901
             # Mark, then delete: the address is gone but the pattern-level
             # failure was already recorded above, which is the whole point.
             _set_email_source_note(con, email_id, f"invalid:{reason}:pattern={pattern_key}")
+            # ...unless we had already CONFIRMED this address. Then the row
+            # stays and simply carries the new invalid status: one 550, which a
+            # throttling provider will happily hand out, must not erase a
+            # verified result. It stays visible as invalid rather than vanishing.
+            if email_id is not None and _was_ever_valid(con, int(email_id)):
+                log.info(
+                    "R12 sequential: keeping previously-confirmed address despite 550",
+                    extra={"email_id": email_id, "email": email_addr, "reason": reason},
+                )
+                continue
             if cleanup_enabled and email_id is not None:
                 try:
                     _delete_email_and_verification_results(con, int(email_id))
@@ -3889,6 +3957,33 @@ def _probe_candidates(
     accept to "valid" and sets catchall_ruled_out, so the caller can skip the
     extra sanity connection it would otherwise open.
     """
+    # Daily volume ceiling. The per-second RPS limiter caps BURST and had nothing
+    # to say about the 2026-08-25 backfill, which issued ~8,700 probes over hours
+    # -- every second within budget -- and got outbound port 25 blocked at the
+    # host. Refusal returns "unknown", never "invalid": an address we declined to
+    # test is untested, and grading it invalid would delete a good row.
+    try:
+        allowed, why = daily_probe_budget(get_redis(), mx_host, count=len(emails))
+    except Exception:
+        allowed, why = True, "budget_unavailable"
+    if not allowed:
+        log.warning(
+            "SMTP daily probe budget exhausted; skipping probe",
+            extra={"mx_host": mx_host, "reason": why, "count": len(emails)},
+        )
+        return [
+            {
+                "email": e,
+                "status": "unknown",
+                "reason": f"probe_budget:{why}",
+                "code": None,
+                "message": None,
+                "retries": 0,
+                "catchall_ruled_out": False,
+            }
+            for e in emails
+        ]
+
     try:
         results = probe_rcpt_batch(
             emails,

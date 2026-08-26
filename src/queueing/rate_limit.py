@@ -85,6 +85,82 @@ def can_consume_rps(redis: Redis, key: str, limit: int) -> bool:
     return cnt <= limit
 
 
+# ---- Daily volume ceiling -------------------------------------------------
+#
+# The per-second RPS window above limits BURST. It does nothing about sustained
+# volume, and sustained volume is what gets an IP cut off.
+#
+# 2026-08-25: a backfill issued ~8,700 RCPT probes in one run, ~6,400 of them at
+# a single provider. Nothing in the system objected -- every individual second
+# was within its RPS budget. The provider began throttling (921 x 450) and the
+# HOST blocked outbound port 25 entirely (674 probes recorded
+# port25_unreachable). All verification stopped for a day and required the
+# provider to lift the block by hand.
+#
+# These caps are deliberately the crude kind that cannot be reasoned around: a
+# count of probes in a rolling 24h window, globally and per MX host, checked
+# before each probe. Defaults are set near normal daily operation, well under
+# what drew attention.
+DAILY_KEY_GLOBAL = "probes:day:global:{day}"
+DAILY_KEY_MX = "probes:day:mx:{mx}:{day}"
+DAILY_TTL = 172_800  # 48h; the 24h bucket plus slack
+
+SMTP_DAILY_PROBE_CAP = int(os.getenv("SMTP_DAILY_PROBE_CAP", "3000"))
+SMTP_DAILY_PROBE_CAP_PER_MX = int(os.getenv("SMTP_DAILY_PROBE_CAP_PER_MX", "750"))
+
+
+def _day_bucket() -> str:
+    return time.strftime("%Y%m%d", time.gmtime())
+
+
+def daily_probe_budget(redis: Redis, mx_host: str, *, count: int = 1) -> tuple[bool, str]:
+    """Consume `count` from the global and per-MX daily probe budgets.
+
+    Returns ``(allowed, reason)``. On refusal the caller must NOT probe, and must
+    NOT record the outcome as ``invalid`` -- an address we declined to test is
+    unknown, not dead, and treating it otherwise would delete good rows.
+
+    Fails OPEN on a Redis error: losing the ceiling is bad, but stopping all
+    verification because Redis hiccuped is worse, and the host-level block is the
+    backstop either way.
+    """
+    day = _day_bucket()
+    mx = (mx_host or "unknown").strip().lower()
+    try:
+        gkey = DAILY_KEY_GLOBAL.format(day=day)
+        gcount = redis.incrby(gkey, count)
+        if gcount == count:
+            redis.expire(gkey, DAILY_TTL)
+        if gcount > SMTP_DAILY_PROBE_CAP:
+            return False, f"daily_global_cap:{SMTP_DAILY_PROBE_CAP}"
+
+        mkey = DAILY_KEY_MX.format(mx=mx, day=day)
+        mcount = redis.incrby(mkey, count)
+        if mcount == count:
+            redis.expire(mkey, DAILY_TTL)
+        if mcount > SMTP_DAILY_PROBE_CAP_PER_MX:
+            return False, f"daily_mx_cap:{SMTP_DAILY_PROBE_CAP_PER_MX}:{mx}"
+    except Exception:
+        return True, "budget_unavailable"
+    return True, ""
+
+
+def daily_probe_usage(redis: Redis, mx_host: str | None = None) -> dict:
+    """Current usage against the caps. For diagnostics and the admin surface."""
+    day = _day_bucket()
+    out: dict = {"day": day, "global_cap": SMTP_DAILY_PROBE_CAP, "global_used": 0}
+    try:
+        out["global_used"] = int(redis.get(DAILY_KEY_GLOBAL.format(day=day)) or 0)
+        if mx_host:
+            mx = mx_host.strip().lower()
+            out["mx"] = mx
+            out["mx_cap"] = SMTP_DAILY_PROBE_CAP_PER_MX
+            out["mx_used"] = int(redis.get(DAILY_KEY_MX.format(mx=mx, day=day)) or 0)
+    except Exception:
+        pass
+    return out
+
+
 # ---- Backoff helpers ----
 def full_jitter_delay(base: float, attempt: int, cap: float) -> float:
     exp = min(cap, base * (2**attempt))

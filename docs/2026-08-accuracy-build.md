@@ -320,3 +320,91 @@ Worker 2 now runs `orchestrator,generate,verify,crawl` — generate first, falli
 back to crawl when there is nothing to generate, so neither queue starves the
 other and neither worker idles. Set in
 `docker-compose.crestwelliq.yml`; worker 1 keeps the original order.
+
+---
+
+## 9. The 2026-08-25 outage — probe volume, and what it cost
+
+**Read this before running any backfill.**
+
+### What happened
+
+The backfill of never-probed people (run `c19269bd`, 455 companies) issued
+roughly **8,700 RCPT probes in a single run, ~6,400 of them at one provider**.
+
+- The provider began throttling: **921 × `450`**.
+- **The host blocked outbound port 25 entirely** — 674 probes recorded
+  `port25_unreachable`. All verification stopped for a day and the block had to
+  be lifted by hand.
+
+Nothing in the system objected, because nothing was watching the right thing.
+The RPS limiter caps **burst**, and every individual second was inside its
+budget. Sustained volume had no ceiling at all.
+
+### What it cost
+
+The run did find **863 valid addresses**. It also did damage:
+
+| | before | after |
+|---|---:|---:|
+| confirmed addresses | 1,847 | **1,564** |
+| companies with a valid address | 355 | **286** |
+
+`CLEANUP_INVALID_GENERATED` deletes an address, and its whole verification
+history, the moment a probe returns `invalid`. A throttling provider **rejects
+rather than defers**, and a policy rejection under directory-harvest suspicion is
+indistinguishable from "no such user" at the SMTP layer. Some of that 283 is
+genuine churn. **How much cannot be established, because the rows were deleted.**
+
+Note what did *not* cause damage: the host block itself surfaced as
+`port25_unreachable`, which classifies as `temp_fail` and correctly deletes
+nothing. The earlier work on that classification held up.
+
+### Two guards, both now in place
+
+**1. A rolling daily ceiling on probe volume** (`src/queueing/rate_limit.py`),
+global and per MX host, checked before every probe:
+
+| | default | env |
+|---|---:|---|
+| global | 3,000 / day | `SMTP_DAILY_PROBE_CAP` |
+| per MX host | 750 / day | `SMTP_DAILY_PROBE_CAP_PER_MX` |
+
+The per-MX cap is the one that matters here — it would have stopped that run at
+roughly an eighth of the volume it reached. A refused probe returns **`unknown`,
+never `invalid`**: an address we declined to test is untested, not dead, and
+grading it otherwise would turn a rate-limit event into permanent data loss. The
+budget fails **open** on a Redis error, because halting all verification is worse
+than losing the ceiling, and the host block is the backstop regardless.
+
+**2. A confirmed address is never deleted by a later 550.**
+`emails.first_valid_at` is stamped on first confirmation and never cleared;
+both deletion paths refuse when it is set, and the address keeps its row while
+recording the new status, so a genuinely dead mailbox is still visible as invalid
+rather than vanishing. The guard fails **closed** — a missing column or a query
+error means "keep it". Migration
+`2026_08_26_protect_confirmed_addresses.sql` stamps the 1,561 addresses already
+in the table, so existing data is covered rather than only future confirmations.
+
+Both locked by `tests/test_probe_volume_and_confirmed_addresses.py`.
+
+### The principle, for the third time
+
+This is the same error as the person-scoped pattern bug in section 7, in a
+different costume: **a single observation was allowed to erase accumulated
+evidence.** One bounce refuted a company's whole vocabulary; one 550 deleted a
+confirmed address. Both are now required to survive corroboration before they
+destroy anything.
+
+### Operational rule
+
+Do not run an unbounded backfill. Size it against the per-MX ceiling first:
+
+```sql
+SELECT count(*) AS people, count(DISTINCT company_id) AS companies
+  FROM people p WHERE p.generation_at IS NULL AND p.first_name <> '';
+```
+
+At ~3 probes per person, 750 probes per MX per day is roughly **250 people per
+provider per day**. A run spanning thousands of people belongs spread across days,
+not compressed into one evening.

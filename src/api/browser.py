@@ -1415,6 +1415,74 @@ def list_runs(
             pass
 
 
+@router.get("/ops-audit")
+def get_ops_audit(auth: Annotated[AuthContext, Depends(get_auth_context)]) -> dict[str, Any]:
+    """Last nightly operational audit.
+
+    Surfaces decisions that fall due on a date nobody has written down --
+    a cron that should now be removed, addresses aging past usefulness, a
+    migration applied that was deliberately held back. Every serious problem in
+    this system so far was silent; this is the thing that makes them speak.
+
+    Written by `scripts/ops_audit.py` (cron, daily). A missing or stale file is
+    itself reported rather than rendered as "all clear", because "the audit has
+    not run" and "nothing is wrong" must never look the same.
+    """
+    con = _get_conn()
+    try:
+        row = con.execute(
+            "SELECT generated_at, needs_action, findings_json"
+            " FROM ops_audit_report ORDER BY generated_at DESC LIMIT 1"
+        ).fetchone()
+    except Exception as exc:
+        return {
+            "available": False,
+            "needs_action": None,
+            "findings": [],
+            "note": f"Audit table unreadable: {exc}",
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    if not row:
+        return {
+            "available": False,
+            "needs_action": None,
+            "findings": [],
+            "note": "No audit has run yet. Expected daily from scripts/ops_audit.py.",
+        }
+
+    try:
+        findings = json.loads(row[2]) if row[2] else []
+    except Exception:
+        findings = []
+
+    generated = str(row[0])
+    stale = False
+    try:
+        age = datetime.now(UTC) - row[0]
+        stale = age.total_seconds() > 48 * 3600
+    except Exception:
+        pass
+
+    return {
+        "available": True,
+        "generated_at": generated,
+        "needs_action": bool(row[1]),
+        "stale": stale,
+        "findings": findings,
+        # "the audit has not run" and "nothing is wrong" must never look alike.
+        "note": (
+            "Audit is over 48h old -- check the cron before trusting it."
+            if stale
+            else ""
+        ),
+    }
+
+
 def _derive_run_progress(con: Any, *, started_at: str | None) -> dict[str, Any]:
     """Live counts derived from the work itself, not from ``progress_json``.
 

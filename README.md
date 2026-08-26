@@ -209,6 +209,7 @@ See [docs/service-management.md](docs/service-management.md) for the `esctl` ope
 
 | Document | Description |
 |---|---|
+| [MAINTENANCE.md](MAINTENANCE.md) | **Decisions with a trigger** — what will need attention, when, and why. Paired with the nightly `ops_audit.py` |
 | [2026-08-accuracy-build.md](docs/2026-08-accuracy-build.md) | **Start here.** What the current build does, what it measured, and how to read a run without being misled |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flow, module responsibilities |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Complete environment variable reference |

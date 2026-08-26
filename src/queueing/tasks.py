@@ -2690,7 +2690,68 @@ def _enqueue_r16_probe(email_id: int | None, email: str, domain: str) -> None:
         log.warning("R16 enqueue failed: %s", e, extra={"email": email, "domain": domain})
 
 
-def task_generate_emails(  # noqa: C901
+def task_generate_emails(person_id: int, first: str, last: str, domain: str) -> dict:
+    """Generate and verify candidate addresses for one person.
+
+    Thin wrapper so the company's outstanding-people counter is decremented on
+    EVERY exit path, including exceptions. The body has many returns; a finally
+    here is the only place that catches all of them.
+
+    The last person job to finish is what declares the company complete. The
+    fan-out cannot: it only enqueues and returns in seconds, which is why run
+    a661ca92 reported `succeeded` with 655 jobs still queued.
+    """
+    try:
+        return _generate_emails_for_person(person_id, first, last, domain)
+    finally:
+        _signal_person_job_done()
+
+
+def _signal_person_job_done() -> None:
+    """Decrement this company's counter; the one that empties it completes it.
+
+    Best-effort throughout. A missing counter means "do not complete from here",
+    so a lost key delays a run's terminal status rather than fabricating one --
+    which is the safe direction, because a run marked complete while its work
+    continues is what this whole change exists to stop.
+    """
+    try:
+        from rq import get_current_job
+
+        from src.queueing.pipeline_v2 import company_pending_done
+
+        job = get_current_job()
+        meta = (job.meta or {}) if job is not None else {}
+        run_id = meta.get("run_id")
+        company_id = meta.get("company_id")
+        tenant_id = str(meta.get("tenant_id") or "dev")
+        if not run_id or company_id is None:
+            return
+
+        remaining = company_pending_done(
+            tenant_id=tenant_id, run_id=str(run_id), company_id=int(company_id)
+        )
+        if remaining != 0:
+            return
+
+        # Last person at this company. NOW the company is genuinely done.
+        _touch_run_heartbeat(run_id=str(run_id))
+        if not meta.get("is_terminal_stage"):
+            return
+        total = meta.get("total_companies")
+        if not total:
+            return
+        _check_run_completion(
+            run_id=str(run_id),
+            tenant_id=tenant_id,
+            company_id=int(company_id),
+            total=int(total),
+        )
+    except Exception:
+        log.debug("person-job completion signal failed", exc_info=True)
+
+
+def _generate_emails_for_person(  # noqa: C901
     person_id: int,
     first: str,
     last: str,

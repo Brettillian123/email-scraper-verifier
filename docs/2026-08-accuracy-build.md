@@ -138,7 +138,7 @@ The real cause was in how probe failures were recorded. See
 Of the three reporting defects found, two are fixed. One is not, and it is the
 one that matters most.
 
-**STILL BROKEN — run status is wrong in BOTH directions.** Do not trust it.
+**FIXED 2026-08-26 — run status was wrong in BOTH directions.**
 
 - `a661ca92` reported **`succeeded` with 655 generate jobs still queued**;
   verification kept writing rows for roughly an hour afterwards. Measuring that
@@ -147,12 +147,19 @@ one that matters most.
   and had to be marked terminal by hand — a generate+verify run never triggers
   the terminal-stage check at all.
 
-Query `verification_results` by time window, never by run status. The fix needs a
-Redis/RQ test environment that does not exist yet, and it is not worth shipping
-blind: a run that never completes is *worse* than one that completes early,
-because `2026_08_20_run_reaper.sql` (deliberately unapplied) defaults to
-`requeue=True` and would re-enqueue live work — duplicating exactly the outbound
-SMTP that got port 25 blocked.
+The cause: `task_generate_company_emails` was the "terminal stage", but a fan-out
+only ENQUEUES per-person jobs and returns in seconds. The probing happens later,
+in those jobs.
+
+The fix moves the company-complete signal to the **last person job**, via a
+per-company counter in Redis. A *missing* counter reports "do not complete from
+here", so a lost key can only delay a terminal status, never fabricate one —
+completing early corrupts measurements, completing late is visible and harmless.
+Locked by `tests/test_run_completion_waits_for_people.py`, which fails against
+the old code.
+
+This was blocked for days on the absence of a test environment. That is now
+`docker-compose.test.yml` + `scripts/run_tests.sh`: **754 passing, was 10.**
 
 **FIXED — per-domain progress.** `progress_json` still is not revised, but
 `GET /api/browser/runs/{id}` now carries a `live` block counted from the work

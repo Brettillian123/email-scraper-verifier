@@ -837,6 +837,55 @@ def _enqueue(
     return q.enqueue(func, **kwargs)
 
 
+#: How long a company's outstanding-people counter lives. Comfortably longer
+#: than any real run; short enough that an abandoned run cannot pin keys forever.
+COMPANY_PENDING_TTL_S = 86_400
+
+
+def _company_pending_key(tenant_id: str, run_id: str, company_id: int) -> str:
+    return f"tenant:{tenant_id}:run:{run_id}:company:{company_id}:pending_people"
+
+
+def company_pending_set(*, tenant_id: str, run_id: str, company_id: int, n: int) -> None:
+    """Record how many per-person jobs this company's fan-out just enqueued.
+
+    A company is not finished when its fan-out returns -- the fan-out only
+    ENQUEUES, and completes in seconds. Recording the count here is what lets the
+    last person job be the thing that declares the company done.
+    """
+    if n <= 0:
+        return
+    try:
+        r = _get_redis()
+        key = _company_pending_key(tenant_id, run_id, company_id)
+        r.set(key, int(n), ex=COMPANY_PENDING_TTL_S)
+    except Exception:
+        log.debug("could not set company pending counter", exc_info=True)
+
+
+def company_pending_done(*, tenant_id: str, run_id: str, company_id: int) -> int | None:
+    """One person job finished. Returns people still outstanding, or None.
+
+    None means "no counter" -- either it expired or the fan-out never set one.
+    Callers treat that as "do not attempt completion from here", so a lost
+    counter can only ever DELAY a run's terminal status, never fabricate one.
+    """
+    try:
+        r = _get_redis()
+        key = _company_pending_key(tenant_id, run_id, company_id)
+        if not r.exists(key):
+            return None
+        remaining = int(r.decr(key))
+        if remaining <= 0:
+            r.delete(key)
+            return 0
+        r.expire(key, COMPANY_PENDING_TTL_S)
+        return remaining
+    except Exception:
+        log.debug("could not decrement company pending counter", exc_info=True)
+        return None
+
+
 def _maybe_mark_run_complete_from_job() -> None:
     """
     Per-company job boundary for the generate-fanout and verify-sweep stages.
@@ -867,6 +916,24 @@ def _maybe_mark_run_complete_from_job() -> None:
         tenant_id = str(meta.get("tenant_id") or "dev")
         company_id = meta.get("company_id")
         total = meta.get("total_companies")
+
+        # A fan-out that enqueued people is NOT this company's last word. It
+        # only queues jobs and returns in seconds; the probing happens later, in
+        # those jobs. Declaring the company done here is what let run a661ca92
+        # report `succeeded` with 655 generate jobs still queued, with
+        # verification writing rows for an hour afterwards.
+        #
+        # The last person job calls _check_run_completion() instead. If the
+        # counter is missing the company completes here as before, so a lost key
+        # degrades to the old behaviour rather than stranding the run.
+        if run_id and company_id is not None and meta.get("stage") == "generate_company_fanout":
+            try:
+                r = _get_redis()
+                key = _company_pending_key(tenant_id, str(run_id), int(company_id))
+                if int(r.get(key) or 0) > 0:
+                    return
+            except Exception:
+                log.debug("could not read company pending counter", exc_info=True)
 
         if not run_id or company_id is None or not total:
             return
@@ -997,6 +1064,11 @@ def task_generate_company_emails(  # noqa: C901
                         "company_id": company_id,
                         "person_id": person_id,
                         "stage": "generate_person_emails",
+                        # Carried so the LAST person job can complete the
+                        # company: without these it cannot call
+                        # _check_run_completion() and the run never finishes.
+                        "is_terminal_stage": meta.get("is_terminal_stage", False),
+                        "total_companies": meta.get("total_companies"),
                         "ai_enabled": meta.get("ai_enabled", True),
                         "skip_verified": meta.get("skip_verified", True),
                         "skip_catch_all": meta.get("skip_catch_all", False),
@@ -1018,6 +1090,13 @@ def task_generate_company_emails(  # noqa: C901
                         "domain": dom,
                     },
                 )
+
+        # Must be set BEFORE the finally block runs: that is where
+        # _maybe_mark_run_complete_from_job() reads it to decide whether this
+        # company is genuinely finished or merely queued.
+        company_pending_set(
+            tenant_id=tenant_id, run_id=run_id, company_id=company_id, n=enqueued
+        )
 
         return {
             "ok": True,

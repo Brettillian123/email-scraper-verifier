@@ -135,23 +135,39 @@ The real cause was in how probe failures were recorded. See
 
 ## 4. Reading a run without being misled
 
-Three reporting defects are known and unfixed. They do not affect the
-correctness of addresses that are found.
+Of the three reporting defects found, two are fixed. One is not, and it is the
+one that matters most.
 
-1. **`status='succeeded'` fires before the verify tail drains.** Run `a661ca92`
-   was marked succeeded at 21:33; verification wrote rows until roughly 22:30.
-   Query `verification_results` by time window, not by run status — measuring
-   this run by its terminal status undercounted it as 20 companies against a true
-   87.
-2. **`progress_json` is never revised.** Every domain still reads
-   `state: "enqueued"` and `metrics.total_companies: 0` on a completed run. A
-   stalled domain looks exactly like a finished one.
-3. **A company that yields nothing records no reason** — no note of whether it
-   was no people extracted, no pattern, no MX, or every candidate bounced.
-   `CLEANUP_INVALID_GENERATED` then deletes the failed rows, so the outcome is
-   unrecoverable after the fact. This is what made the diagnosis in section 7
-   take a full round of wrong conclusions to reach, and it is the highest-value
-   observability work outstanding.
+**STILL BROKEN — run status is wrong in BOTH directions.** Do not trust it.
+
+- `a661ca92` reported **`succeeded` with 655 generate jobs still queued**;
+  verification kept writing rows for roughly an hour afterwards. Measuring that
+  run by its terminal status undercounted it as 20 companies against a true 87.
+- `c19269bd` sat **`running` for 18 hours after its queues had fully drained**
+  and had to be marked terminal by hand — a generate+verify run never triggers
+  the terminal-stage check at all.
+
+Query `verification_results` by time window, never by run status. The fix needs a
+Redis/RQ test environment that does not exist yet, and it is not worth shipping
+blind: a run that never completes is *worse* than one that completes early,
+because `2026_08_20_run_reaper.sql` (deliberately unapplied) defaults to
+`requeue=True` and would re-enqueue live work — duplicating exactly the outbound
+SMTP that got port 25 blocked.
+
+**FIXED — per-domain progress.** `progress_json` still is not revised, but
+`GET /api/browser/runs/{id}` now carries a `live` block counted from the work
+itself (`companies_crawled`, `people_processed`, `valid`, `catch_all`). Verified
+against `a661ca92`: `live` reports 96 crawled and 94 valid while `progress_json`
+still claims every domain is `enqueued`. Deriving beats syncing — a
+read-modify-write on a 77KB document from two workers is a race waiting to
+happen.
+
+**FIXED — a company that yields nothing now says why.**
+`people.generation_status` holds the generator's own verdict (`no_mx`,
+`no_candidates`, `all_invalid`, `exhausted`, `deferred`, `valid_found`,
+`risky_found`) with a timestamp and probe count. It paid for itself within a day:
+the funnel breakdown in section 10, and the throttling-window analysis that
+identified which verdicts to distrust, both came from a single query against it.
 
 ---
 

@@ -1,7 +1,11 @@
-"""Nightly recovery pass: re-confirm addresses lost to the 2026-08-25 outage.
+"""Nightly probe pass: work through the people whose address question is open.
 
 Runs in the 01:00-06:00 window. Enqueues per-PERSON generation jobs up to the
 daily probe budget, then stops.
+
+It began life as outage recovery. Measurement showed there was nothing to
+recover -- see the note above SQL -- so it now drains the genuinely-open queue
+(`deferred` and `exhausted`) and no-ops once that is empty.
 
 THREE THINGS THIS DOES DIFFERENTLY FROM THE BACKFILL THAT CAUSED THE OUTAGE
 --------------------------------------------------------------------------
@@ -50,43 +54,32 @@ PROBES_PER_PERSON = int(os.getenv("MAX_PROBES_PER_PERSON", "3"))
 PREFLIGHT_MX = os.getenv("RECOVERY_PREFLIGHT_MX", "aspmx.l.google.com")
 GENERATE_QUEUE = os.getenv("RECOVERY_QUEUE", "generate")
 
-#: WHAT CANNOT BE USED TO FIND THE LOST ADDRESSES.
+#: WHY THIS DOES NOT CHASE THE DELETED ADDRESSES.
 #:
-#: The obvious approach is "companies that lost an address, first". Not
-#: expressible: deleting an address takes its `emails` row, its
-#: `verification_results` rows and its pattern evidence with it, so a company
-#: that lost everything is indistinguishable from one that never had anything.
-#: `first_valid_at` exists only on surviving rows; `company_email_pattern` was
-#: created during this same session and cannot see backwards. An earlier version
-#: tried anyway, with a clause that could never be true -- `had_before` was a
-#: strict subset of `confirmed_now` -- and silently ordered by nothing at all.
+#: The 2026-08-26 run deleted ~1,148 confirmed addresses on 550s issued while a
+#: provider was throttling us, which looked like it should be recoverable. It is
+#: not, and the measurement is worth keeping so nobody spends another night on it:
 #:
-#: WHAT CAN. The verdicts themselves carry a timestamp, and the throttling window
-#: is known to the minute. That is the handle.
+#:   * 25 people from that cohort, probed across the FULL ten-pattern vocabulary
+#:     on healthy SMTP: ZERO recovered. Not a ranking problem, not a budget
+#:     problem -- those mailboxes are gone.
+#:   * A sample of the addresses that SURVIVED that run still resolves at 90%
+#:     (pre-August confirmations) and 100% (August confirmations).
 #:
-#: The window in which verdicts cannot be trusted.
+#: Read together: the run retired stale confirmations rather than destroying good
+#: ones. Those 1,148 were Feb-April guesses that had since died, and the 1,564
+#: remaining is a smaller, more accurate address book than the 1,847 it replaced.
 #:
-#: Probe telemetry pins the onset precisely. Through 01:36 the run was healthy --
-#: 7, 21, 33 and 46 accepts per minute with zero 450s. From 01:45 the throttling
-#: responses begin and accepts collapse to 0-3 per minute. Every `all_invalid`
-#: recorded after that point was decided while the provider was refusing us, and
-#: a throttling provider rejects rather than defers: at the SMTP layer that is
-#: indistinguishable from "no such user". Those verdicts deleted the addresses.
+#: So `all_invalid` is treated as final. Re-probing 1,319 dead addresses nightly
+#: is precisely the volume that got outbound port 25 blocked in the first place.
 #:
-#: 1,589 people carry a verdict from this window and hold no address today. They
-#: are the recovery cohort. The upper bound excludes the clean slices run after
-#: the block lifted, whose verdicts ARE trustworthy.
-SUSPECT_FROM = os.getenv("RECOVERY_SUSPECT_FROM", "2026-08-26T01:45:00Z")
-SUSPECT_TO = os.getenv("RECOVERY_SUSPECT_TO", "2026-08-26T12:00:00Z")
-
+#: What is genuinely open: `deferred` (a real 4xx we said we would retry) and
+#: `exhausted` (probes that never reached a verdict). ~474 people at time of
+#: writing, and nobody at all is unasked -- the addressable pool is finished.
+#: Further growth needs new PEOPLE, not more probing.
 SQL = """
 WITH confirmed_pattern AS (
   SELECT DISTINCT company_id FROM company_email_pattern WHERE confirmed_count > 0
-),
-suspect AS (
-  SELECT id FROM people
-   WHERE generation_at::timestamptz >= %s AND generation_at::timestamptz < %s
-     AND generation_status IN ('all_invalid', 'exhausted')
 )
 SELECT p.id, p.first_name, p.last_name, lower(c.domain)
   FROM people p
@@ -95,17 +88,12 @@ SELECT p.id, p.first_name, p.last_name, lower(c.domain)
    AND p.first_name <> '' AND p.last_name <> ''
    -- nothing currently on file for this person
    AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.person_id = p.id)
-   AND (
-     -- never asked
-     p.generation_status IS NULL
-     -- or asked and the question is still open
-     OR p.generation_status IN ('deferred', 'exhausted')
-     -- or answered, but answered while the provider was throttling us
-     OR p.id IN (SELECT id FROM suspect)
-   )
+   -- never asked, or asked and the question is still genuinely open.
+   -- `all_invalid` is deliberately absent: see the note above.
+   AND (p.generation_status IS NULL OR p.generation_status IN ('deferred', 'exhausted'))
  ORDER BY
-   -- 1. verdicts taken under throttling: this is the actual recovery
-   (p.id IN (SELECT id FROM suspect)) DESC,
+   -- 1. a real deferral we promised to come back to
+   (p.generation_status = 'deferred') DESC,
    -- 2. companies with a confirmed pattern: these land on probe #1, so they are
    --    the cheapest results available per unit of provider patience
    (p.company_id IN (SELECT company_id FROM confirmed_pattern)) DESC,
@@ -169,7 +157,7 @@ def main() -> int:
 
     con = get_conn()
     try:
-        rows = con.execute(SQL, (SUSPECT_FROM, SUSPECT_TO, cap)).fetchall()
+        rows = con.execute(SQL, (cap,)).fetchall()
     finally:
         try:
             con.close()

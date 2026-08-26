@@ -621,10 +621,14 @@ Dry run, selects and reports but enqueues nothing:
 docker exec -w /app -e PYTHONPATH=/app cw-iq-worker-1 python scripts/nightly_recovery.py --dry-run
 ```
 
-### How long recovery should take
+### How long it should take, and when to remove it
 
-At 100 people per slice and 5 slices, ~500 people per night, but the per-MX
-ceiling binds first: most prospects sit on Google or Outlook, so expect roughly
-250 people per provider per day. The ~132 companies that lost addresses are a few
-nights' work. When `nightly_recovery.py` starts logging "no unprobed people
-remain", the backlog is clear and the cron can be removed.
+The open queue is 474 people (`deferred` + `exhausted`), which fits inside a
+single night's budget. Expect it to log "no unprobed people remain" after the
+first or second night -- at which point **remove the cron**, because it has
+nothing left to do.
+
+It deliberately does NOT re-probe `all_invalid` people. Those 1,319 were tested
+across the full ten-pattern vocabulary on healthy SMTP and zero recovered; their
+mailboxes are gone. Re-probing them nightly would be exactly the volume that got
+outbound port 25 blocked.

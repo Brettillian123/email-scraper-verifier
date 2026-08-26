@@ -408,3 +408,51 @@ SELECT count(*) AS people, count(DISTINCT company_id) AS companies
 At ~3 probes per person, 750 probes per MX per day is roughly **250 people per
 provider per day**. A run spanning thousands of people belongs spread across days,
 not compressed into one evening.
+
+---
+
+## 10. The outage loss was mostly correction, not damage
+
+Section 9 says the ~1,148 deleted addresses could not be assessed because the
+rows were gone. They can be assessed — by asking whether those people have a
+findable address *now*, on healthy SMTP. Measured 2026-08-26:
+
+| test | result |
+|---|---|
+| 25 people from the deleted cohort, probed across the **full ten-pattern vocabulary** | **0 recovered** |
+| 40 surviving **pre-August** confirmations, re-probed | **90% still resolve** |
+| 40 surviving **August** confirmations, re-probed | **100% still resolve** |
+
+Zero recovery across the entire vocabulary is not a ranking failure or a probe
+budget failure. Those mailboxes do not exist.
+
+**So the run retired stale confirmations rather than destroying good ones.** The
+1,847 figure included roughly 1,148 Feb–April guesses that had since died; the
+1,564 that remain resolve at 90–100% on re-test. The address book got smaller and
+substantially more accurate in the same movement.
+
+This corrects the earlier claim that "most of that loss is probably recoverable".
+It was not recoverable, and it did not need to be.
+
+What remains true from section 9: the volume was reckless, the host block was
+real, and the guards belong there regardless. A run that deletes 1,148 rows
+should not be able to happen by accident even when the deletions turn out to be
+right — the outcome was luck, not design.
+
+### The addressable pool is finished
+
+| `people.generation_status` | count |
+|---|---:|
+| never asked | **0** |
+| `deferred` | 5 |
+| `exhausted` | 469 |
+| `all_invalid` | 1,319 |
+
+Nobody with a name and a domain is unasked. `all_invalid` is final — that is the
+cohort tested above. The genuinely open queue is 474 people, roughly one night
+under the daily cap, after which `nightly_recovery.py` logs "no unprobed people
+remain" and no-ops.
+
+**Coverage now grows by finding new PEOPLE, not by probing harder.** Discovery and
+extraction are the remaining levers; the SMTP layer has been taken as far as this
+company/people set allows.

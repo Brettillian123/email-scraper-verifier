@@ -176,6 +176,28 @@ def test_a_generic_saas_homepage_is_not_auto_promoted():
     assert not generic.stage_hits, "and it carries no stage evidence, so it must not promote"
 
 
+def test_press_and_funds_are_not_treated_as_prospects():
+    """The weakness of the search source, pinned.
+
+    A funding query returns articles ABOUT funding. The first live SearXNG run
+    for "seed round B2B SaaS" returned redbud.vc, forumvc.com and
+    payproglobal.com -- a fund, an accelerator and an advice blog. Taking the
+    result host gives the publisher, never the company that raised.
+    """
+    for d in ("redbud.vc", "forumvc.com", "techcrunch.com", "ycombinator.com",
+              "bessemer.ventures.com", "finsmes.com"):
+        assert src_mod._is_press(d), f"{d} would be proposed as a prospect"
+
+    for d in ("stripe.com", "vanta.com", "acme.io"):
+        assert not src_mod._is_press(d), f"{d} was wrongly filtered as press"
+
+
+def test_searxng_replaced_serper_entirely():
+    """No SaaS search dependency should remain in the adapter table."""
+    assert "searxng" in src_mod.ADAPTERS
+    assert "serper" not in src_mod.ADAPTERS
+
+
 def test_thresholds_are_configured_conservatively():
     """These are the only thing between a bad source and a large outbound SMTP
     bill. A regression that loosens them should fail here first."""

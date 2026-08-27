@@ -11,9 +11,9 @@ after a profile crawl, because a domain on its own says almost nothing.
     vc_portfolio  A seed/Series-A fund's portfolio page is a curated list of
                   exactly the stage that buys fractional executives. One page is
                   worth dozens of search queries.
-    serper        The already-configured Serper key, asked about funding events
-                  rather than about people. Catches a company the week it raises,
-                  which is when it starts hiring executives.
+    searxng       Self-hosted metasearch (no key, no quota, no subscription),
+                  asked about funding events. The weakest of the three: a funding
+                  query returns the PRESS, not the company that raised.
     link_graph    Customer, partner and integration pages of companies already in
                   the database. Cheapest, no external dependency, and biased
                   toward whoever the existing set already links to -- which is
@@ -48,6 +48,24 @@ _NEVER_SUFFIX = (
     ".cloudfront.net", ".amazonaws.com", ".googleapis.com", ".gstatic.com",
     ".cdn.com", ".typekit.net", ".fontawesome.com", ".w3.org", ".schema.org",
 )
+
+#: Publishers, funds, accelerators and advice sites. A funding-news query returns
+#: these instead of the company that raised, so without this filter the search
+#: source proposes the press as prospects.
+_PRESS_HINTS = (
+    ".vc", "vc.com", "ventures.com", "capital.com", "partners.com",
+    "techcrunch", "businesswire", "prnewswire", "globenewswire", "forbes",
+    "bloomberg", "reuters", "axios", "venturebeat", "sifted", "eu-startups",
+    "finsmes", "pitchbook", "cbinsights", "accelerator", "ycombinator",
+    "seedtable", "startupsavant", "failory", "saastr",
+)
+
+
+def _is_press(domain: str) -> bool:
+    """True for a publisher/fund/advice domain rather than an operating company."""
+    d = (domain or "").lower()
+    return any(h in d for h in _PRESS_HINTS)
+
 
 _HREF = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.I)
 
@@ -138,72 +156,62 @@ def from_vc_portfolio(url: str, *, max_bytes: int = 2_000_000) -> list[Candidate
     return out
 
 
-def from_serper(query: str, *, num: int = 10) -> list[Candidate]:
-    """Companies named by a Google search, via the already-configured Serper key.
+def from_searxng(query: str, *, num: int = 20) -> list[Candidate]:
+    """Companies named by a web search, via SELF-HOSTED SearXNG.
 
-    Aimed at funding events ("raises Series A", "seed round") rather than at
-    people, which is what google_discovery.py already uses this key for. The
-    result LINKS are usually press coverage, so the company domain is taken from
-    the result body where present and otherwise from the link host -- press
-    domains are filtered by _NEVER plus the caller's own review.
+    Replaces the Serper SaaS API: no key, no quota, no subscription, and no
+    account to run out of credits -- which is exactly what Serper had done.
+    SearXNG runs as `cw-iq-searxng` on the isolated iq network, is not published
+    to the internet, and metasearches DuckDuckGo/Bing/Brave rather than scraping
+    any one of them.
+
+    KNOW THE WEAKNESS BEFORE TRUSTING THIS SOURCE. A query like "seed round B2B
+    SaaS" returns ARTICLES ABOUT funding, not the companies that raised: the
+    first live results were redbud.vc, payproglobal.com and forumvc.com -- a VC,
+    an advice blog and an accelerator. Taking the result host gives you the
+    publisher, not the subject.
+
+    _PRESS filters the worst of that, but the honest position is that search is
+    the weakest of the three sources and works best with queries naming a
+    company-listing PAGE ("portfolio", "our companies", "backed by") rather than
+    an event. Extracting the subject of a funding article needs the article read,
+    which is an LLM job and not this function's.
     """
     import httpx
 
-    key = (os.getenv("SERPER_API_KEY") or "").strip()
-    if not key:
-        log.info("serper source skipped: SERPER_API_KEY not set")
-        return []
-
+    base = (os.getenv("SEARXNG_URL") or "http://iq-searxng:8080").rstrip("/")
     try:
-        r = httpx.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            # Serper 400s above num=10; google_discovery.py already clamps the
-            # same way, and sends gl/hl with it.
-            json={"q": query, "num": min(int(num), 10), "gl": "us", "hl": "en"},
-            timeout=20.0,
+        r = httpx.get(
+            f"{base}/search",
+            params={"q": query, "format": "json", "language": "en"},
+            timeout=30.0,
         )
         r.raise_for_status()
         data = r.json()
-    except httpx.HTTPStatusError as exc:
-        body = ""
-        try:
-            body = exc.response.text[:200]
-        except Exception:
-            pass
-        # "Not enough credits" is an account state, not a transient error.
-        # Reporting it as a generic warning would make an empty source look
-        # like a quiet day.
-        if "credit" in body.lower():
-            log.error(
-                "SERPER HAS NO CREDITS -- this source yields nothing until the "
-                "account is topped up. Not a transient failure.",
-                extra={"q": query, "body": body},
-            )
-        else:
-            log.warning("serper query failed", extra={"q": query, "body": body})
-        return []
     except Exception as exc:
-        log.warning("serper query failed", extra={"q": query, "err": str(exc)})
+        log.warning(
+            "searxng query failed -- is cw-iq-searxng up and is JSON enabled in "
+            "its settings.yml? (JSON is off by default)",
+            extra={"q": query, "err": str(exc)},
+        )
         return []
 
     out: list[Candidate] = []
     seen: set[str] = set()
-    for item in (data.get("organic") or []):
-        for field in ("link", "displayedLink"):
-            v = item.get(field) or ""
-            if not v:
-                continue
-            try:
-                host = urlparse(v if "//" in v else f"https://{v}").netloc
-            except Exception:
-                continue
-            d = _registrable(host)
-            if d and d not in seen:
-                seen.add(d)
-                out.append(Candidate(domain=d, source="serper", source_detail=query))
-            break
-    log.info("serper found %s candidates", len(out), extra={"q": query})
+    for item in (data.get("results") or [])[: int(num)]:
+        url = item.get("url") or ""
+        if not url:
+            continue
+        try:
+            host = urlparse(url).netloc
+        except Exception:
+            continue
+        d = _registrable(host)
+        if not d or d in seen or _is_press(d):
+            continue
+        seen.add(d)
+        out.append(Candidate(domain=d, source="searxng", source_detail=query))
+    log.info("searxng found %s candidates", len(out), extra={"q": query})
     return out
 
 
@@ -239,6 +247,6 @@ def from_link_graph(page_url: str, *, max_bytes: int = 1_000_000) -> list[Candid
 #: or search phrase is a row in the database, not a deploy.
 ADAPTERS = {
     "vc_portfolio": from_vc_portfolio,
-    "serper": from_serper,
+    "searxng": from_searxng,
     "link_graph": from_link_graph,
 }

@@ -128,6 +128,34 @@ def check_recovery_backlog(con, a: Audit) -> None:
         a.add(OK, "recovery_backlog", f"{remaining} people still worth probing")
 
 
+def check_tarpit_blocked(con, a: Audit) -> None:
+    """People we cannot reach because their mail host tarpits us.
+
+    Not a bug and not fixable by probing harder: Mimecast sits at 95% temp-fail
+    across 3,930 samples, Zoho at 93.6%. Those hosts are skipped before a socket
+    opens, so these people are UNTESTED rather than answered.
+
+    They are excluded from the nightly pass on purpose -- nothing changes about a
+    tarpit between one night and the next, and re-selecting them burned budget
+    for 45 real probes out of 500 people. Surfaced here instead so the number
+    stays visible and can be revisited if a provider's behaviour changes.
+    """
+    row = con.execute(
+        "SELECT count(*) FROM people WHERE generation_status = 'not_attempted'"
+    ).fetchone()
+    n = int(row[0]) if row and row[0] is not None else 0
+    if n:
+        a.add(
+            WATCH,
+            "tarpit_blocked",
+            f"{n} people sit behind mail hosts that tarpit us — untested, not answered",
+            "Excluded from the nightly pass by design. Revisit only if a provider's "
+            "temp-fail rate drops; see the tarpit thresholds in src/resolve/mx.py.",
+        )
+    else:
+        a.add(OK, "tarpit_blocked", "No people blocked behind tarpit hosts")
+
+
 def check_address_freshness(con, a: Audit) -> None:
     """Addresses decay. Measured: ~64% of Feb-April confirmations were dead by
     late August. Nobody was tracking that, which is why it surfaced as an outage."""
@@ -236,6 +264,7 @@ def main() -> int:
             check_stuck_runs,
             check_probe_budget,
             check_recovery_backlog,
+            check_tarpit_blocked,
             check_address_freshness,
             check_unapplied_migrations,
             check_reaper_migration,

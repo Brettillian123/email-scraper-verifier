@@ -118,10 +118,11 @@ from src.verify.candidates import (  # evidence-ranked probe planning
     rank_candidates,
 )
 from src.verify.catchall import check_catchall_for_domain  # R17 domain-level catch-all
-from src.verify.smtp import (  # R16 SMTP probe core
+from src.verify.smtp import (
     is_greylist_deferral,
     probe_rcpt,
     probe_rcpt_batch,  # one session, several RCPTs
+    will_skip_as_tarpit,  # R16 SMTP probe core
 )
 from src.verify.status import (
     VerificationSignals,
@@ -3975,7 +3976,21 @@ def _generate_emails_sequential(  # noqa: C901
     all_invalid = bool(attempts) and all(
         a.get("status") in ("invalid", "skipped") for a in attempts
     )
-    final_status = "all_invalid" if all_invalid else "exhausted"
+    # "Nothing was asked" is not the same outcome as "asked, no clear answer",
+    # and collapsing them cost a whole night. Every candidate here was refused
+    # before a socket opened -- the MX is a tarpit, or the daily budget was
+    # spent -- so this person has not been tested at all. Recorded distinctly so
+    # the nightly pass can stop re-selecting them: they were coming back
+    # `exhausted`, re-entering the pool, and being skipped again the next night,
+    # forever, while consuming budget each time.
+    not_attempted = bool(attempts) and all(
+        str(a.get("reason") or "").startswith(("tarpit_skipped", "probe_budget"))
+        for a in attempts
+    )
+    if not_attempted:
+        final_status = "not_attempted"
+    else:
+        final_status = "all_invalid" if all_invalid else "exhausted"
     if deferred_scheduled:
         # Not a dead end: a probe is queued and will land in verification_results.
         final_status = "deferred"
@@ -4018,6 +4033,30 @@ def _probe_candidates(
     accept to "valid" and sets catchall_ruled_out, so the caller can skip the
     extra sanity connection it would otherwise open.
     """
+    # Tarpit hosts are skipped inside probe_rcpt_batch WITHOUT opening a socket.
+    # Check that first: consuming budget for a probe that never happens is how an
+    # overnight pass spent 1,500 of its 3,000 allowance to issue 45 real probes.
+    try:
+        if will_skip_as_tarpit(mx_host):
+            log.info(
+                "skipping tarpit MX before spending probe budget",
+                extra={"mx_host": mx_host, "count": len(emails)},
+            )
+            return [
+                {
+                    "email": e,
+                    "status": "unknown",
+                    "reason": "tarpit_skipped",
+                    "code": None,
+                    "message": None,
+                    "retries": 0,
+                    "catchall_ruled_out": False,
+                }
+                for e in emails
+            ]
+    except Exception:
+        log.debug("tarpit pre-check failed; continuing", exc_info=True)
+
     # Daily volume ceiling. The per-second RPS limiter caps BURST and had nothing
     # to say about the 2026-08-25 backfill, which issued ~8,700 probes over hours
     # -- every second within budget -- and got outbound port 25 blocked at the

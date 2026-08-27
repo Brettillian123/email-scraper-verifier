@@ -180,6 +180,30 @@ def _record_probe_raw(
         pass
 
 
+def will_skip_as_tarpit(mx_host: str) -> bool:
+    """Would probe_rcpt_batch() skip this host without opening a socket?
+
+    Callers need to know BEFORE they spend anything on the attempt. The tarpit
+    gate sits inside probe_rcpt_batch, so a caller that consumes a probe budget
+    first pays full price for a probe that never happens.
+
+    Measured 2026-08-27: an overnight pass enqueued 500 people, consumed 1,500
+    from the daily budget and issued 45 actual probes. The rest were
+    tarpit-skipped -- Mimecast sits at 95% temp-fail across 3,930 samples, Zoho
+    at 93.6% -- so the budget was spent on nothing.
+    """
+    try:
+        hint = _get_hint(mx_host)
+    except Exception:
+        return False
+    if not isinstance(hint, dict) or not hint.get("tarpit"):
+        return False
+    try:
+        return float(hint.get("success_rate") or 0.0) < SMTP_TARPIT_SKIP_SUCCESS_RATE
+    except Exception:
+        return True
+
+
 def _get_hint(mx_host: str) -> dict[str, Any] | None:
     if not _mx_get_hint:
         return None

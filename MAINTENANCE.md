@@ -21,6 +21,7 @@ so they are not rediscovered as incidents.
 | A schema object missing | `migrations` | Apply from `db/migrations/`. Code depending on these fails *silently*. |
 | `run_reaper_state` exists | `reaper` | The reaper migration has been applied — see below before leaving it on. |
 | Catch-all share ≥45% over 30 days | `catch_all_share` | The ceiling moved, not the code. |
+| People behind tarpit hosts | `tarpit_blocked` | Informational. They are retried nightly at lowest priority and the flag self-expires — act only if the count grows. |
 
 ---
 
@@ -53,6 +54,18 @@ declares it done, not the fan-out) and is covered by
 watch a few real runs reach `succeeded` at the right moment — the counter is
 best-effort by design, and a missing key delays completion rather than faking it.
 
+### Tarpit hosts, and why the verdict expires
+
+Mimecast and Zoho genuinely defer us — verified on fresh evidence 2026-08-27:
+given a clean window they still deferred 70% and 87% of probes respectively, and
+re-earned the flag on present-day data.
+
+What changed is that the verdict is now *falsifiable*. It used to be computed over
+180 days, and since a flagged host is skipped before a socket opens, no new
+evidence could ever overturn it — Mimecast was being condemned on probes that
+predated the greylist deferral built to handle it. `SMTP_TARPIT_WINDOW_DAYS`
+(14) means a host that stops deferring clears itself, with no one intervening.
+
 ### Growth no longer comes from probing
 
 **Nobody with a name and a domain is unasked.** The SMTP layer has been taken as
@@ -70,7 +83,7 @@ extraction — more people, not more probes.
   against provider tolerance — worth measuring **after** address decay is handled,
   not before, and never during a backfill.
 
-- **36 tests still skip** under `scripts/run_tests.sh` (754 pass). Worth a look
+- **36 tests still skip** under `scripts/run_tests.sh` (759 pass). Worth a look
   when someone next touches those areas; not urgent.
 
 - **`lead_search_docs`** is an orphan table at 0 rows. `GET /leads/search` is a
@@ -101,5 +114,6 @@ docker exec -w /app -e PYTHONPATH=/app cw-iq-worker-1 \
 docker exec cw-iq-worker-1 python -c "from src.queueing.rate_limit import daily_probe_usage; from src.queueing.redis_conn import get_redis; print(daily_probe_usage(get_redis(), 'aspmx.l.google.com'))"
 ```
 
-Rollback images, newest first: `crestwell-iq:pre-run-completion`,
-`:pre-probe-caps`, `:pre-observability`, `:pre-evidence-fix`, `:prev`.
+Rollback images, newest first: `crestwell-iq:pre-tarpit-window`,
+`:pre-tarpit-precheck`, `:pre-run-completion`, `:pre-probe-caps`,
+`:pre-observability`, `:pre-evidence-fix`, `:prev`.

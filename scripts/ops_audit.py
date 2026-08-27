@@ -135,10 +135,15 @@ def check_tarpit_blocked(con, a: Audit) -> None:
     across 3,930 samples, Zoho at 93.6%. Those hosts are skipped before a socket
     opens, so these people are UNTESTED rather than answered.
 
-    They are excluded from the nightly pass on purpose -- nothing changes about a
-    tarpit between one night and the next, and re-selecting them burned budget
-    for 45 real probes out of 500 people. Surfaced here instead so the number
-    stays visible and can be revisited if a provider's behaviour changes.
+    Verified on fresh evidence 2026-08-27: given a clean window, Mimecast still
+    deferred 70% of 30 probes and Zoho 87%, so both re-earned the flag on
+    present-day data rather than on the pre-August history that used to condemn
+    them permanently.
+
+    They ARE retried, nightly, at lowest priority -- the tarpit pre-check makes
+    that nearly free, and the verdict expires after SMTP_TARPIT_WINDOW_DAYS, so a
+    provider that changes behaviour clears itself without anyone intervening.
+    Surfaced here so the number stays visible rather than quietly growing.
     """
     row = con.execute(
         "SELECT count(*) FROM people WHERE generation_status = 'not_attempted'"
@@ -149,8 +154,10 @@ def check_tarpit_blocked(con, a: Audit) -> None:
             WATCH,
             "tarpit_blocked",
             f"{n} people sit behind mail hosts that tarpit us — untested, not answered",
-            "Excluded from the nightly pass by design. Revisit only if a provider's "
-            "temp-fail rate drops; see the tarpit thresholds in src/resolve/mx.py.",
+            "Retried nightly at lowest priority, and free to retry: the tarpit "
+            "pre-check costs no probe budget. The flag now expires after "
+            "SMTP_TARPIT_WINDOW_DAYS, so these clear automatically if the "
+            "provider's behaviour changes. No action unless the number grows.",
         )
     else:
         a.add(OK, "tarpit_blocked", "No people blocked behind tarpit hosts")

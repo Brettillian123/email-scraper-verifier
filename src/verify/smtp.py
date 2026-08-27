@@ -75,7 +75,17 @@ SMTP_SESSION_RATELIMIT_STOP_AFTER: int = _env_num("SMTP_SESSION_RATELIMIT_STOP_A
 SMTP_PROBE_TOTAL_BUDGET_SECONDS: float = _env_num("SMTP_PROBE_TOTAL_BUDGET_SECONDS", 12.0, float)
 # 30d is falsified by this deployment: observed gaps between real events are
 # 114/133/170 days (no run reaper), so a 30d window returns None for every host.
+# That reasoning holds for LATENCY, which is all this window now governs.
 SMTP_BEHAVIOR_WINDOW_DAYS: int = _env_num("SMTP_BEHAVIOR_WINDOW_DAYS", 180, int)
+# The TARPIT verdict gets its own, much shorter window, because it is
+# self-sealing: a flagged host is skipped before a socket opens, so no evidence
+# that would overturn the flag can ever be gathered. On 2026-08-27 Mimecast was
+# being skipped on a 94.7% temp-fail rate whose every sample predated August --
+# and therefore predated the greylist deferral built to handle exactly that
+# behaviour. The verdict was permanent by construction. With no probes inside
+# this window the answer is "not currently a tarpit", so the host gets one fresh
+# chance and re-earns the flag on present-day evidence if it deserves it.
+SMTP_TARPIT_WINDOW_DAYS: int = _env_num("SMTP_TARPIT_WINDOW_DAYS", 14, int)
 SMTP_TARPIT_SKIP_SUCCESS_RATE: float = _env_num("SMTP_TARPIT_SKIP_SUCCESS_RATE", 0.03, float)
 SMTP_TARPIT_DEFER_SECONDS: int = _env_num("SMTP_TARPIT_DEFER_SECONDS", 600, int)
 # B6 session ceilings. The wall-clock ceiling is the existing per-session budget
@@ -212,6 +222,7 @@ def _get_hint(mx_host: str) -> dict[str, Any] | None:
         return _mx_get_hint(  # type: ignore[call-arg]
             mx_host,
             window_days=SMTP_BEHAVIOR_WINDOW_DAYS,
+            tarpit_window_days=SMTP_TARPIT_WINDOW_DAYS,
             db_path=db_path,
         )
     except TypeError:

@@ -794,10 +794,37 @@ def record_mx_probe(
 
 
 def get_mx_behavior_hint(
-    mx_host: str, *, window_days: int = 30, db_path: str | None = None
+    mx_host: str,
+    *,
+    window_days: int = 30,
+    tarpit_window_days: int | None = None,
+    db_path: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Return a compact behavior hint dict derived from recent probes.
+
+    TWO WINDOWS, because the two things this returns decay at different rates.
+
+    ``window_days`` governs LATENCY, which ages gracefully -- a host that was
+    300ms slow six months ago is still roughly 300ms slow, and the only use of
+    that number is widening a timeout. A long window is right there.
+
+    ``tarpit_window_days`` governs the TARPIT VERDICT, which does not age
+    gracefully at all, because it is self-sealing: a flagged host is skipped
+    before a socket opens, so no new evidence can ever be gathered to overturn
+    it. Judging that on stale data means a verdict is permanent by construction.
+
+    Measured 2026-08-27, which is why this parameter exists. Mimecast carried a
+    94.7% temp-fail rate over 1,955 probes and was skipped on every attempt --
+    but **every one of those probes predated August**, and therefore predated the
+    greylist deferral (60/300/900s) built specifically to handle hosts that defer.
+    The rate that condemned them was measured under retry timings greylisting
+    always rejects. They had never been tried under the current behaviour and,
+    because of the skip, never could be.
+
+    With no probes inside the tarpit window the verdict is False: a host we have
+    not probed lately is not *currently* known to tarpit us. It gets one fresh
+    chance, and re-earns the flag on present-day evidence if it deserves it.
 
     Note: db_path parameter is deprecated. Uses get_conn() for PostgreSQL.
     """
@@ -815,7 +842,7 @@ def get_mx_behavior_hint(
 
         rows = conn.execute(
             """
-            SELECT code, category, elapsed_ms
+            SELECT code, category, elapsed_ms, ts
             FROM mx_probe_stats
             WHERE mx_host = ? AND ts >= ?
             ORDER BY ts DESC
@@ -867,7 +894,32 @@ def get_mx_behavior_hint(
     # production probes hard-fail) marks a brand-new MX a tarpit on n=1. That
     # matters most for hosts we have only just started probing, which is exactly
     # the population a coverage push introduces.
-    tarpit = total >= TARPIT_MIN_SAMPLES and tfr > TARPIT_TEMP_FAIL_RATE
+    # The tarpit verdict uses only the recent sub-window. See the docstring: this
+    # judgement gates all future probing of the host, so judging it on stale data
+    # makes it permanent by construction.
+    tw = int(tarpit_window_days or window_days)
+    if tw >= int(window_days):
+        t_rows = rows
+    else:
+        t_cut = datetime.fromtimestamp(
+            datetime.now(UTC).timestamp() - (tw * 86400), UTC
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        t_rows = []
+        for r in rows:
+            v = get_val(r, 3, "ts")
+            if v is None:
+                continue
+            # ts is TEXT and ISO-8601, so lexical order is chronological. The
+            # stored form uses a space separator where the cutoff uses "T";
+            # normalise before comparing or same-day rows sort wrongly.
+            if str(v).replace(" ", "T") >= t_cut:
+                t_rows.append(r)
+
+    t_total = len(t_rows)
+    t_temps = sum(1 for r in t_rows if (get_val(r, 1, "category") or "") == "temp_fail")
+    t_tfr = round(t_temps / t_total, 3) if t_total else 0.0
+
+    tarpit = t_total >= TARPIT_MIN_SAMPLES and t_tfr > TARPIT_TEMP_FAIL_RATE
 
     return {
         "n": total,
@@ -877,6 +929,11 @@ def get_mx_behavior_hint(
         "success_rate": srate,
         "tarpit": bool(tarpit),
         "window_days": window_days,
+        # What the tarpit verdict was actually computed from, so a skipped host
+        # can be explained without re-deriving it.
+        "tarpit_window_days": tw,
+        "tarpit_n": t_total,
+        "tarpit_temp_fail_rate": t_tfr,
     }
 
 

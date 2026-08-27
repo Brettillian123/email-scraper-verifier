@@ -90,8 +90,16 @@ SELECT p.id, p.first_name, p.last_name, lower(c.domain)
    AND NOT EXISTS (SELECT 1 FROM emails e WHERE e.person_id = p.id)
    -- never asked, or asked and the question is still genuinely open.
    -- `all_invalid` is deliberately absent: see the note above.
-   AND (p.generation_status IS NULL OR p.generation_status IN ('deferred', 'exhausted'))
+   -- `not_attempted` IS included: it means a tarpit or a spent budget stopped us
+   -- before a socket opened, and both of those clear on their own. Excluding it
+   -- would have stranded these people permanently the moment the tarpit lifted.
+   AND (p.generation_status IS NULL
+        OR p.generation_status IN ('deferred', 'exhausted', 'not_attempted'))
  ORDER BY
+   -- 0. anything we actually asked outranks anything we only failed to ask.
+   --    not_attempted people are cheap to retry (the tarpit pre-check costs no
+   --    probe budget) but they must not crowd out real candidates in a slice.
+   (p.generation_status = 'not_attempted') ASC,
    -- 1. a real deferral we promised to come back to
    (p.generation_status = 'deferred') DESC,
    -- 2. companies with a confirmed pattern: these land on probe #1, so they are

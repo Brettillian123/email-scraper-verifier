@@ -1,7 +1,7 @@
 # The 2026-08 accuracy build
 
 What changed, what it measured, and how to read a run without being misled.
-This is the code running on Contabo (`157.173.206.82`, image `crestwell-iq:local`).
+This is the code running on Contabo (`the server address, removed`, image `crestwell-iq:local`).
 
 ---
 

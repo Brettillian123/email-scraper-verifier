@@ -219,7 +219,7 @@ section 3 returned 7.4% instead of something much higher.
 ### The conflation
 
 `_teach_unprocessed()` banked every 550 from a probe session as evidence against
-the **format**. But a 550 for `kellyleveque@magicspoon.com` proves exactly one
+the **format**. But a 550 for `kdoe@example-foods.example` proves exactly one
 thing: Kelly LeVeque has no mailbox at that domain. It says nothing about whether
 the company uses `firstlast`.
 
@@ -254,9 +254,9 @@ is written off — including the real employees further down the list.
 | **people never probed, full set** | **535** |
 
 `caremessage.org` is the clean illustration: **26 people**, refuted after 3 of
-them bounced, ~23 never probed — and `ccorral@caremessage.org` (`flast`) resolves
+them bounced, ~23 never probed — and `jdoe@example-care.example` (`flast`) resolves
 perfectly well. `elemenohealth.com`: 5 people, all patterns refuted, and
-`steve.mundro@elemenohealth.com` (`first.last`) resolves. Both formats were rank
+`jane.doe@example-health.example` (`first.last`) resolves. Both formats were rank
 1 and 2 in the base-rate order. Their own evidence had declared them dead.
 
 This is also why the exec-sorted batch of 25 scored 94%: a real CEO gets probed
